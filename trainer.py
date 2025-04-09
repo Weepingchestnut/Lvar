@@ -95,7 +95,7 @@ class VARTrainer(object):
         
         # if progressive training
         self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = prog_si
-        if self.last_prog_si != prog_si:
+        if self.last_prog_si != prog_si:    # 不走该if
             if self.last_prog_si != -1: self.first_prog = False
             self.last_prog_si = prog_si
             self.prog_it = 0
@@ -110,7 +110,7 @@ class VARTrainer(object):
         
         gt_idx_Bl: List[torch.LongTensor] = self.vae_local.img_to_idxBl(inp_B3HW)
         gt_BL = torch.cat(gt_idx_Bl, dim=1)                     # [bs, 680]
-        x_BLCv_wo_first_l: torch.Tensor = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
+        x_BLCv_wo_first_l: torch.Tensor = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)     # for teacher-forcing input
         
         with self.var_opt.amp_ctx:
             self.var_wo_ddp.forward

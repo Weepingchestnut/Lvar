@@ -147,7 +147,7 @@ def main(args):
                 recon_B3HW = var.autoregressive_infer_cfg(B=n, label_B=label_B, cfg=args.cfg_scale, top_k=900, top_p=0.95, g_seed=seed, more_smooth=args.more_smooth)
             
         # measure speed after the first generation batch
-        if total >= global_batch_size:
+        if total >= global_batch_size and rank == 0:
             torch.cuda.synchronize()
             used_time += time.time() - start_time
             print("Generating {} images takes {:.5f} seconds, {:.5f} sec per image".format(total, used_time, used_time / total))

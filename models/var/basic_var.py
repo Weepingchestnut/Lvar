@@ -104,8 +104,8 @@ class SelfAttention(nn.Module):
         B, L, C = x.shape
         
         qkv = F.linear(input=x, weight=self.mat_qkv.weight, 
-                       bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)
-        main_type = qkv.dtype
+                       bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)   # [bs, L, 3, num_heads, ]
+        main_type = qkv.dtype       # torch.float16
         # qkv: BL3Hc
         
         using_flash = self.using_flash and attn_bias is None and qkv.dtype != torch.float32
@@ -128,7 +128,7 @@ class SelfAttention(nn.Module):
                 self.cached_k = k
                 self.cached_v = v
             else: 
-                k = self.cached_k = torch.cat((self.cached_k, k), dim=dim_cat)
+                k = self.cached_k = torch.cat((self.cached_k, k), dim=dim_cat)      # influence: [bs, 5, 16, 64], 5 for scale=3 --> k: [bs, 16, 16, 64]
                 v = self.cached_v = torch.cat((self.cached_v, v), dim=dim_cat)
         
         dropout_p = self.attn_drop if self.training else 0.0

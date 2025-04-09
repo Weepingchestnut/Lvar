@@ -23,7 +23,7 @@ import dist
 
 
 class Args(Tap):
-    data_path: str = '/path/to/imagenet'
+    data_path: str = 'datasets/imagenet'    #'/path/to/imagenet'
     exp_name: str = 'text'
     
     # VAE
@@ -210,7 +210,7 @@ def init_dist_and_get_args():
             del sys.argv[i]
             break
     
-    args = Args(explicit_bool=True).parse_args(known_only=True)
+    args = Args(explicit_bool=True).parse_args(known_only=True)     # known_only=True 仅解析已定义的参数，忽略未定义的参数
     if args.local_debug:
         args.pn = '1_2_3'
         args.seed = 1
@@ -224,7 +224,7 @@ def init_dist_and_get_args():
         if args.data_path == '/path/to/imagenet':
             raise ValueError(f'{"*"*40}  please specify --data_path=/path/to/imagenet  {"*"*40}')
     
-    # warn args.extra_args
+    # warn args.extra_args: Warns the user about undefined additional parameters
     if len(args.extra_args) > 0:
         print(f'======================================================================================')
         print(f'=========================== WARNING: UNEXPECTED EXTRA ARGS ===========================\n{args.extra_args}')
@@ -237,7 +237,7 @@ def init_dist_and_get_args():
     misc.init_distributed_mode(local_out_path=args.local_out_dir_path, timeout=30)
     
     # set env
-    args.set_tf32(args.tf32)
+    args.set_tf32(args.tf32)    # if use tf32 speed up
     args.seed_everything(benchmark=args.pg == 0)
     
     # update args: data loading
@@ -250,10 +250,10 @@ def init_dist_and_get_args():
         args.pn = '1_2_3_4_5_7_9_12_16_21_27_36_48_64'
     args.patch_nums = tuple(map(int, args.pn.replace('-', '_').split('_')))
     args.resos = tuple(pn * args.patch_size for pn in args.patch_nums)
-    args.data_load_reso = max(args.resos)
+    args.data_load_reso = max(args.resos)       # 确定最大分辨率
     
     # update args: bs and lr
-    bs_per_gpu = round(args.bs / args.ac / dist.get_world_size())
+    bs_per_gpu = round(args.bs / args.ac / dist.get_world_size())       # Batch size per GPU
     args.batch_size = bs_per_gpu
     args.bs = args.glb_batch_size = args.batch_size * dist.get_world_size()
     args.workers = min(max(0, args.workers), args.batch_size)

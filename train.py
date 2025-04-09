@@ -210,10 +210,17 @@ def main_training():
                 print(f'[{type(ld_train).__name__}] [ld_train.sampler.set_epoch({ep})]', flush=True, force=True)
         tb_lg.set_step(ep * iters_train)
 
+        # ------ train one epoch ------
         stats, (sec, remain_time, finish_time) = train_one_ep(
-            ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer
+            ep, ep == start_ep, start_it if ep == start_ep else 0, 
+            args, 
+            tb_lg,          # tensorboard logger
+            ld_train,
+            iters_train,
+            trainer         # Trainer class
         )
 
+        # ------ 各类log记录 ------
         L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
         best_L_mean, best_acc_mean = min(best_L_mean, L_mean), max(best_acc_mean, acc_mean)
 
@@ -225,8 +232,10 @@ def main_training():
         args.remain_time, args.finish_time = remain_time, finish_time
 
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
+        # ------------------------
         is_val_and_also_saving = (ep + 1) % 10 == 0 or (ep + 1) == args.ep
 
+        # ------ evaluation and save checkpoints ------
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
 
@@ -253,6 +262,7 @@ def main_training():
                     shutil.copy(local_out_ckpt, local_out_ckpt_best)
                 print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
             dist.barrier()
+        # ----------------------------------------------
         
         print(    f'     [ep{ep}]  (training )  Lm: {best_L_mean:.3f} ({L_mean:.3f}), Lt: {best_L_tail:.3f} ({L_tail:.3f}),  Acc m&t: {best_acc_mean:.2f} {best_acc_tail:.2f},  Remain: {remain_time},  Finish: {finish_time}', flush=True)
         tb_lg.update(head='AR_ep_loss', step=ep+1, **AR_ep_loss)
@@ -289,7 +299,7 @@ def train_one_ep(ep: int,
     from utils.lr_control import lr_wd_annealing
     trainer: VARTrainer
 
-    step_cnt = 0
+    step_cnt = 0        # step count
     me = misc.MetricLogger(delimiter='  ')
     me.add_meter('tlr', misc.SmoothedValue(window_size=1, fmt='{value:.2g}'))
     me.add_meter('tnm', misc.SmoothedValue(window_size=1, fmt='{value:.2f}'))
@@ -300,20 +310,32 @@ def train_one_ep(ep: int,
     if is_first_ep:
         warnings.filterwarnings('ignore', category=DeprecationWarning)
         warnings.filterwarnings('ignore', category=UserWarning)
-    g_it, max_it = ep * iters_train, args.ep * iters_train          # max_iteration
+    g_it, max_it = ep * iters_train, args.ep * iters_train          # global iteration: 表示自训练开始以来的总 iter数; max_iteration
 
     for it, (inp, label) in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
         g_it = ep * iters_train + it
         if it < start_it: continue
         if is_first_ep and it == start_it: warnings.resetwarnings()
 
+        # ------ get input and label ------
         inp = inp.to(args.device, non_blocking=True)        # [bs, 3, 256, 256]
         label = label.to(args.device, non_blocking=True)    # [bs]
 
         args.cur_it = f'{it+1}/{iters_train}'
 
         wp_it = args.wp * iters_train
-        min_tlr, max_tlr, min_twd, max_twd = lr_wd_annealing(args.sche, trainer.var_opt.optimizer, args.tlr, args.twd, args.twde, g_it, wp_it, max_it, wp0=args.wp0, wpe=args.wpe)
+        min_tlr, max_tlr, min_twd, max_twd = lr_wd_annealing(   # 根据 iter 调整学习率
+            args.sche,
+            trainer.var_opt.optimizer,
+            args.tlr,
+            args.twd,
+            args.twde,
+            g_it,
+            wp_it,
+            max_it,
+            wp0=args.wp0,
+            wpe=args.wpe
+        )
         args.cur_lr, args.cur_wd = max_tlr, max_twd
 
         if args.pg: # default: args.pg == 0.0, means no progressive training, won't get into this
@@ -328,11 +350,13 @@ def train_one_ep(ep: int,
         
         stepping = (g_it + 1) % args.ac == 0
         step_cnt += int(stepping)
-
+        
+        # ------ 核心 train step ------
         grad_norm, scale_log2 = trainer.train_step(
             it=it, g_it=g_it, stepping=stepping, metric_lg=me, tb_lg=tb_lg,
             inp_B3HW=inp, label_B=label, prog_si=prog_si, prog_wp_it=args.pgwp * iters_train,
         )
+        # -----------------------------
 
         me.update(tlr=max_tlr)
         tb_lg.set_step(step=g_it)

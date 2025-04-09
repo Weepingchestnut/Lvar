@@ -24,7 +24,8 @@ class AmpOptimizer:
         
         if self.enable_amp:
             self.amp_ctx = torch.autocast('cuda', enabled=True, dtype=torch.float16 if self.using_fp16_rather_bf16 else torch.bfloat16, cache_enabled=True)
-            self.scaler = torch.cuda.amp.GradScaler(init_scale=2. ** 11, growth_interval=1000) if self.using_fp16_rather_bf16 else None # only fp16 needs a scaler
+            # self.scaler = torch.cuda.amp.GradScaler(init_scale=2. ** 11, growth_interval=1000) if self.using_fp16_rather_bf16 else None # only fp16 needs a scaler
+            self.scaler = torch.amp.GradScaler('cuda', init_scale=2. ** 11, growth_interval=1000) if self.using_fp16_rather_bf16 else None
         else:
             self.amp_ctx = NullCtx()
             self.scaler = None

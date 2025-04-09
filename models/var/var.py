@@ -8,7 +8,7 @@ import torch.nn as nn
 import dist
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vae.vqvae import VQVAE, VectorQuantizer2
-from .basic_var import AdaLNBeforeHead, AdaLNSelfAttn
+from .basic_var import AdaLNBeforeHead, AdaLNGatedLinearAttn, AdaLNSelfAttn
 
 
 class SharedAdaLin(nn.Linear):
@@ -160,6 +160,7 @@ class VAR(nn.Module):
         depth = len(self.blocks)
         for block_idx, sab in enumerate(self.blocks):
             sab: AdaLNSelfAttn
+            # GLA and GLAMLP no such attribute
             sab.attn.proj.weight.data.div_(math.sqrt(2 * depth))
             sab.ffn.fc2.weight.data.div_(math.sqrt(2 * depth))
             if hasattr(sab.ffn, 'fcg') and sab.ffn.fcg is not None:
@@ -216,7 +217,7 @@ class VAR(nn.Module):
         elif isinstance(label_B, int):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
-        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))      # [16, 1024]
+        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))      # [2*batch, 1024]
         # cat: tensor([ 980,  980,  437,  437,   22,   22,  562,  562, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000], device='cuda:0'), torch.Size([16])
 
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC        # [1, 680, 1024]
@@ -242,16 +243,16 @@ class VAR(nn.Module):
             logits_BlV = self.get_logits(x, cond_BD)                    # [16, 1, 4096]
 
             t = cfg * ratio
-            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]                                                    # [8, 1, 4096]
+            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]                                                    # [bs, seq_len(1->4->9...), Cvab(4096)]
 
-            idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]    # [8, 1]
+            idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]    # [bs, seq_len(1->4->9...)]
             if not more_smooth: # this is the default case
-                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae                                       # [8, 1, 32]
+                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae                                       # [bs, seq_len(1->4->9...), Cvae(32)]
             else:   # not used when evaluating FID/IS/Precision/Recall
                 gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
                 h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
             
-            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)                                              # [8, 32, 1, 1]
+            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)                                              # [bs, Cvae, h, w]: hw(1->2->3...)
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
             if si != self.num_stages_minus_1:   # prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
@@ -276,8 +277,9 @@ class VAR(nn.Module):
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)    # (0, 680)
         B = x_BLCv_wo_first_l.shape[0]
 
-        with torch.cuda.amp.autocast(enabled=False):
-            label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
+        # with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
+            label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)    # 随机丢弃一些label，替换为特殊类标签1000
             sos = cond_BD = self.class_emb(label_B)                                                             # [bs, 1024]
             sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)     # [bs, 1, 1024]
 
@@ -292,15 +294,17 @@ class VAR(nn.Module):
 
         # hack: get the dtype if mixed precision is used
         temp = x_BLC.new_ones(8, 8)
-        main_type = torch.matmul(temp, temp).dtype
+        main_type = torch.matmul(temp, temp).dtype                  # torch.float16
         
         x_BLC = x_BLC.to(dtype=main_type)
-        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
-        attn_bias = attn_bias.to(dtype=main_type)
+        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)         # float32 --> float16
+        attn_bias = attn_bias.to(dtype=main_type)                   # float32 --> float16
 
         AdaLNSelfAttn.forward
+        # ------ Transformer blocks ------
         for i, b in enumerate(self.blocks):
             x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+        # --------------------------------
         x_BLC = self.get_logits(x_BLC.float(), cond_BD)
 
         if self.prog_si == 0:

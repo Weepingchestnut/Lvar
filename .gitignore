@@ -1,0 +1,9 @@
+*.pyc
+checkpoints
+local_output
+.idea/
+datasets/
+.vscode/
+work_dir/
+mytest/
+*.pb
