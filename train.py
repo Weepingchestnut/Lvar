@@ -82,7 +82,7 @@ def build_everything(args: arg_util.Args):
     from torch.nn.parallel import DistributedDataParallel as DDP
     from models import build_vae_var
     from models.vae.vqvae import VQVAE
-    from models.var.var import VAR
+    from models.var.var_model import VAR
     from trainer import VARTrainer
     from utils.amp_sc import AmpOptimizer
     from utils.lr_control import filter_params

@@ -1,11 +1,12 @@
 import json
+import math
 import os
 import random
 import re
 import subprocess
 import sys
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Optional, Union
 
 import numpy as np
@@ -19,7 +20,7 @@ except ImportError as e:
     time.sleep(5)
     raise e
 
-import dist
+import utils.dist as dist
 
 
 class Args(Tap):

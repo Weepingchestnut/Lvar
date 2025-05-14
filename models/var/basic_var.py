@@ -96,7 +96,7 @@ class SelfAttention(nn.Module):
         # only used during inference
         self.caching, self.cached_k, self.cached_v = False, None, None
     
-    def kv_caching(self, enable: bool): 
+    def kv_caching(self, enable: bool):
         self.caching, self.cached_k, self.cached_v = enable, None, None
     
     # NOTE: attn_bias is None during inference because kv cache is enabled
@@ -104,12 +104,12 @@ class SelfAttention(nn.Module):
         B, L, C = x.shape
         
         qkv = F.linear(input=x, weight=self.mat_qkv.weight, 
-                       bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)   # [bs, L, 3, num_heads, ]
-        main_type = qkv.dtype       # torch.float16
+                       bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)   # [bs, L, 3, num_heads, head_dim]
+        main_type = qkv.dtype       # train: torch.float16
         # qkv: BL3Hc
         
         using_flash = self.using_flash and attn_bias is None and qkv.dtype != torch.float32
-        if using_flash or self.using_xform: 
+        if using_flash or self.using_xform:
             q, k, v = qkv.unbind(dim=2)
             dim_cat = 1     # q or k or v: BLHc
         else: 
@@ -148,7 +148,8 @@ class SelfAttention(nn.Module):
                 p=dropout_p, 
                 scale=self.scale).view(B, L, C)
         else:
-            oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias, dropout_p=dropout_p).transpose(1, 2).reshape(B, L, C)
+            oup = slow_attn(query=q, key=k, value=v, scale=self.scale,
+                            attn_mask=attn_bias, dropout_p=dropout_p).transpose(1, 2).reshape(B, L, C)
         
         return self.proj_drop(self.proj(oup))
         # attn = (q @ k.transpose(-2, -1)).add_(attn_bias + self.local_rpb())  # BHLc @ BHcL => BHLL

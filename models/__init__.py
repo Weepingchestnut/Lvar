@@ -2,7 +2,7 @@ from typing import Tuple
 import torch.nn as nn
 
 from .vae.vqvae import VQVAE
-from .var.var import VAR
+from .var.var_model import VAR
 
 
 def build_vae_var(

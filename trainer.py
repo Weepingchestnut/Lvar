@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 import dist
 from models.vae.quant import VectorQuantizer2
 from models.vae.vqvae import VQVAE
-from models.var.var import VAR
+from models.var.var_model import VAR
 from utils.amp_sc import AmpOptimizer
 from utils.misc import MetricLogger, TensorboardLogger
 

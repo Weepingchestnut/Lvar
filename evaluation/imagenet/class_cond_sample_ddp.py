@@ -11,7 +11,7 @@ from tqdm import tqdm
 from PIL import Image
 
 from models.vae.vqvae import VQVAE
-from models.var.var import VAR
+from models.var.var_model import VAR
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -64,7 +64,7 @@ def main(args):
 
     # ------ Load model ------
     assert args.model_depth in {16, 20, 24, 30}
-    vae_ckpt, var_ckpt = 'checkpoints/var/vae_ch160v4096z32.pth', f'checkpoints/var/var_d{args.model_depth}.pth'
+    vae_ckpt, var_ckpt = 'pretrained_models/var/vae_ch160v4096z32.pth', f'pretrained_models/var/var_d{args.model_depth}.pth'
 
     patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
 
@@ -96,12 +96,13 @@ def main(args):
     var.init_weights(init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=-1)    # init_std < 0: automated
 
     # load checkpoints
-    vae.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
-    var.load_state_dict(torch.load(var_ckpt, map_location='cpu'), strict=True)
+    vae.load_state_dict(torch.load(vae_ckpt, map_location='cpu', weights_only=True), strict=True)
+    var.load_state_dict(torch.load(var_ckpt, map_location='cpu', weights_only=True), strict=True)
     vae.eval(), var.eval()
     for p in vae.parameters(): p.requires_grad_(False)
     for p in var.parameters(): p.requires_grad_(False)
-    print(f'Model prepare finished.')
+    if rank == 0:
+        print(f'Model prepare finished.')
 
     # Create folder to save samples:
     model_string_name = "VAR-d{}".format(args.model_depth)
@@ -114,9 +115,10 @@ def main(args):
 
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
     n = args.per_proc_batch_size
-    print("n = {}".format(n))
     global_batch_size = n * tdist.get_world_size()
-    print("global_batch_size = {}".format(global_batch_size))
+    if rank == 0:
+        print("n = {}".format(n))
+        print("global_batch_size = {}".format(global_batch_size))
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
     total_samples = int(math.ceil(args.num_fid_samples / global_batch_size) * global_batch_size)
 
