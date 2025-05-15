@@ -4,7 +4,7 @@ from typing import Tuple, List, Dict, Union
 
 import torch.nn
 
-import dist
+import utils.dist as dist
 
 
 def lr_wd_annealing(sche_type: str, optimizer, peak_lr, wd, wd_end, cur_it, wp_it, max_it, wp0=0.005, wpe=0.001):
@@ -106,3 +106,30 @@ def filter_params(model, nowd_keys=()) -> Tuple[
     
     assert len(names_no_grad) == 0, f'[get_param_groups] names_no_grad = \n{pformat(names_no_grad, indent=2, width=240)}\n'
     return names, paras, list(para_groups.values())
+
+
+def plot():
+    import matplotlib.pyplot as plt
+    import torch.nn as nn
+    from torch.optim import SGD
+    # for sche in ('lin', 'lin0', 'lin00', 'lin0.5', 'lin0.75'):
+    for sche in ('lin0', ):
+        op = SGD(nn.Linear(3, 4).parameters(), lr=1e-3)
+        it, lr = [], []
+        iters = 500
+        wp_it, max_it = 1 * iters, 10 * iters
+        for cur_it in range(max_it):
+            it.append(cur_it)
+            lr.append(lr_wd_annealing(sche, op, 0.1, 1e-5, 1e-5, cur_it, wp_it, max_it, wpe=0.3)[0])
+
+        plt.figure()
+        plt.title(sche)
+        plt.plot(it, lr, 'b', label=sche)
+        plt.xlabel('it'), plt.ylabel('lr')
+        plt.legend()
+
+    plt.savefig('lr.jpg')
+
+
+if __name__ == '__main__':
+    plot()

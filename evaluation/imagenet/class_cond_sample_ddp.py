@@ -146,7 +146,7 @@ def main(args):
 
         with torch.inference_mode():
             with torch.autocast('cuda', enabled=True, dtype=torch.float16, cache_enabled=True):     # using bfloat16 can be faster
-                recon_B3HW = var.autoregressive_infer_cfg(B=n, label_B=label_B, cfg=args.cfg_scale, top_k=900, top_p=0.95, g_seed=seed, more_smooth=args.more_smooth)
+                recon_B3HW = var.autoregressive_infer_cfg(B=n, label_B=label_B, cfg=args.cfg_scale, top_k=900, top_p=0.96, g_seed=seed, more_smooth=args.more_smooth)
             
         # measure speed after the first generation batch
         if total >= global_batch_size and rank == 0:
