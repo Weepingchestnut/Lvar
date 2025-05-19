@@ -7,7 +7,7 @@
 
 
 
-执行脚本`scripts/c2i_sample_ddp.sh`，可改写脚本中的推理代码文件为上述一种（推荐固定类别生成顺序，指标更高）
+执行脚本`scripts/c2i_sample_ddp.sh`，可改写脚本中的推理代码文件为上述一种（推荐固定类别生成顺序，生成质量指标更高）
 
 ```bash
 bash scripts/c2i_sample_ddp.sh
@@ -19,7 +19,7 @@ bash scripts/c2i_sample_ddp.sh
 
 
 
-跑通后会将生成的图像数据存储到路径`.../Lvar/work_dir`下，同时生成对应的`.npz`文件，用于后续测试指标
+跑通后会将生成的图像数据存储到路径`.../Lvar/work_dir`下，同时生成对应的`.npz`文件，用于后续测试指标。
 
 
 
@@ -27,22 +27,18 @@ bash scripts/c2i_sample_ddp.sh
 
 ## OpenAI TensorFlow 脚本
 
-参考VAR官方Repo，主要还是使用openai提供的验证工具https://github.com/openai/guided-diffusion/tree/main/evaluations，它是基于TensorFlow框架的
+参考VAR官方Repo，主要还是使用openai提供的[验证工具](https://github.com/openai/guided-diffusion/tree/main/evaluations)（基于TensorFlow框架）。
 
 具体运行文件位于`.../Lvar/evaluation/imagenet/openai_evaluator.py`
 
 
 
-需要先下载参考`.npz`数据集，
+需要先下载ImageNet的参考`.npz`数据集，
 
 - ImageNet 256x256: [reference batch](https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz)（常用）
 - ImageNet 512x512: [reference batch](https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/512/VIRTUAL_imagenet512.npz)
 
-将下载好的参考`.npz`数据集放置到路径：
-
-```bash
-.../Lvar/evaluation/imagenet/VIRTUAL_imagenet256_labeled.npz
-```
+将下载好的参考`.npz`数据集放置到路径`.../Lvar/evaluation/imagenet/VIRTUAL_imagenet256_labeled.npz`。
 
 
 
@@ -56,4 +52,29 @@ python openai_evaluator.py VIRTUAL_imagenet256_labeled.npz <path_to_our_generati
 
 ## PyTorch 脚本
 
-新增基于PyTorch的验证脚本
+新增基于PyTorch的验证脚本，参考[MAR](https://github.com/LTH14/mar/blob/main/engine_mar.py)中的实现。
+
+首先需安装经过自定义的`torch-fidelty`，安装命令如下：
+
+```bash
+pip install -e git+https://github.com/LTH14/torch-fidelity.git@master#egg=torch-fidelity
+```
+
+此外，需下载ImageNet的统计参考`.npz`数据集，
+
+- ImageNet 256x256: [adm_in256_stats.npz](https://github.com/LTH14/mar/blob/main/fid_stats/adm_in256_stats.npz)
+
+将下载好的统计参考`.npz`数据集放置到路径`.../Lvar/evaluation/imagenet/adm_in256_stats.npz`。
+
+
+
+c2i推理脚本会默认进行FID和IS的计算，也可以通过代码`torch_evaluator.py`进行指标计算；
+
+- `img_save_folder`：存储生成图像的路径。
+
+
+
+
+
+
+
