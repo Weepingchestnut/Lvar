@@ -7,3 +7,4 @@ datasets/
 work_dir/
 mytest/
 *.pb
+pretrained_models/
