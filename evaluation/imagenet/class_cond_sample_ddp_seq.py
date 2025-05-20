@@ -235,9 +235,13 @@ def main(args):
         print("create npz Done.")
 
         # ------ torch compute FID, IS ------
+        # get current .py path
+        script_path = os.path.abspath(__file__)
+        script_dir = os.path.dirname(script_path)
+
         if args.image_size == 256:
             input2 = None
-            fid_statistics_file = 'adm_in256_stats.npz'
+            fid_statistics_file = os.path.join(script_dir, 'adm_in256_stats.npz')
         else:
             raise NotImplementedError
         
