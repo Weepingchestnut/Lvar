@@ -2,6 +2,7 @@
 
 Pillow
 huggingface_hub
+matplotlib
 numpy
 pytz
 # transformers

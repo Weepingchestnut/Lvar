@@ -35,8 +35,10 @@ if __name__ == '__main__':
     if osp.exists(prompt_rewrite_cache_file):
         with open(prompt_rewrite_cache_file, 'r') as f:
             prompt_rewrite_cache = json.load(f)
+            print("\n[Load prompt_rewrite_cache.json successful!]\n")
     else:
         prompt_rewrite_cache = {}
+        print("\n[Load prompt_rewrite_cache.json false!]\n")
     
     if args.model_type == 'flux_1_dev':
         from diffusers import FluxPipeline
@@ -51,9 +53,9 @@ if __name__ == '__main__':
         # load infinity
         infinity = load_transformer(vae, args)
 
-        if args.rewrite_prompt:
-            from tools.prompt_rewriter import PromptRewriter
-            prompt_rewriter = PromptRewriter(system='', few_shot_history=[])
+        # if args.rewrite_prompt:
+        #     from tools.prompt_rewriter import PromptRewriter
+        #     prompt_rewriter = PromptRewriter(system='', few_shot_history=[])
     
     for index, metadata in enumerate(metadatas):
         seed_everything(args.seed)
@@ -73,11 +75,11 @@ if __name__ == '__main__':
             old_prompt = prompt
             if args.load_rewrite_prompt_cache and prompt in prompt_rewrite_cache:
                 prompt = prompt_rewrite_cache[prompt]
-            else:
-                refined_prompt = prompt_rewriter.rewrite(prompt)
-                input_key_val = extract_key_val(refined_prompt)
-                prompt = input_key_val['prompt']
-                prompt_rewrite_cache[prompt] = prompt
+            # else:
+            #     refined_prompt = prompt_rewriter.rewrite(prompt)
+            #     input_key_val = extract_key_val(refined_prompt)
+            #     prompt = input_key_val['prompt']
+            #     prompt_rewrite_cache[prompt] = prompt
             print(f'old_prompt: {old_prompt}, refined_prompt: {prompt}')
             
         images = []

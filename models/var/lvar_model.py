@@ -5,6 +5,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 
+from models.var.basic_lvar import AdaLNGLA
 import utils.dist as dist
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vae.vqvae import VQVAE, VectorQuantizer2
@@ -19,7 +20,7 @@ class SharedAdaLin(nn.Linear):
         return super().forward(cond_BD).view(-1, 1, 6, C)   # B16C
 
 
-class VAR(nn.Module):
+class LVAR(nn.Module):
     def __init__(
         self, vae_local: VQVAE,
         num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
@@ -92,6 +93,18 @@ class VAR(nn.Module):
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx], last_drop_p=0 if block_idx == 0 else dpr[block_idx-1],
                 attn_l2_norm=attn_l2_norm,
                 flash_if_available=flash_if_available, fused_if_available=fused_if_available,
+            )
+            for block_idx in range(depth)
+        ])
+        # *add GLA blocks
+        self.linear_blocks = nn.ModuleList([
+            AdaLNGLA(
+                block_idx=block_idx,
+                embed_dim=self.C, num_heads=num_heads, norm_layer=norm_layer,
+                cond_dim=self.D, shared_aln=shared_aln,
+                mlp_ratio=mlp_ratio, attn_l2_norm=attn_l2_norm,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx], last_drop_p=0 if block_idx == 0 else dpr[block_idx-1],
+                fused_if_available=fused_if_available,
             )
             for block_idx in range(depth)
         ])
@@ -204,49 +217,77 @@ class VAR(nn.Module):
         Args:
             B (int): batch size
             label_B (Optional[Union[int, torch.LongTensor]]): imagenet label; if None, randomly sampled
-            g_seed (Optional[int], optional): random seed. Defaults to None.
+            g_seed (Optional[int], optional): random seed.
             cfg (float, optional): classifier-free guidance ratio. Defaults to 4.
             top_k (int, optional): top-k sampling. Defaults to 900.
             top_p (float, optional): top-p sampling. Defaults to 0.95.
-            more_smooth (bool, optional): smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking. Defaults to False.
+            more_smooth (bool, optional): smoothing the pred using gumbel softmax; only used in visualization,
+                                            not used in FID/IS benchmarking. Defaults to False.
 
         Returns:
             torch.Tensor: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
         """
-        if g_seed is None: 
-            rng = None
-        else:
-            self.rng.manual_seed(g_seed)
-            rng = self.rng
+        if g_seed is None: rng = None
+        else: self.rng.manual_seed(g_seed); rng = self.rng
         
         if label_B is None:
             label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
         elif isinstance(label_B, int):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
-        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))      # [2*batch, 1024]
+        sos = cond_BD = self.class_emb(
+            torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)),
+                      dim=0))      # [2*bs, C(1024)]
         # cat: tensor([ 980,  980,  437,  437,   22,   22,  562,  562, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000], device='cuda:0'), torch.Size([16])
 
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC        # [1, 680, 1024]
-        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]      # [1, 680, 1024]
+        next_token_map = (sos.unsqueeze(1).expand(2 * B, self.first_l, -1)
+                          + self.pos_start.expand(2 * B, self.first_l, -1)
+                          + lvl_pos[:, :self.first_l])      # [1, 680, 1024]
         # sos: [16, 1024] -> [16, 1, 1024]; self.pos_start: [1, 1, 1024] -> [16, 1, 1024]; lvl_pos: [1, 680, 1024] -> [1, 1, 1024]
 
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])       # [8, 32, 16, 16]
 
-        for b in self.blocks:
-            b.attn.kv_caching(True)
+        # To store KV caches for the second to last scale
+        second_last_scale_kv_caches = []
+        for b in self.blocks: b.attn.kv_caching(True)
 
         for si, pn in enumerate(self.patch_nums):       # si: i-th segment
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
             cur_L += pn*pn
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, \
+            #     f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} /\
+            #         {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)               # [16, 1024]
-            x = next_token_map                                          # scale=3: [bs*2, 3*3, C]
+            x = next_token_map                                          # [16, 1, 1024]
+
             AdaLNSelfAttn.forward
-            for b in self.blocks:
-                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+            AdaLNGLA.forward
+            # last scale
+            if pn == self.patch_nums[-1]:
+                # todo: how to use last scale's KV Cache or token map?
+                past_key_values = [
+                    {'recurrent_state': torch.bmm(k.transpose(1, 2), v)}
+                    for k, v in second_last_scale_kv_caches]
+                for lb in self.linear_blocks:
+                    x = lb(
+                        x=x,
+                        # past_key_values = second_last_scale_kv_caches[lb_idx] if len(second_last_scale_kv_caches) != 0 else None,
+                        past_key_values=past_key_values,
+                        cond_BD=cond_BD_or_gss,
+                        attn_bias=None
+                    )
+            else:
+                for b in self.blocks:
+                    x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)      # [2*bs, cur_L, C]
+                    
+                    if pn == self.patch_nums[-2] and b.attn.caching:
+                        second_last_scale_kv_caches.append(
+                            (b.attn.cached_k.transpose(1, 2).reshape(2*B, cur_L, -1).clone(),
+                             b.attn.cached_v.transpose(1, 2).reshape(2*B, cur_L, -1).clone()))
+                
             # --> for visual attn map ---
             # for idx, b in enumerate(self.blocks):
             #     # print(f"Cueerent: {idx+1} block")
@@ -255,7 +296,7 @@ class VAR(nn.Module):
             #         self.vis_attn_map.set_cur_block(idx+1)
             #     x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None,
             #           vis_attn_map=self.vis_attn_map)
-            #     # print("=" * 50)
+                # print("=" * 50)
             # ---------------------------
             logits_BlV = self.get_logits(x, cond_BD)                    # [16, 1, 4096]
 
@@ -341,7 +382,7 @@ if __name__ == '__main__':
     import random
     import numpy as np
 
-    MODEL_DEPTH = 30
+    MODEL_DEPTH = 36
     assert MODEL_DEPTH in {16, 20, 24, 30, 36}
 
     FOR_512_px = MODEL_DEPTH == 36
@@ -369,7 +410,7 @@ if __name__ == '__main__':
         share_quant_resi=4,
         v_patch_nums=patch_nums).to(device)
     
-    var = VAR(
+    lvar = LVAR(
         vae_local=vae,
         num_classes=1000, depth=MODEL_DEPTH, embed_dim=width, num_heads=heads,
         drop_rate=0., attn_drop_rate=0., drop_path_rate=dpr,
@@ -378,9 +419,9 @@ if __name__ == '__main__':
         patch_nums=patch_nums,
         flash_if_available=True, fused_if_available=True,
     ).to(device)
-    var.init_weights(init_adaln=0.5, init_adaln_gamma=1e-5, 
-                     init_head=0.02, init_std=-1)    # init_std < 0: automated
-    vae.eval(), var.eval()
+    lvar.init_weights(init_adaln=0.5, init_adaln_gamma=1e-5,
+                      init_head=0.02, init_std=-1)    # init_std < 0: automated
+    vae.eval(), lvar.eval()
 
     # set args
     seed = 0
@@ -406,7 +447,7 @@ if __name__ == '__main__':
     label_B: torch.LongTensor = torch.tensor(class_labels, device=device)   # torch.Size([8])
 
     with torch.autocast('cuda', enabled=True, dtype=torch.float16, cache_enabled=True):   # using bfloat16 can be faster
-        recon_B3HW = var.autoregressive_infer_cfg(B=B, label_B=label_B, 
+        recon_B3HW = lvar.autoregressive_infer_cfg(B=B, label_B=label_B, 
                                                   cfg=cfg, top_k=900, top_p=0.96, g_seed=seed, more_smooth=more_smooth)
 
     print(f'recon_B3HW.shape = {recon_B3HW.shape}')

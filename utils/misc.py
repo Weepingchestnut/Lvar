@@ -1,7 +1,9 @@
 from collections import defaultdict, deque
 import datetime
+import functools
 import glob
 import os
+import subprocess
 import sys
 import time
 from typing import Iterator, List, Tuple
@@ -10,8 +12,11 @@ import numpy as np
 import pytz
 import torch
 
-import dist
+import utils.dist as dist
 from utils import arg_util
+
+
+os_system = functools.partial(subprocess.call, shell=True)
 
 
 def time_str(fmt='[%m-%d %H:%M:%S]'):
@@ -20,7 +25,8 @@ def time_str(fmt='[%m-%d %H:%M:%S]'):
 
 def init_distributed_mode(local_out_path, only_sync_master=False, timeout=30):
     try:
-        dist.initialize(fork=False, timeout=timeout)
+        # dist.__initialize(fork=False, timeout=timeout)
+        dist.__initialize(fork=False, timeout_minutes=timeout)
         dist.barrier()
     except RuntimeError:
         print(f'{">"*75}  NCCL Error  {"<"*75}', flush=True)
@@ -108,6 +114,20 @@ class DistLogger(object):
     
     def __getattr__(self, attr: str):
         return getattr(self._lg, attr) if self._verbose else DistLogger.do_nothing
+
+
+class Low_GPU_usage(object):
+    def __init__(self, files, sleep_secs, verbose):
+        pass
+
+    def early_stop(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
 
 
 class TensorboardLogger(object):
@@ -230,18 +250,21 @@ class SmoothedValue(object):
 
 class MetricLogger(object):
     def __init__(self, delimiter='  '):
-        self.meters = defaultdict(SmoothedValue)
         self.delimiter = delimiter
+
+        self.meters = defaultdict(SmoothedValue)
         self.iter_end_t = time.time()
-        self.log_iters = []
+        self.log_iters = set()
+        self.log_every_iter = False
     
     def update(self, **kwargs):
         for k, v in kwargs.items():
             if v is None:
                 continue
-            if hasattr(v, 'item'): v = v.item()
+            if hasattr(v, 'item'): 
+                v = v.item()
             # assert isinstance(v, (float, int)), type(v)
-            assert isinstance(v, (float, int))
+            # assert isinstance(v, (float, int))
             self.meters[k].update(v)
     
     def __getattr__(self, attr):
@@ -268,59 +291,46 @@ class MetricLogger(object):
     def add_meter(self, name, meter):
         self.meters[name] = meter
     
-    def log_every(self, start_it, max_iters, itrt, print_freq, header=None):
-        self.log_iters = set(np.linspace(0, max_iters-1, print_freq, dtype=int).tolist())
+    def log_every(self, start_it, max_iters, itrt, log_freq, log_every_iter=False, header=''):    # also solve logging & skipping iterations before start_it
+        start_it = start_it % max_iters
+        self.log_iters = set(range(start_it, max_iters, log_freq))
         self.log_iters.add(start_it)
-        if not header:
-            header = ''
-        start_time = time.time()
+        self.log_iters.add(max_iters-1)
+        self.log_iters.add(max_iters)
+        self.log_every_iter = log_every_iter
         self.iter_end_t = time.time()
-        self.iter_time = SmoothedValue(fmt='{avg:.4f}')
-        self.data_time = SmoothedValue(fmt='{avg:.4f}')
-        space_fmt = ':' + str(len(str(max_iters))) + 'd'
-        log_msg = [
-            header,
-            '[{0' + space_fmt + '}/{1}]',
-            'eta: {eta}',
-            '{meters}',
-            'time: {time}',
-            'data: {data}'
-        ]
-        log_msg = self.delimiter.join(log_msg)
+        self.iter_time = SmoothedValue(fmt='{value:.4f}')
+        self.data_time = SmoothedValue(fmt='{value:.3f}')
+        header_fmt = header + ':  [{0:' + str(len(str(max_iters))) + 'd}/{1}]'
         
+        start_time = time.time()
         if isinstance(itrt, Iterator) and not hasattr(itrt, 'preload') and not hasattr(itrt, 'set_epoch'):
-            for i in range(start_it, max_iters):
+            for it in range(start_it, max_iters):
                 obj = next(itrt)
+                if it < start_it: continue
                 self.data_time.update(time.time() - self.iter_end_t)
-                yield i, obj
+                yield it, obj
                 self.iter_time.update(time.time() - self.iter_end_t)
-                if i in self.log_iters:
-                    eta_seconds = self.iter_time.global_avg * (max_iters - i)
-                    eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-                    print(log_msg.format(
-                        i, max_iters, eta=eta_string,
-                        meters=str(self),
-                        time=str(self.iter_time), data=str(self.data_time)), flush=True)
+                if self.log_every_iter or it in self.log_iters:
+                    eta_seconds = self.iter_time.avg * (max_iters - it)
+                    print(f'{header_fmt.format(it, max_iters)}  eta: {str(datetime.timedelta(seconds=int(eta_seconds)))}  {str(self)}  T: {self.iter_time.value:.3f}s  dataT: {self.data_time.value*1e3:.1f}ms', flush=True)
                 self.iter_end_t = time.time()
         else:
             if isinstance(itrt, int): itrt = range(itrt)
-            for i, obj in enumerate(itrt):
+            for it, obj in enumerate(itrt):
+                if it < start_it:
+                    self.iter_end_t = time.time()
+                    continue
                 self.data_time.update(time.time() - self.iter_end_t)
-                yield i, obj
+                yield it, obj
                 self.iter_time.update(time.time() - self.iter_end_t)
-                if i in self.log_iters:
-                    eta_seconds = self.iter_time.global_avg * (max_iters - i)
-                    eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-                    print(log_msg.format(
-                        i, max_iters, eta=eta_string,
-                        meters=str(self),
-                        time=str(self.iter_time), data=str(self.data_time)), flush=True)
+                if self.log_every_iter or it in self.log_iters:
+                    eta_seconds = self.iter_time.avg * (max_iters - it)
+                    print(f'{header_fmt.format(it, max_iters)}  eta: {str(datetime.timedelta(seconds=int(eta_seconds)))}  {str(self)}  T: {self.iter_time.value:.3f}s  dataT: {self.data_time.value*1e3:.1f}ms', flush=True)
                 self.iter_end_t = time.time()
-        
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print('{}   Total time:      {}   ({:.3f} s / it)'.format(
-            header, total_time_str, total_time / max_iters), flush=True)
+        cost = time.time() - start_time
+        cost_str = str(datetime.timedelta(seconds=int(cost)))
+        print(f'{header}   Cost of this ep:      {cost_str}   ({cost / (max_iters-start_it):.3f} s / it)', flush=True)
 
 
 def glob_with_latest_modified_first(pattern, recursive=False):
