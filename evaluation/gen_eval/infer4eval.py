@@ -3,6 +3,7 @@ import json
 
 from lightning_fabric import seed_everything
 
+from models.scalekv.scale_kv import enable_scale_kv
 from tools.conf import HF_HOME, HF_TOKEN
 from tools.run_infinity import *
 
@@ -52,6 +53,9 @@ if __name__ == '__main__':
         vae = load_visual_tokenizer(args)
         # load infinity
         infinity = load_transformer(vae, args)
+
+        if 'scalekv' in args.model_type:
+            infinity = enable_scale_kv(infinity, window_size=16, max_capacity=650, kernel_size=5, pooling='maxpool')
 
         # if args.rewrite_prompt:
         #     from tools.prompt_rewriter import PromptRewriter
