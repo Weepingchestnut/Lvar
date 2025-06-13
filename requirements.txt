@@ -1,11 +1,18 @@
-# torch~=2.1.0
-
+# torch~=2.6.0
+clean-fid
+clip_benchmark
 Pillow
+httpx
 huggingface_hub
 matplotlib
 numpy
+openai
+opencv-python
+pytorch_lightning
 pytz
+seaborn
 # transformers
 typed-argument-parser
 tensorflow-io
 tensorboard
+wandb

@@ -1,7 +1,6 @@
 import torch
 
 from timm.loss import SoftTargetCrossEntropy
-# from timm.models.layers import DropPath
 from timm.layers.drop import DropPath
 
 

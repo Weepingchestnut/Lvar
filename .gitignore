@@ -1,10 +1,28 @@
-*.pyc
+# vscode
+.vscode
+.idea/
+
+# macOS
+.DS_Store
+
+# pycache
+__pycache__
+
+# datasets
+datasets
+
+# experimental results
 checkpoints
 local_output
-.idea/
-datasets/
-.vscode/
-work_dir/
-mytest/
+logs
+wandb
+
+# pretrain models
 *.pb
 pretrained_models/
+*.npz
+
+# dev ing...
+models/kernels/
+mytest/
+work_dir/
