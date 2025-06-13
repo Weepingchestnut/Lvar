@@ -1,11 +1,11 @@
 # set arguments for inference
 pn=1M
-model_type=infinity_2b
+model_type=scalekv_infinity_2b
 use_scale_schedule_embedding=0
 use_bit_label=1
 checkpoint_type='torch'
 infinity_model_path=pretrained_models/infinity/Infinity/infinity_2b_reg.pth
-out_dir_root=work_dir/evaluation/dpg-bench/infinity_2b
+out_dir_root=work_dir/evaluation/dpg-bench/scalekv_infinity_2b
 vae_type=32
 vae_path=pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth
 cfg=4
@@ -44,7 +44,6 @@ python evaluation/dpg_bench/infer4dpg.py \
     --apply_spatial_patchify ${apply_spatial_patchify} \
     --cfg_insertion_layer ${cfg_insertion_layer} \
     --outdir ${out_dir}/images \
-    --rewrite_prompt ${rewrite_prompt}
 
 
 # --- calculate metrics ---
@@ -66,12 +65,5 @@ accelerate launch --num_machines 1 --num_processes $PROCESSES --multi_gpu --mixe
     --resolution $RESOLUTION \
     --pic-num $PIC_NUM \
     --vqa-model mplug
-
-# single GPU
-# python evaluation/dpg_bench/compute_dpg_bench.py \
-#   --image-root-path $IMAGE_ROOT_PATH \
-#   --resolution $RESOLUTION \
-#   --pic-num $PIC_NUM \
-#   --vqa-model mplug
 
 # conda deactivate

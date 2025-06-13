@@ -14,7 +14,7 @@ from torch import autocast
 from transformers import AutoTokenizer, T5EncoderModel, T5TokenizerFast
 
 from models.infinity.infinity_model import Infinity
-from models.infinity.fastvar_model import FastVAR_Infinity
+from models.fastvar.fastvar_model import FastVAR_Infinity
 from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 
 
@@ -95,29 +95,47 @@ def load_infinity(
     bf16=False,
     checkpoint_type='torch',
 ):
-    print(f'[Loading Infinity]')
     text_maxlen = 512
-    # with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
+    print(f'[Loading Infinity]')
     with autocast("cuda", dtype=torch.bfloat16, enabled=True, cache_enabled=True), torch.no_grad():
-        infinity_test: Infinity = Infinity(
-        # infinity_test: Infinity = FastVAR_Infinity(
-            vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
-            shared_aln=True, raw_scale_schedule=scale_schedule,
-            checkpointing='full-block',
-            customized_flash_attn=False,
-            fused_norm=True,
-            pad_to_multiplier=128,
-            use_flex_attn=use_flex_attn,
-            add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
-            use_bit_label=use_bit_label,
-            rope2d_each_sa_layer=rope2d_each_sa_layer,
-            rope2d_normalized_by_hw=rope2d_normalized_by_hw,
-            pn=pn,
-            apply_spatial_patchify=apply_spatial_patchify,
-            inference_mode=True,
-            train_h_div_w_list=[1.0],
-            **model_kwargs,
-        ).to(device=device)
+        if model_kwargs.get('fastvar') is not None:
+            infinity_test: Infinity = FastVAR_Infinity(
+                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
+                shared_aln=True, raw_scale_schedule=scale_schedule,
+                checkpointing='full-block',
+                customized_flash_attn=False,
+                fused_norm=True,
+                pad_to_multiplier=128,
+                use_flex_attn=use_flex_attn,
+                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
+                use_bit_label=use_bit_label,
+                rope2d_each_sa_layer=rope2d_each_sa_layer,
+                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+                pn=pn,
+                apply_spatial_patchify=apply_spatial_patchify,
+                inference_mode=True,
+                train_h_div_w_list=[1.0],
+                **model_kwargs,
+            ).to(device=device)
+        else:
+            infinity_test: Infinity = Infinity(
+                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
+                shared_aln=True, raw_scale_schedule=scale_schedule,
+                checkpointing='full-block',
+                customized_flash_attn=False,
+                fused_norm=True,
+                pad_to_multiplier=128,
+                use_flex_attn=use_flex_attn,
+                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
+                use_bit_label=use_bit_label,
+                rope2d_each_sa_layer=rope2d_each_sa_layer,
+                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+                pn=pn,
+                apply_spatial_patchify=apply_spatial_patchify,
+                inference_mode=True,
+                train_h_div_w_list=[1.0],
+                **model_kwargs,
+            ).to(device=device)
         print(f'[you selected Infinity with {model_kwargs=}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
 
         if bf16:
@@ -195,6 +213,18 @@ def load_transformer(vae, args):
         kwargs_model = dict(depth=40, embed_dim=2688, num_heads=24, drop_path_rate=0.1, mlp_ratio=4, block_chunks=4)
     elif args.model_type == 'infinity_layer48':
         kwargs_model = dict(depth=48, embed_dim=3360, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=4)
+    # --- add fastvar ---
+    elif args.model_type == 'fastvar_infinity_2b':
+        kwargs_model = dict(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8,
+                            fastvar=True)
+    elif args.model_type == 'fastvar_infinity_8b':
+        kwargs_model = dict(depth=40, embed_dim=3584, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8, 
+                            fastvar=True)
+    # --- add scalekv ---
+    elif args.model_type == 'scalekv_infinity_2b':
+        kwargs_model = dict(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8)
+    elif args.model_type == 'scalekv_infinity_8b':
+        kwargs_model = dict(depth=40, embed_dim=3584, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8)
     
     infinity = load_infinity(
         rope2d_each_sa_layer=args.rope2d_each_sa_layer, 

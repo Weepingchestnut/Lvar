@@ -1,11 +1,11 @@
 # set arguments for inference
 pn=1M
-model_type=infinity_2b
+model_type=scalekv_infinity_2b
 use_scale_schedule_embedding=0
 use_bit_label=1
 checkpoint_type='torch'
 infinity_model_path=pretrained_models/infinity/Infinity/infinity_2b_reg.pth
-out_dir_root=work_dir/evaluation/dpg-bench/infinity_2b
+out_dir_root=work_dir/evaluation/gen_eval/scalekv_infinity_2b
 vae_type=32
 vae_path=pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth
 cfg=4
@@ -19,11 +19,13 @@ apply_spatial_patchify=0
 cfg_insertion_layer=0
 sub_fix=cfg${cfg}_tau${tau}_cfg_insertion_layer${cfg_insertion_layer}
 
-# DPG-Bench
-out_dir=${out_dir_root}/dpg-bench_${sub_fix}
+# GenEval
+rewrite_prompt=1    # default: 1, load prompt_rewrite_cache.json, from https://github.com/user-attachments/files/18260941/prompt_rewrite_cache.json
+out_dir=${out_dir_root}/gen_eval_${sub_fix}_rewrite_prompt${rewrite_prompt}_round2_real_rewrite
+# test_gen_eval
 
 # --- run inference ---
-python evaluation/dpg_bench/infer4dpg.py \
+python evaluation/gen_eval/infer4eval.py \
     --cfg ${cfg} \
     --tau ${tau} \
     --pn ${pn} \
@@ -46,32 +48,14 @@ python evaluation/dpg_bench/infer4dpg.py \
     --outdir ${out_dir}/images \
     --rewrite_prompt ${rewrite_prompt}
 
+# --- detect objects ---
+export CUDA_VISIBLE_DEVICES=0
+export CUDA_LAUNCH_BLOCKING=1
+python evaluation/gen_eval/evaluate_images.py ${out_dir}/images \
+    --outfile ${out_dir}/results/det.jsonl \
+    --model-config evaluation/gen_eval/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py \
+    --model-path pretrained_models/mask2former
 
-# --- calculate metrics ---
-source ~/anaconda3/etc/profile.d/conda.sh
-conda activate modelscope
-
-IMAGE_ROOT_PATH=${out_dir}/images
-RESOLUTION=1024
-PIC_NUM=${PIC_NUM:-4}
-PROCESSES=${PROCESSES:-2}   # default GPU number
-PORT=${PORT:-29500}
-
-export MODELSCOPE_CACHE="./pretrained_models/.modelscope_cache"
-# mkdir -p $MODELSCOPE_CACHE
-
-accelerate launch --num_machines 1 --num_processes $PROCESSES --multi_gpu --mixed_precision "fp16" --main_process_port $PORT \
-    evaluation/dpg_bench/compute_dpg_bench.py \
-    --image-root-path $IMAGE_ROOT_PATH \
-    --resolution $RESOLUTION \
-    --pic-num $PIC_NUM \
-    --vqa-model mplug
-
-# single GPU
-# python evaluation/dpg_bench/compute_dpg_bench.py \
-#   --image-root-path $IMAGE_ROOT_PATH \
-#   --resolution $RESOLUTION \
-#   --pic-num $PIC_NUM \
-#   --vqa-model mplug
-
-# conda deactivate
+# --- accumulate results ---
+python evaluation/gen_eval/summary_scores.py ${out_dir}/results/det.jsonl > ${out_dir}/results/res.txt
+    cat ${out_dir}/results/res.txt

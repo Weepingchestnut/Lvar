@@ -5,7 +5,8 @@ use_scale_schedule_embedding=0
 use_bit_label=1
 checkpoint_type='torch'
 infinity_model_path=pretrained_models/infinity/Infinity/infinity_2b_reg.pth
-out_dir_root=work_dir/evaluation/infinity_2b
+# out_dir_root=work_dir/evaluation/infinity_2b
+out_dir_root=work_dir/evaluation/fastvar_per-layer_pst_cfg_infinity_2b
 vae_type=32
 vae_path=pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth
 cfg=4
@@ -20,7 +21,7 @@ cfg_insertion_layer=0
 sub_fix=cfg${cfg}_tau${tau}_cfg_insertion_layer${cfg_insertion_layer}
 
 # GenEval
-rewrite_prompt=0    # default: 1, load prompt_rewrite_cache.json, from https://github.com/user-attachments/files/18260941/prompt_rewrite_cache.json
+rewrite_prompt=1    # default: 1, load prompt_rewrite_cache.json, from https://github.com/user-attachments/files/18260941/prompt_rewrite_cache.json
 out_dir=${out_dir_root}/gen_eval_${sub_fix}_rewrite_prompt${rewrite_prompt}_round2_real_rewrite
 # test_gen_eval
 

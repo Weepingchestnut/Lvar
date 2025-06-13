@@ -35,7 +35,7 @@ class FastVAR_Infinity(Infinity):
         if fastvar_enabled:
             if fastvar_pruning_ratios is None:
                 self.fastvar_pruning_ratios = [0.4, 0.5, 1.0, 1.0][:fastvar_cache_step_N]
-                print(f"\n[FastVAR_per-layer enabled with default pruning ratios: {self.fastvar_pruning_ratios} for last {fastvar_cache_step_N} steps.]")
+                print(f"\n[FastVAR_per-layer_pst_cfg enabled with default pruning ratios: {self.fastvar_pruning_ratios} for last {fastvar_cache_step_N} steps.]")
             else:
                 self.fastvar_pruning_ratios = fastvar_pruning_ratios
             assert len(self.fastvar_pruning_ratios) == self.fastvar_cache_step_N, \
@@ -175,8 +175,9 @@ class FastVAR_Infinity(Infinity):
         
         # *====== FastVAR: Determine K_total and K_N_step_idx for caching ======*
         K_total_scales = len(scale_schedule)
-        if self.fastvar_enabled and K_total_scales <= self.fastvar_cache_step_N :
-            print(f"Warning: FastVAR enabled, but K_total_scales ({K_total_scales}) <= fastvar_cache_step_N ({self.fastvar_cache_step_N}). Disabling FastVAR for this run.")
+        if self.fastvar_enabled and K_total_scales <= self.fastvar_cache_step_N:
+            print(f"Warning: FastVAR enabled, but K_total_scales ({K_total_scales}) <= fastvar_cache_step_N ({self.fastvar_cache_step_N}). \
+                  Disabling FastVAR for this run.")
             _fastvar_active = False
         else:
             _fastvar_active = self.fastvar_enabled
@@ -268,7 +269,7 @@ class FastVAR_Infinity(Infinity):
         # *------ scale auto-regressive ------*
         # *------------------------------------
         for si, pn in enumerate(scale_schedule):        # si: i-th segment, pn: current scale patch number (patch_t, patch_h, patch_w)
-            print(f'{si=}, {pn=}')                      # for debug
+            # print(f'{si=}, {pn=}')                      # for debug
             cfg = cfg_list[si]                          # get current scale si's CFG
 
             if si >= trunk_scale: break                 # trunk_scale=1000
@@ -344,7 +345,7 @@ class FastVAR_Infinity(Infinity):
                         # *====== FastVAR: Pivotal Token Selection (PTS) for Texture Filling Stage ======*
                         if is_texture_filling_stage:
                             pivotal_indices_for_current_scale = self._pivotal_token_selection(
-                                last_stage[:B],        # PTS on the conditional part only (B, NumTokens, C)
+                                last_stage,                     # ? PTS on cfg (bs, NumTokens, C)
                                 (pn[1], pn[2]),                 # Assuming t=1 for spatial shape
                                 keep_k_tokens)                  # torch.Size([B, num_pivotal_tokens])
                             # Gather pivotal tokens
@@ -354,6 +355,8 @@ class FastVAR_Infinity(Infinity):
                                 gathered_input_list.append(last_stage[b_idx_gather].gather(dim=0, 
                                                                                            index=pivotal_indices_for_current_scale[orig_b_idx_for_indices].unsqueeze(-1).expand(-1, self.C)))
                             last_stage = torch.stack(gathered_input_list, dim=0) # (bs, NumPivotal, C)
+                            # todo: last_stage.gather
+                            # last_stage = last_stage.gather()
                             # print(f"FastVAR: Scale {si}, Pruning Ratio {pruning_ratio:.2f}, \
                             #       Kept {keep_k_tokens}/{num_tokens_current_scale_total} tokens.")
 
