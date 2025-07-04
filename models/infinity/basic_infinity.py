@@ -3,15 +3,12 @@ Definitions of blocks of VAR transformer model.
 """
 
 import math
-import os
 import sys
-
-from tools.visual_attn import VisualAttnMap
 debugger_attached = hasattr(sys, 'gettrace') and sys.gettrace() is not None
 from functools import partial
 from typing import Optional, Tuple, Union
-import numpy as np
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,9 +19,9 @@ from timm.layers import DropPath, drop_path
 from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
 from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
 
+# not slow attn, for torch 2.6.0, it's flash attn 2 
+# https://docs.pytorch.org/docs/2.6/generated/torch.nn.functional.scaled_dot_product_attention.html#torch.nn.functional.scaled_dot_product_attention
 from torch.nn.functional import scaled_dot_product_attention as slow_attn    # q, k, v: BHLc
-# for visualize attn map -->
-from models.var.basic_var import slow_attn_vis
 
 # Import flash_attn's fused ops
 try:
@@ -50,7 +47,8 @@ def precompute_rope2d_freqs_grid(
         max_width=2048 // 16,
         base=10000.0,
         device=None,
-        scaling_factor=1.0):
+        scaling_factor=1.0
+    ):
     # split the dimension into half, one for x and one for y
     half_dim = dim // 2
     inv_freq = 1.0 / (base ** (torch.arange(0, half_dim, 2, dtype=torch.int64).float().to(device) / half_dim)) # namely theta, 1 / (10000^(i/half_dim)), i=0,2,..., half_dim-2
@@ -263,8 +261,8 @@ class SelfAttention(nn.Module):
         self.cached_v = None
     
     # NOTE: attn_bias_or_two_vector is None during inference
-    def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0,
-                vis_attn_map: VisualAttnMap = None):   # vis_attn_map only use for gen attn map
+    def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]],
+                attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
         """
         :param (fp32) x: shaped (B or batch_size, L or seq_length, C or hidden_dim); if seq-parallel is used, the `L` dim would be shared
         :param (fp32) attn_bias_or_two_vector:
@@ -293,7 +291,8 @@ class SelfAttention(nn.Module):
         B, L, C = x.shape
         
         # qkv: amp, bf16
-        qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)  # BL3Hc
+        qkv = (F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias)))
+               .view(B, L, 3, self.num_heads, self.head_dim))  # BL3Hc
         if self.using_flash: q, k, v = qkv.unbind(dim=2); L_dim = 1           # q or k or v: all are shaped in (B:batch_size, L:seq_len, H:heads, c:head_dim)
         else: q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(dim=0); L_dim = 2   # q or k or v: all are shaped in (B:batch_size, H:heads, L:seq_len, c:head_dim)
         
@@ -324,10 +323,9 @@ class SelfAttention(nn.Module):
             if self.use_flex_attn and attn_fn is not None:
                 oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
             else:
-                oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0).transpose(1, 2).reshape(B, L, C)
-                # for attn map vis --> 
-                # oup = slow_attn_vis(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0,
-                #                     vis_attn_map=vis_attn_map).transpose(1, 2).reshape(B, L, C)
+                oup = (slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0)
+                       .transpose(1, 2)
+                       .reshape(B, L, C))
             # oup: bf16
         
         return self.proj_drop(self.proj(oup))
@@ -372,7 +370,7 @@ class SelfAttnBlock(nn.Module):
         
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector):  # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             if self.shared_aln: # always True;                   (1, 1, 6, C)  + (B, 1, 6, C)
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
             else:
@@ -403,7 +401,7 @@ class CrossAttention(nn.Module):
         :param proj_drop: proj drop out
         :param cos_attn: during attention, q and k will be L2-normalized and scaled by a head-wise learnable parameter self.scale_mul_1H11
         """
-        cos_attn = False    # TODO: never use cos attn in cross attention with T5 kv
+        cos_attn = False    # todo: never use cos attn in cross attention with T5 kv
         super().__init__()
         self.for_attn_pool = for_attn_pool
         self.embed_dim = embed_dim
@@ -519,10 +517,8 @@ class CrossAttnBlock(nn.Module):
         self.checkpointing_sa_only = checkpointing_sa_only
     
     # NOTE: attn_bias_or_two_vector is None during inference
-    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0,
-                vis_attn_map: VisualAttnMap = None):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
-        # with torch.cuda.amp.autocast(enabled=False):    # disable half precision
-        with torch.autocast('cuda', enabled=False):
+    def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):    # todo: minGPT and vqgan also uses pre-norm, just like this, while MaskGiT uses post-norm
+        with torch.autocast('cuda', enabled=False):     # disable half precision
             if self.shared_aln: # always True;                   (1, 1, 6, C)  + (B, 1, 6, C)
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
             else:
@@ -533,7 +529,7 @@ class CrossAttnBlock(nn.Module):
             if self.checkpointing_sa_only and self.training:
                 x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             else:
-                x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid)
+                x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind)      # * add scale_ind
             x = x + self.drop_path(x_sa.mul_(gamma1))
             x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
             x = x + self.drop_path(self.ffn( self.ln_wo_grad(x.float()).mul(scale2.add(1)).add_(shift2) ).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
@@ -542,8 +538,7 @@ class CrossAttnBlock(nn.Module):
             if self.checkpointing_sa_only and self.training:
                 x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             else:
-                x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind,
-                               vis_attn_map=vis_attn_map)
+                x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind)
             x = x + self.drop_path(x_sa.mul_(gamma1))
             x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
             x = x + self.drop_path(self.ffn(self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP

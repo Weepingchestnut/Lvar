@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import hart_backend.fused_kernels
+import hart_backend.fused_kernels   # cd models/hart/kernels && python setup.py install or bash install.sh
 
 from models.helpers import DropPath
 

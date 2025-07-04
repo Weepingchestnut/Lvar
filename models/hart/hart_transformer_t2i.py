@@ -94,7 +94,9 @@ class HARTForT2I(PreTrainedModel):
             scale=0.25)
 
         vae_local = HARTAutoEncoderWithDisc.from_pretrained(vae_path).vae
-        vae_local = vae_local.cuda()
+        # vae_local = vae_local.cuda()
+        # -->
+        vae_local = vae_local.to_empty(device="cuda")
         vae_local.requires_grad_(False)
 
         assert embed_dim % num_heads == 0

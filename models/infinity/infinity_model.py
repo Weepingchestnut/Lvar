@@ -167,7 +167,8 @@ class Infinity(nn.Module):
         always_training_scales=20,
         apply_spatial_patchify = 0,
         inference_mode=False,
-        cache_dir=None          # debug, timm load_model has cache_dir default
+        cache_dir=None,          # debug, timm load_model has cache_dir default
+        skip_last_scales: int = 2,
     ):
         # set hyperparameters
         self.C = embed_dim
@@ -353,14 +354,11 @@ class Infinity(nn.Module):
         print(
             f'\n[constructor]  ==== customized_flash_attn={self.customized_flash_attn} (using_flash={sum((b.sa.using_flash if self.t2i else b.attn.using_flash) for b in self.unregistered_blocks)}/{self.depth}), fused_mlp={fused_mlp} (fused_mlp={sum(b.ffn.fused_mlp_func is not None for b in self.unregistered_blocks)}/{self.depth}) ==== \n'
             f'    [Infinity config ] embed_dim={embed_dim}, num_heads={num_heads}, depth={depth}, mlp_ratio={mlp_ratio}, swiglu={swiglu} num_blocks_in_a_chunk={self.num_blocks_in_a_chunk}\n'
-            f'    [drop ratios] drop_rate={drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
+            f'    [drop ratios] drop_rate={drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})\n',
+            f'    [skip scales] skip last {skip_last_scales} scales',
             end='\n\n', flush=True
         )
-
-        # ------ visual attn map ------
-        # self.vis_attn_map = VisualAttnMap(save_dir="work_dir/infinity-2b_visual_attn_map")
-        # print('\n[Visual attn map]')
-        self.vis_attn_map = None
+        self.skip_last_scales = skip_last_scales
 
     def compile_flex_attn(self):
         attn_fn_compile_dict = {}
@@ -552,6 +550,7 @@ class Infinity(nn.Module):
             vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
         else:
             vae_scale_schedule = scale_schedule
+        
         # ------ text prompt process: for CFG ------
         kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
         if any(np.array(cfg_list) != 1):
@@ -610,8 +609,15 @@ class Infinity(nn.Module):
         
         num_stages_minus_1 = len(scale_schedule) - 1
         summed_codes = 0
-        # ------ auto-regressive scale ------
+        # ------ auto-regressive scale ------             si: [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64]
         for si, pn in enumerate(scale_schedule):        # si: i-th segment, pn: current scale patch number
+            # skip last scales
+            if self.skip_last_scales == 2 and (48 == pn[2] or 64 == pn[2]):
+                continue
+            elif self.skip_last_scales == 1 and 64 == pn[2]:
+                continue
+            # print(f"\n[debug] --- current scale: {si} ({pn[1]}x{pn[2]}) ---")
+
             cfg = cfg_list[si]                          # get current scale si's CFG
             if si >= trunk_scale:                       # trunk_scale=1000
                 break
@@ -636,10 +642,7 @@ class Infinity(nn.Module):
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
                 
                 for m in b.module:
-                    # self.vis_attn_map.set_cur_scale(pn)     # add for vis_attn_map
-                    # self.vis_attn_map.set_cur_block(layer_idx)
-                    last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si,
-                                   vis_attn_map=self.vis_attn_map)
+                    last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
                         # print(f'add cfg={cfg} on {layer_idx}-th layer output')
                         last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
@@ -849,7 +852,8 @@ if __name__ == '__main__':
             vae_local=vae, text_channels=2048, text_maxlen=512,
             shared_aln=True, raw_scale_schedule=None,
             checkpointing='full-block',
-            customized_flash_attn=False,
+            customized_flash_attn=True,    # default: False
+            fused_mlp=True,                 # default: False
             fused_norm=True,
             pad_to_multiplier=128,
             use_flex_attn=0,
