@@ -6,6 +6,8 @@ import time
 from typing import Dict, Sequence
 
 import numpy as np
+import psutil
+import pynvml
 import torch
 import torchvision
 
@@ -40,8 +42,34 @@ Please generate only the enhanced description for the prompt below and DO NOT in
 
 User Prompt:\n"""
 
-# max_seq_len = 10240
-# max_batch_size = 16
+max_seq_len = 10240
+max_batch_size = 16
+
+
+def get_memory_usage(device, nvml_handle):
+    """获取当前 CPU 和 GPU 的内存使用情况"""
+    process = psutil.Process(os.getpid())
+    cpu_mem = process.memory_info().rss / 1024**2 # Bytes to MB
+
+    # PyTorch's perspective
+    pytorch_gpu_mem = torch.cuda.memory_allocated(device) / 1024**2 if torch.cuda.is_available() else 0
+
+    # NVIDIA-SMI's perspective
+    if nvml_handle:
+        info = pynvml.nvmlDeviceGetMemoryInfo(nvml_handle)
+        nvsmi_gpu_mem = info.used / 1024**2 # Bytes to MB
+    else:
+        nvsmi_gpu_mem = 0
+
+    return cpu_mem, pytorch_gpu_mem, nvsmi_gpu_mem
+
+
+def format_memory(mem_mb):
+    """将 MB 格式化为 GB 或 MB"""
+    if mem_mb > 1024:
+        return f"{mem_mb / 1024:.2f} GB"
+    else:
+        return f"{mem_mb:.2f} MB"
 
 
 # Modified from VILA
@@ -146,65 +174,58 @@ def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
 
 
 def main(args):
-    device = torch.device("cuda")
+    # --- NVML init ---
+    nvml_handle = None
+    try:
+        pynvml.nvmlInit()
+        if torch.cuda.is_available():
+            nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+    except pynvml.NVMLError as e:
+        print(f"Warning: Could not initialize NVML. NVIDIA-SMI usage will not be reported. Error: {e}")
+    # ----------------
 
-    model = AutoModel.from_pretrained(args.model_path)
-    model = model.to(device)
-    model.eval()
+    try:
+        device = torch.device("cuda")
+    
+        # --- Memory Analysis: Initial State ---
+        torch.cuda.empty_cache()
+        start_cpu, start_pytorch_gpu, start_nvsmi_gpu = get_memory_usage(device, nvml_handle)
+        print("--- Memory Usage (Initial) ---")
+        print(f"CPU Memory: {format_memory(start_cpu)}")
+        print(f"GPU Memory (PyTorch): {format_memory(start_pytorch_gpu)}")
+        print(f"GPU Memory (NVIDIA-SMI): {format_memory(start_nvsmi_gpu)}")
+        print("-" * 35)
+        # --------------------------------------
 
-    if args.use_ema:
-        ema_model = copy.deepcopy(model)
-        ema_model.load_state_dict(
-            torch.load(os.path.join(args.model_path, "ema_model.bin"))
-        )
+        model = AutoModel.from_pretrained(args.model_path)
+        model = model.to(device)
+        model.eval()
 
-    text_tokenizer = AutoTokenizer.from_pretrained(args.text_model_path)
-    text_model = AutoModel.from_pretrained(args.text_model_path).to(device)
-    text_model.eval()
-    text_tokenizer_max_length = args.max_token_length
-
-    prompts = random.sample(default_prompts, args.batch_size)
-
-    with torch.inference_mode():
-        with torch.autocast(
-            "cuda", enabled=True, dtype=torch.float16, cache_enabled=True
-        ):
-
-            (
-                context_tokens,
-                context_mask,
-                context_position_ids,
-                context_tensor,
-            ) = encode_prompts(
-                prompts,
-                text_model,
-                text_tokenizer,
-                args.max_token_length,
-                llm_system_prompt,
-                args.use_llm_system_prompt,
+        if args.use_ema:
+            ema_model = copy.deepcopy(model)
+            ema_model.load_state_dict(
+                torch.load(os.path.join(args.model_path, "ema_model.bin"))
             )
 
-            infer_func = (
-                ema_model.autoregressive_infer_cfg
-                if args.use_ema
-                else model.autoregressive_infer_cfg
-            )
+        text_tokenizer = AutoTokenizer.from_pretrained(args.text_model_path)
+        text_model = AutoModel.from_pretrained(args.text_model_path).to(device)
+        text_model.eval()
 
-            # warmup
-            for _ in tqdm(range(args.warmup_iter)):
-                output_imgs = infer_func(
-                    B=context_tensor.size(0),
-                    label_B=context_tensor,
-                    cfg=args.cfg,
-                    g_seed=args.seed,
-                    more_smooth=args.more_smooth,
-                    context_position_ids=context_position_ids,
-                    context_mask=context_mask,
-                )
+        # --- Memory analysis: After model load ---
+        torch.cuda.synchronize()
+        post_cpu, post_pytorch_gpu, post_nvsmi_gpu = get_memory_usage(device, nvml_handle)
+        print("\n--- Memory Usage (After Model Load) ---")
+        print(f"CPU Memory: {format_memory(post_cpu)} (Used: {format_memory(post_cpu - start_cpu)})")
+        print(f"GPU Memory (PyTorch): {format_memory(post_pytorch_gpu)} (Used: {format_memory(post_pytorch_gpu - start_pytorch_gpu)})")
+        print(f"GPU Memory (NVIDIA-SMI): {format_memory(post_nvsmi_gpu)} (Used: {format_memory(post_nvsmi_gpu - start_nvsmi_gpu)})")
+        print("-" * 35)
+        # ----------------------------------------
 
-            # latency profile
-            start_time = time.time()
-            for _ in tqdm(range(args.profile_iter)):
+        text_tokenizer_max_length = args.max_token_length
+        prompts = random.sample(default_prompts, args.batch_size)
+
+        with torch.inference_mode():
+            with torch.autocast("cuda", enabled=True, dtype=torch.float16, cache_enabled=True):
                 (
                     context_tokens,
                     context_mask,
@@ -214,24 +235,112 @@ def main(args):
                     prompts,
                     text_model,
                     text_tokenizer,
-                    args.max_token_length,
+                    # args.max_token_length,
+                    text_tokenizer_max_length,
                     llm_system_prompt,
                     args.use_llm_system_prompt,
                 )
-                output_imgs = infer_func(
-                    B=context_tensor.size(0),
-                    label_B=context_tensor,
-                    cfg=args.cfg,
-                    g_seed=args.seed,
-                    more_smooth=args.more_smooth,
-                    context_position_ids=context_position_ids,
-                    context_mask=context_mask,
-                )
-            total_time = time.time() - start_time
 
-    average_time = total_time / args.profile_iter
-    print(
-        f"Generation with batch_size = {args.batch_size} take {average_time:2f}s per step.")
+                infer_func = (
+                    ema_model.autoregressive_infer_cfg
+                    if args.use_ema
+                    else model.autoregressive_infer_cfg
+                )
+
+                # --- Memory Analysis: Preparing for Inference ---
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(device)
+                peak_cpu_mem = post_cpu
+                peak_nvsmi_gpu_mem = post_nvsmi_gpu
+                # ------------------------------------------------
+
+                # warmup
+                print(f"\nStarting GPU warm-up for {args.warmup_iter} iterations...")
+                for _ in tqdm(range(args.warmup_iter)):
+                    output_imgs = infer_func(
+                        B=context_tensor.size(0),
+                        label_B=context_tensor,
+                        cfg=args.cfg,
+                        g_seed=args.seed,
+                        more_smooth=args.more_smooth,
+                        context_position_ids=context_position_ids,
+                        context_mask=context_mask,
+                    )
+                    # --- Memory Analysis: Monitoring CPU and NVIDIA-SMI in a loop ---
+                    cpu, _, nvsmi = get_memory_usage(device, nvml_handle)
+                    peak_cpu_mem = max(peak_cpu_mem, cpu)
+                    peak_nvsmi_gpu_mem = max(peak_nvsmi_gpu_mem, nvsmi)
+                    # ----------------------------------------------------------------
+                torch.cuda.synchronize(device=device)
+                print("GPU warm-up finished.")
+
+                # latency profile
+                print(f"\nStarting inference speed test for {args.profile_iter} iterations...")
+                timings = []
+                sstart_time = time.time()
+                for _ in tqdm(range(args.profile_iter)):
+                    start_time = time.perf_counter()    # for accurate timing
+                    (
+                        context_tokens,
+                        context_mask,
+                        context_position_ids,
+                        context_tensor,
+                    ) = encode_prompts(
+                        prompts,
+                        text_model,
+                        text_tokenizer,
+                        args.max_token_length,
+                        llm_system_prompt,
+                        args.use_llm_system_prompt,
+                    )
+                    output_imgs = infer_func(
+                        B=context_tensor.size(0),
+                        label_B=context_tensor,
+                        cfg=args.cfg,
+                        g_seed=args.seed,
+                        more_smooth=args.more_smooth,
+                        context_position_ids=context_position_ids,
+                        context_mask=context_mask,
+                    )
+                    # --- Memory Analysis: Monitoring CPU and NVIDIA-SMI in a loop ---
+                    cpu, _, nvsmi = get_memory_usage(device, nvml_handle)
+                    peak_cpu_mem = max(peak_cpu_mem, cpu)
+                    peak_nvsmi_gpu_mem = max(peak_nvsmi_gpu_mem, nvsmi)
+                    # ----------------------------------------------------------------
+                    torch.cuda.synchronize(device=device)   # *Important*: Ensure that all CUDA operations are completed before recording the time
+
+                    end_time = time.perf_counter()
+                    timings.append(end_time - start_time)
+
+                ttotal_time = time.time() - sstart_time
+                print("Inference speed test finished.")
+
+        average_time = ttotal_time / args.profile_iter
+        print(f"\nGeneration with batch_size = {args.batch_size} take {average_time:2f}s per step.")
+
+        batch_size = args.batch_size
+        avg_latency = sum(timings) / len(timings)
+        std_latency = torch.tensor(timings).std().item()
+        throughput = batch_size / avg_latency if avg_latency > 0 else float('inf')
+
+        print(f"\n--- Inference Performance ---")
+        print(f"Batch Size: {batch_size}")
+        print(f"Average Latency: {avg_latency * 1000:.2f} ms")
+        print(f"Latency StdDev: {std_latency * 1000:.2f} ms")
+        print(f"Throughput: {throughput:.2f} samples/sec")
+        print("-" * 30)
+
+        # --- Memory Analysis: final report ---
+        peak_pytorch_gpu_mem = torch.cuda.max_memory_allocated(device) / 1024**2
+        print("\n--- Memory Usage (Peak during Inference) ---")
+        print(f"Peak CPU Memory: {format_memory(peak_cpu_mem)} (Total Used: {format_memory(peak_cpu_mem - start_cpu)})")
+        print(f"Peak GPU Memory (PyTorch): {format_memory(peak_pytorch_gpu_mem)} (Total Used: {format_memory(peak_pytorch_gpu_mem - start_pytorch_gpu)})")
+        print(f"Peak GPU Memory (NVIDIA-SMI): {format_memory(peak_nvsmi_gpu_mem)} (Total Used: {format_memory(peak_nvsmi_gpu_mem - start_nvsmi_gpu)})")
+        print("-" * 40)
+    
+    finally:
+        if nvml_handle:
+            pynvml.nvmlShutdown()   # NVML clean
 
 
 if __name__ == "__main__":
@@ -240,14 +349,14 @@ if __name__ == "__main__":
         "--model_path",
         type=str,
         help="The path to HART model.",
-        default="pretrained_models/HART-1024",)
+        default="pretrained_models/hart/hart-0.7b-1024px/llm",)
     parser.add_argument(
         "--text_model_path",
         type=str,
         help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
-        default="Qwen2-VL-1.5B-Instruct",)
+        default="pretrained_models/hart/Qwen2-VL-1.5B-Instruct",)
     parser.add_argument(
-        "--batch_size", type=int, help="Generation batch size", default=1)
+        "--batch_size", type=int, help="Generation batch size", default=2)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--use_ema", type=bool, default=True)
     parser.add_argument("--max_token_length", type=int, default=300)

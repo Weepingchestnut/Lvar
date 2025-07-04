@@ -1,11 +1,11 @@
 # set arguments for inference
 pn=1M
-model_type=scalekv_infinity_2b
+model_type=skipvar_infinity_2b
 use_scale_schedule_embedding=0
 use_bit_label=1
 checkpoint_type='torch'
 infinity_model_path=pretrained_models/infinity/Infinity/infinity_2b_reg.pth
-out_dir_root=work_dir/evaluation/gen_eval/scalekv_infinity_2b
+out_dir_root=work_dir/evaluation/gen_eval/${model_type}
 vae_type=32
 vae_path=pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth
 cfg=4

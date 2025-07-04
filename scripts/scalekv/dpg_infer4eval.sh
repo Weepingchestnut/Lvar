@@ -21,9 +21,14 @@ sub_fix=cfg${cfg}_tau${tau}_cfg_insertion_layer${cfg_insertion_layer}
 
 # DPG-Bench
 out_dir=${out_dir_root}/dpg-bench_${sub_fix}
+mkdir -p ${out_dir}
 
 # --- run inference ---
-python evaluation/dpg_bench/infer4dpg.py \
+# single GPU
+# python evaluation/dpg_bench/infer4dpg.py \
+# mutil GPUs
+unset CUDA_VISIBLE_DEVICES
+torchrun --nproc_per_node=2 evaluation/dpg_bench/infer4dpg_ddp.py \
     --cfg ${cfg} \
     --tau ${tau} \
     --pn ${pn} \
@@ -43,11 +48,11 @@ python evaluation/dpg_bench/infer4dpg.py \
     --text_channels ${text_channels} \
     --apply_spatial_patchify ${apply_spatial_patchify} \
     --cfg_insertion_layer ${cfg_insertion_layer} \
-    --outdir ${out_dir}/images \
+    --outdir ${out_dir}/images 2>&1 | tee ${out_dir}/eval_dpg-bench.log
 
 
 # --- calculate metrics ---
-source ~/anaconda3/etc/profile.d/conda.sh
+source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
 conda activate modelscope
 
 IMAGE_ROOT_PATH=${out_dir}/images
@@ -64,6 +69,13 @@ accelerate launch --num_machines 1 --num_processes $PROCESSES --multi_gpu --mixe
     --image-root-path $IMAGE_ROOT_PATH \
     --resolution $RESOLUTION \
     --pic-num $PIC_NUM \
-    --vqa-model mplug
+    --vqa-model mplug 2>&1 | tee ${out_dir}/matrics_dpg-bench.log
+
+# single GPU
+# python evaluation/dpg_bench/compute_dpg_bench.py \
+#   --image-root-path $IMAGE_ROOT_PATH \
+#   --resolution $RESOLUTION \
+#   --pic-num $PIC_NUM \
+#   --vqa-model mplug
 
 # conda deactivate
