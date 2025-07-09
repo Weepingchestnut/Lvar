@@ -66,16 +66,23 @@ def transform(pil_img, tgt_h, tgt_w):
 
 
 def joint_vi_vae_encode_decode(vae, image_path, scale_schedule, device, tgt_h, tgt_w):
+    # 1. Image load and pre-process
     pil_image = Image.open(image_path).convert('RGB')
     inp = transform(pil_image, tgt_h, tgt_w)
     inp = inp.unsqueeze(0).to(device)
+
+    # 2. VAE encoder
     scale_schedule = [(item[0], item[1], item[2]) for item in scale_schedule]
     t1 = time.time()
     h, z, _, all_bit_indices, _, infinity_input = vae.encode(inp, scale_schedule=scale_schedule)
     t2 = time.time()
+
+    # 3. Call the VAE decoder for reconstruction
     recons_img = vae.decode(z)[0]
     if len(recons_img.shape) == 4:
         recons_img = recons_img.squeeze(1)
+    
+    # 4. Image post-process
     print(f'recons: z.shape: {z.shape}, recons_img shape: {recons_img.shape}')
     t3 = time.time()
     print(f'vae encode takes {t2-t1:.2f}s, decode takes {t3-t2:.2f}s')
@@ -84,6 +91,7 @@ def joint_vi_vae_encode_decode(vae, image_path, scale_schedule, device, tgt_h, t
     gt_img = (inp[0] + 1) / 2
     gt_img = gt_img.permute(1, 2, 0).mul_(255).cpu().numpy().astype(np.uint8)
     print(recons_img.shape, gt_img.shape)
+    
     return gt_img, recons_img, all_bit_indices
 
 
@@ -486,21 +494,21 @@ def gen_one_img(
 
 
 def add_common_arguments(parser):
-    parser.add_argument('--cfg', type=str, default='3')
-    parser.add_argument('--tau', type=float, default=1)
-    parser.add_argument('--pn', type=str, required=True, choices=['0.06M', '0.25M', '1M'])
-    parser.add_argument('--model_path', type=str, required=True)
+    parser.add_argument('--cfg', type=str, default='4')     # '3'
+    parser.add_argument('--tau', type=float, default=0.5)     # 1
+    parser.add_argument('--pn', type=str, default='1M', choices=['0.06M', '0.25M', '1M'])
+    parser.add_argument('--model_path', type=str, default='pretrained_models/infinity/Infinity/infinity_2b_reg.pth')
     parser.add_argument('--cfg_insertion_layer', type=int, default=0)
-    parser.add_argument('--vae_type', type=int, default=1)
-    parser.add_argument('--vae_path', type=str, default='')
-    parser.add_argument('--add_lvl_embeding_only_first_block', type=int, default=0, choices=[0,1])
+    parser.add_argument('--vae_type', type=int, default=32)
+    parser.add_argument('--vae_path', type=str, default='pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth')
+    parser.add_argument('--add_lvl_embeding_only_first_block', type=int, default=1, choices=[0,1])
     parser.add_argument('--use_bit_label', type=int, default=1, choices=[0,1])
     parser.add_argument('--model_type', type=str, default='infinity_2b')
     parser.add_argument('--rope2d_each_sa_layer', type=int, default=1, choices=[0,1])
     parser.add_argument('--rope2d_normalized_by_hw', type=int, default=2, choices=[0,1,2])
     parser.add_argument('--use_scale_schedule_embedding', type=int, default=0, choices=[0,1])
     parser.add_argument('--sampling_per_bits', type=int, default=1, choices=[1,2,4,8,16])
-    parser.add_argument('--text_encoder_ckpt', type=str, default='')
+    parser.add_argument('--text_encoder_ckpt', type=str, default='pretrained_models/infinity/flan-t5-xl')
     parser.add_argument('--text_channels', type=int, default=2048)
     parser.add_argument('--apply_spatial_patchify', type=int, default=0, choices=[0,1])
     parser.add_argument('--h_div_w_template', type=float, default=1.000)

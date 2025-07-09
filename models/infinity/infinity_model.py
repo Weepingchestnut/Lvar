@@ -10,8 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models import register_model
 
-from tools.visual_attn import VisualAttnMap
-
 from models.infinity.flex_attn import FlexAttn
 from models.infinity.basic_infinity import AdaLNBeforeHead, CrossAttnBlock, SelfAttnBlock, flash_attn_func, flash_fused_op_installed, CrossAttention, FastRMSNorm, precompute_rope2d_freqs_grid
 
@@ -20,7 +18,7 @@ from utils.dist import for_visualize
 from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 
 try:
-    from .fused_op import fused_ada_layer_norm, fused_ada_rms_norm
+    from models.infinity.fused_op import fused_ada_layer_norm, fused_ada_rms_norm
 except:
     fused_ada_layer_norm, fused_ada_rms_norm = None, None
 
@@ -168,7 +166,7 @@ class Infinity(nn.Module):
         apply_spatial_patchify = 0,
         inference_mode=False,
         cache_dir=None,          # debug, timm load_model has cache_dir default
-        skip_last_scales: int = 2,
+        skip_last_scales: int = 0,
     ):
         # set hyperparameters
         self.C = embed_dim
@@ -852,8 +850,8 @@ if __name__ == '__main__':
             vae_local=vae, text_channels=2048, text_maxlen=512,
             shared_aln=True, raw_scale_schedule=None,
             checkpointing='full-block',
-            customized_flash_attn=True,    # default: False
-            fused_mlp=True,                 # default: False
+            customized_flash_attn=False,    # default: False
+            fused_mlp=False,                 # default: False
             fused_norm=True,
             pad_to_multiplier=128,
             use_flex_attn=0,
