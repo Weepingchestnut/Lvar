@@ -11,6 +11,7 @@ from typing import Iterator, List, Tuple
 import numpy as np
 import pytz
 import torch
+import torch.distributed as tdist
 
 import utils.dist as dist
 from utils import arg_util
@@ -375,4 +376,24 @@ def create_npz_from_sample_folder(sample_folder: str):
     np.savez(npz_path, arr_0=samples)
     print(f'Saved .npz file to {npz_path} [shape={samples.shape}].')
     return npz_path
+
+
+def is_dist_avail_and_initialized():
+    if not tdist.is_available():
+        return False
+    if not tdist.is_initialized():
+        return False
+    return True
+
+
+def get_rank():
+    if not is_dist_avail_and_initialized():
+        return 0
+    return tdist.get_rank()
+
+
+def get_world_size():
+    if not is_dist_avail_and_initialized():
+        return 1
+    return tdist.get_world_size()
 
