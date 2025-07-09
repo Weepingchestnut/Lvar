@@ -181,9 +181,9 @@ if __name__ == '__main__':
 
     if args.out_dir:
         out_dir = args.out_dir
-    # else:
-    #     out_dir = osp.join('output', osp.basename(osp.dirname(model_path)), osp.splitext(osp.basename(model_path))[0], 
-    #                        f'coco30k_infer' if args.coco30k_prompts else 'comprehensive_infer')
+    else:
+        out_dir = osp.join('output', osp.basename(osp.dirname(args.model_path)), osp.splitext(osp.basename(args.model_path))[0], 
+                           f'coco30k_infer' if args.coco30k_prompts else 'comprehensive_infer')
     print(f'save to {out_dir}')
 
     # load text encoder
@@ -215,6 +215,7 @@ if __name__ == '__main__':
             h_div_w_template = h_div_w_templates[np.argmin(np.abs(h_div_w_templates - infer_data['h_div_w']))]
             scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
             scale_schedule = [(1, h, w) for (t,h, w) in scale_schedule]
+
             if args.apply_spatial_patchify:
                 vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
             else:
@@ -231,7 +232,14 @@ if __name__ == '__main__':
                     continue
             
             if args.coco30k_prompts or args.save4fid_eval:
-                concate_img = gen_one_img(infinity, vae, text_tokenizer, text_encoder, prompt, g_seed=0, gt_leak=0, gt_ls_Bl=gt_ls_Bl, t5_path=None, tau_list=args.tau, cfg_sc=3, cfg_list=args.cfg, scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer], vae_type=args.vae_type, sampling_per_bits=args.sampling_per_bits)
+                concate_img = gen_one_img(
+                    infinity, vae, text_tokenizer, text_encoder,
+                    prompt, g_seed=0, gt_leak=0, gt_ls_Bl=gt_ls_Bl,
+                    # t5_path=None,
+                    tau_list=args.tau, cfg_sc=3, cfg_list=args.cfg,
+                    scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer],
+                    vae_type=args.vae_type, sampling_per_bits=args.sampling_per_bits
+                ).cpu().numpy()
             else:
                 g_seed = 0 if args.n_samples == 1 else None
                 tmp_img_list = []
@@ -239,33 +247,48 @@ if __name__ == '__main__':
                     tmp_img_list.append(
                         gen_one_img(
                             infinity, vae, text_tokenizer, text_encoder,
-                            prompt, g_seed=g_seed,
-                            gt_leak=0, gt_ls_Bl=gt_ls_Bl,
+                            prompt, g_seed=g_seed, gt_leak=0, gt_ls_Bl=gt_ls_Bl,
                             # t5_path=None,
                             tau_list=args.tau, cfg_sc=3, cfg_list=args.cfg,
-                            scale_schedule=scale_schedule,
-                            cfg_insertion_layer=[args.cfg_insertion_layer],
-                            vae_type=args.vae_type,
-                            sampling_per_bits=1, top_k=0
+                            scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer],
+                            vae_type=args.vae_type, sampling_per_bits=1, top_k=0
                         ).cpu().numpy()
                     )
                 img_list.append(np.concatenate(tmp_img_list, axis=1))
 
-                # tmp_img_list = []
-                # for _ in range(args.n_samples):
-                #     tmp_img_list.append(gen_one_img(infinity, vae, text_tokenizer, text_encoder, prompt, g_seed=g_seed, gt_leak=0, gt_ls_Bl=gt_ls_Bl, t5_path=None, tau_list=args.tau, cfg_sc=3, cfg_list=args.cfg, scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer], vae_type=args.vae_type, sampling_per_bits=8, top_k=0))
-                # img_list.append(np.concatenate(tmp_img_list, axis=1))
+                tmp_img_list = []
+                for _ in range(args.n_samples):
+                    tmp_img_list.append(
+                        gen_one_img(
+                            infinity, vae, text_tokenizer, text_encoder,
+                            prompt, g_seed=g_seed, gt_leak=0, gt_ls_Bl=gt_ls_Bl,
+                            # t5_path=None,
+                            tau_list=args.tau, cfg_sc=3, cfg_list=args.cfg,
+                            scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer],
+                            vae_type=args.vae_type, sampling_per_bits=8, top_k=0
+                        ).cpu().numpy()
+                    )
+                img_list.append(np.concatenate(tmp_img_list, axis=1))
 
-                # tmp_img_list = []
-                # for _ in range(args.n_samples):
-                #     tmp_img_list.append(gen_one_img(infinity, vae, text_tokenizer, text_encoder, prompt, g_seed=g_seed, gt_leak=0, gt_ls_Bl=gt_ls_Bl, t5_path=None, tau_list=args.tau, cfg_sc=3, cfg_list=args.cfg, scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer], vae_type=args.vae_type, sampling_per_bits=16, top_k=0))
-                # img_list.append(np.concatenate(tmp_img_list, axis=1))
+                tmp_img_list = []
+                for _ in range(args.n_samples):
+                    tmp_img_list.append(
+                        gen_one_img(
+                            infinity, vae, text_tokenizer, text_encoder,
+                            prompt, g_seed=g_seed, gt_leak=0, gt_ls_Bl=gt_ls_Bl,
+                            # t5_path=None,
+                            tau_list=args.tau, cfg_sc=3, cfg_list=args.cfg,
+                            scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer],
+                            vae_type=args.vae_type, sampling_per_bits=16, top_k=0
+                        ).cpu().numpy()
+                    )
+                img_list.append(np.concatenate(tmp_img_list, axis=1))
                 
                 if args.n_samples == 1:
                     concate_img = np.concatenate([np.array(item) for item in img_list], 1)
                 else:
                     concate_img = np.concatenate([np.array(item) for item in img_list], 0)
-                concate_img = Image.fromarray(concate_img)
+                # concate_img = Image.fromarray(concate_img)
             
             os.makedirs(osp.dirname(save_file), exist_ok=True)
             # cv2.imwrite(save_file, concate_img.cpu().numpy())
