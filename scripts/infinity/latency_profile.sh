@@ -1,31 +1,33 @@
 # set arguments for inference
-model_type=skipvar_infinity_8b
-# model_type=skipvar_infinity_2b
+skip_scale=$1
+model_type=infinity_8b
+# model_type=infinity_2b
 
-out_dir_root=work_dir/evaluation/dpg-bench/${model_type}
+out_dir_root=work_dir/infer_profile/${model_type}_skip-${skip_scale}-scale
 
-if [ "$model_type" == "skipvar_infinity_2b" ]; then
+if [ "$model_type" == "infinity_2b" ]; then
     checkpoint_type='torch'
     infinity_model_path=pretrained_models/infinity/Infinity/infinity_2b_reg.pth
     vae_type=32
     vae_path=pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth
     apply_spatial_patchify=0
-    cfg=4
-    tau=1
-elif [ "$model_type" == "skipvar_infinity_8b" ]; then
+    cfg=3
+    tau=0.5
+elif [ "$model_type" == "infinity_8b" ]; then
     checkpoint_type='torch_shard'
     infinity_model_path=pretrained_models/infinity/Infinity/infinity_8b_weights
     vae_type=14
     vae_path=pretrained_models/infinity/Infinity/infinity_vae_d56_f8_14_patchify.pth
     apply_spatial_patchify=1
-    cfg=4
+    cfg=3
     tau=1
 else
     echo "Unknown model_type '$model_type'"
-    echo "Support model_type: 'skipvar_infinity_2b', 'skipvar_infinity_8b'"
+    echo "Support model_type: 'infinity_2b', 'infinity_8b'"
     exit 1
 fi
 
+skip_last_scales=${skip_scale}
 pn=1M
 use_scale_schedule_embedding=0
 use_bit_label=1
@@ -37,16 +39,13 @@ text_channels=2048
 cfg_insertion_layer=0
 sub_fix=cfg${cfg}_tau${tau}_cfg_insertion_layer${cfg_insertion_layer}
 
-# DPG-Bench
-out_dir=${out_dir_root}/dpg-bench_${sub_fix}
+out_dir=${out_dir_root}/latency-profile_${sub_fix}
 mkdir -p ${out_dir}
 
 # --- run inference ---
 # single GPU
-# python evaluation/dpg_bench/infer4dpg.py \
-# mutil GPUs
-unset CUDA_VISIBLE_DEVICES
-torchrun --nproc_per_node=4 evaluation/dpg_bench/infer4dpg_ddp.py \
+# export CUDA_VISIBLE_DEVICES=7
+python tools/latency_profile_infinity.py \
     --cfg ${cfg} \
     --tau ${tau} \
     --pn ${pn} \
@@ -66,34 +65,4 @@ torchrun --nproc_per_node=4 evaluation/dpg_bench/infer4dpg_ddp.py \
     --text_channels ${text_channels} \
     --apply_spatial_patchify ${apply_spatial_patchify} \
     --cfg_insertion_layer ${cfg_insertion_layer} \
-    --outdir ${out_dir}/images 2>&1 | tee ${out_dir}/eval_dpg-bench.log
-
-
-# --- calculate metrics ---
-source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
-conda activate modelscope
-
-IMAGE_ROOT_PATH=${out_dir}/images
-RESOLUTION=1024
-PIC_NUM=${PIC_NUM:-4}
-PROCESSES=${PROCESSES:-4}   # default GPU number
-PORT=${PORT:-29500}
-
-export MODELSCOPE_CACHE="./pretrained_models/.modelscope_cache"
-# mkdir -p $MODELSCOPE_CACHE
-
-accelerate launch --num_machines 1 --num_processes $PROCESSES --multi_gpu --mixed_precision "fp16" --main_process_port $PORT \
-    evaluation/dpg_bench/compute_dpg_bench.py \
-    --image-root-path $IMAGE_ROOT_PATH \
-    --resolution $RESOLUTION \
-    --pic-num $PIC_NUM \
-    --vqa-model mplug 2>&1 | tee ${out_dir}/matrics_dpg-bench.log
-
-# single GPU
-# python evaluation/dpg_bench/compute_dpg_bench.py \
-#   --image-root-path $IMAGE_ROOT_PATH \
-#   --resolution $RESOLUTION \
-#   --pic-num $PIC_NUM \
-#   --vqa-model mplug
-
-# conda deactivate
+    --skip_last_scales ${skip_last_scales} 2>&1 | tee ${out_dir}/infer_profile.log

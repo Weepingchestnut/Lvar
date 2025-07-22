@@ -1,21 +1,40 @@
 # set arguments for inference
+model_type=fastvar_infinity_8b
+# model_type=fastvar_infinity_2b
+
+out_dir_root=work_dir/infer_profile/${model_type}
+
+if [ "$model_type" == "fastvar_infinity_2b" ]; then
+    checkpoint_type='torch'
+    infinity_model_path=pretrained_models/infinity/Infinity/infinity_2b_reg.pth
+    vae_type=32
+    vae_path=pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth
+    apply_spatial_patchify=0
+    cfg=3
+    tau=0.5
+elif [ "$model_type" == "fastvar_infinity_8b" ]; then
+    checkpoint_type='torch_shard'
+    infinity_model_path=pretrained_models/infinity/Infinity/infinity_8b_weights
+    vae_type=14
+    vae_path=pretrained_models/infinity/Infinity/infinity_vae_d56_f8_14_patchify.pth
+    apply_spatial_patchify=1
+    cfg=3
+    tau=1
+else
+    echo "Unknown model_type '$model_type'"
+    echo "Support model_type: 'fastvar_infinity_2b', 'fastvar_infinity_8b'"
+    exit 1
+fi
+
+skip_last_scales=2      # FastVAR always skip last 2 scales
 pn=1M
-model_type=fastvar_infinity_2b
 use_scale_schedule_embedding=0
 use_bit_label=1
-checkpoint_type='torch'
-infinity_model_path=pretrained_models/infinity/Infinity/infinity_2b_reg.pth
-out_dir_root=work_dir/infer_profile/fastvar_infinity_2b
-vae_type=32
-vae_path=pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth
-cfg=3
-tau=0.5
 rope2d_normalized_by_hw=2
 add_lvl_embeding_only_first_block=1
 rope2d_each_sa_layer=1
 text_encoder_ckpt=pretrained_models/infinity/flan-t5-xl
 text_channels=2048
-apply_spatial_patchify=0
 cfg_insertion_layer=0
 sub_fix=cfg${cfg}_tau${tau}_cfg_insertion_layer${cfg_insertion_layer}
 
@@ -43,4 +62,5 @@ python tools/latency_profile_infinity.py \
     --text_encoder_ckpt ${text_encoder_ckpt} \
     --text_channels ${text_channels} \
     --apply_spatial_patchify ${apply_spatial_patchify} \
-    --cfg_insertion_layer ${cfg_insertion_layer} 2>&1 | tee ${out_dir}/infer_profile.log
+    --cfg_insertion_layer ${cfg_insertion_layer} \
+    --skip_last_scales ${skip_last_scales} 2>&1 | tee ${out_dir}/infer_profile.log
