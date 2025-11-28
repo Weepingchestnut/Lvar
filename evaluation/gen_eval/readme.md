@@ -55,3 +55,10 @@ AttributeError: module 'pkgutil' has no attribute 'ImpImporter'. Did you mean: '
 pip uninstall -y setuptools
 pip install setuptools
 ```
+
+对于H系列GPU，上述安装过程可能在较新版本的Python(e.g. 3.12.x)和PyTorch(e.g. 2.6.0)环境中存在问题，建议使用[evaluation/dpg_bench](../dpg_bench/readme.md)所创建的版本较低的`modelscope`虚拟环境，重新安装即可。
+<!-- ```python
+pip uninstall mmcv mmcv-full
+
+MMCV_WITH_OPS=1 TORCH_CUDA_ARCH_LIST="9.0" python setup.py develop
+``` -->

@@ -54,9 +54,6 @@ if __name__ == '__main__':
         # load infinity
         infinity = load_transformer(vae, args)
 
-        if 'scalekv' in args.model_type:
-            infinity = enable_scale_kv(infinity, window_size=16, max_capacity=650, kernel_size=5, pooling='maxpool')
-
         # if args.rewrite_prompt:
         #     from tools.prompt_rewriter import PromptRewriter
         #     prompt_rewriter = PromptRewriter(system='', few_shot_history=[])
@@ -89,6 +86,9 @@ if __name__ == '__main__':
         images = []
         for sample_j in range(args.n_samples):
             print(f"Generating {sample_j+1} of {args.n_samples}, prompt={prompt}")
+
+            torch.cuda.reset_peak_memory_stats(device='cuda')
+            alloc_before_gen = torch.cuda.memory_allocated(device='cuda') / (1024**2)
             t1 = time.time()
             if args.model_type == 'flux_1_dev':
                 image = pipe(
@@ -117,10 +117,23 @@ if __name__ == '__main__':
                 scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
                 scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
                 tgt_h, tgt_w = dynamic_resolution_h_w[h_div_w_template][args.pn]['pixel']
-                image = gen_one_img(infinity, vae, text_tokenizer, text_encoder, prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg, scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer], vae_type=args.vae_type)
+
+                image = gen_one_img(
+                    infinity, vae, text_tokenizer, text_encoder, 
+                    prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg, 
+                    scale_schedule=scale_schedule, 
+                    cfg_insertion_layer=[args.cfg_insertion_layer], 
+                    vae_type=args.vae_type
+                )
             else:
                 raise ValueError
             t2 = time.time()
+            alloc_after_gen = torch.cuda.memory_allocated(device='cuda') / (1024**2)
+            peak_alloc_gen = torch.cuda.max_memory_allocated(device='cuda') / (1024**2)
+            print(f"\n[=== Generation Time / Memory Usage of Original Model ===")
+            print(f"GPU allocated before/after: {alloc_before_gen:.1f} MB -> {alloc_after_gen:.1f} MB (delta {alloc_after_gen - alloc_before_gen:+.1f} MB)")
+            print(f"GPU peak allocated during gen: {peak_alloc_gen:.1f} MB (delta {peak_alloc_gen - alloc_before_gen:+.1f} MB)")
+            print("=======================================================================\n")
             print(f'{args.model_type} infer one image takes {t2-t1:.2f}s')
             images.append(image)
         for i, image in enumerate(images):
@@ -130,5 +143,6 @@ if __name__ == '__main__':
             else:
                 image.save(save_file)
     
-        with open(prompt_rewrite_cache_file, 'w') as f:
-            json.dump(prompt_rewrite_cache, f, indent=2)
+        print("All processes finished generation.")
+        # with open(prompt_rewrite_cache_file, 'w') as f:
+        #     json.dump(prompt_rewrite_cache, f, indent=2)

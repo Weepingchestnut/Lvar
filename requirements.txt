@@ -6,12 +6,14 @@ httpx
 huggingface_hub
 matplotlib
 numpy
+nvidia-ml-py
 openai
 opencv-python
 pytorch_lightning
 pytz
 seaborn
-# transformers
+transformers
+tabulate
 typed-argument-parser
 tensorflow-io
 tensorboard

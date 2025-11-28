@@ -1,13 +1,17 @@
 import argparse
+import copy
 import json
 import torch.distributed as tdist
 
+from transformers import AutoModel, AutoTokenizer
 from lightning_fabric import seed_everything
 from tqdm import trange
 
-from models.scalekv.scale_kv import enable_scale_kv
 from tools.conf import HF_HOME, HF_TOKEN
+from tools.run_hart import gen_one_img_hart
 from tools.run_infinity import *
+
+from models.hart.hart_transformer_t2i import HARTForT2I
 
 
 # set environment variables
@@ -70,12 +74,29 @@ if __name__ == '__main__':
         # load infinity
         infinity = load_transformer(vae, args)
 
-        if 'scalekv' in args.model_type:
-            infinity = enable_scale_kv(infinity, window_size=16, max_capacity=650, kernel_size=5, pooling='maxpool')
-
         # if args.rewrite_prompt:
         #     from tools.prompt_rewriter import PromptRewriter
         #     prompt_rewriter = PromptRewriter(system='', few_shot_history=[])
+    elif 'hart' in args.model_type:
+        print(f"[Rank {rank}] Loading HART model...")
+        # load text encoder
+        text_tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_ckpt)
+        text_encoder = AutoModel.from_pretrained(args.text_encoder_ckpt).to(device)
+        text_encoder.eval()
+        # load hart
+        hart = AutoModel.from_pretrained(args.model_path)
+        hart = hart.to(device)
+        hart.eval()
+        if args.use_ema:
+            ema_hart = copy.deepcopy(hart)
+            ema_hart.load_state_dict(torch.load(os.path.join(args.model_path, "ema_model.bin")))
+
+    # hyperparameter setting
+    tau = args.tau; cfg = args.cfg
+    h_div_w_template = 1.000
+    scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
+    scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
+    # tgt_h, tgt_w = dynamic_resolution_h_w[h_div_w_template][args.pn]['pixel']
     
     # for index, metadata in enumerate(metadatas):
     for index in trange(start_idx, end_idx, disable=rank!=0, desc=f"Rank {rank}"):
@@ -93,8 +114,6 @@ if __name__ == '__main__':
         with open(os.path.join(outpath, "metadata.jsonl"), "w") as fp:
             json.dump(metadata, fp)
 
-        tau = args.tau
-        cfg = args.cfg
         if args.rewrite_prompt:
             old_prompt = prompt
             if args.load_rewrite_prompt_cache and prompt in prompt_rewrite_cache:
@@ -109,7 +128,11 @@ if __name__ == '__main__':
         images = []
         for sample_j in range(args.n_samples):
             print(f"[Rank {rank}] Generating {sample_j+1} of {args.n_samples}, prompt={prompt}")
+            # Important! for reproducibility, e.g. 4 samples of same prompt will same
+            seed = args.seed + (index * args.n_samples) + sample_j
             
+            torch.cuda.reset_peak_memory_stats(device=device)
+            alloc_before_gen = torch.cuda.memory_allocated(device=device) / (1024**2)
             t1 = time.time()
             if args.model_type == 'flux_1_dev':
                 image = pipe(
@@ -133,26 +156,38 @@ if __name__ == '__main__':
                 ).images[0]
             elif args.model_type == 'pixart_sigma':
                 image = pipe(prompt).images[0]
+            # ------------ Infinity ------------
             elif 'infinity' in args.model_type:
-                h_div_w_template = 1.000
-                scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
-                scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
-                tgt_h, tgt_w = dynamic_resolution_h_w[h_div_w_template][args.pn]['pixel']
-
                 image = gen_one_img(
-                    infinity, vae, text_tokenizer, text_encoder, 
-                    prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg, 
-                    scale_schedule=scale_schedule, 
-                    cfg_insertion_layer=[args.cfg_insertion_layer], 
-                    vae_type=args.vae_type
+                    infinity, vae, text_tokenizer, text_encoder,
+                    prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg,
+                    scale_schedule=scale_schedule,
+                    cfg_insertion_layer=[args.cfg_insertion_layer],
+                    vae_type=args.vae_type,
+                    g_seed=seed,
+                )
+            # ------------ HART ------------
+            elif 'hart' in args.model_type:
+                image = gen_one_img_hart(
+                    hart, args.use_ema, ema_hart, text_tokenizer, text_encoder,
+                    prompt, cfg, args.max_token_length, args.use_llm_system_prompt,
+                    args.more_smooth,
                 )
             else:
                 raise ValueError
             t2 = time.time()
+
+            alloc_after_gen = torch.cuda.memory_allocated(device=device) / (1024**2)
+            peak_alloc_gen = torch.cuda.max_memory_allocated(device=device) / (1024**2)
+            print(f"\n===== [Rank {rank}] Generation Time / Memory Usage of Original Model =====")
+            print(f"GPU allocated before/after: {alloc_before_gen:.1f} MB -> {alloc_after_gen:.1f} MB (delta {alloc_after_gen - alloc_before_gen:+.1f} MB)")
+            print(f"GPU peak allocated during gen: {peak_alloc_gen:.1f} MB (delta {peak_alloc_gen - alloc_before_gen:+.1f} MB)")
+            print("=======================================================================\n")
             print(f'[Rank {rank}] {args.model_type} infer one image takes {t2-t1:.2f}s')
             images.append(image)
+
         for i, image in enumerate(images):
-            save_file = os.path.join(sample_path, f"{i:05}.jpg")
+            save_file = os.path.join(sample_path, f"{i:05}.jpg")    #; print(f'{save_file=}')
             if 'infinity' in args.model_type:
                 cv2.imwrite(save_file, image.cpu().numpy())
             else:
