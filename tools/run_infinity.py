@@ -2,8 +2,6 @@ import argparse
 import hashlib
 import cv2
 import os
-
-from models.skipvar.skipvar_model import SkipVAR_Infinity
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import os.path as osp
 
@@ -19,10 +17,12 @@ import torch
 import torch.nn.functional as F
 from torch import autocast
 from torchvision.transforms.functional import to_tensor
-from transformers import AutoTokenizer, T5EncoderModel, T5TokenizerFast
+from transformers import AutoTokenizer, T5Config, T5EncoderModel, T5TokenizerFast
 
 from models.infinity.infinity_model import Infinity
 from models.fastvar.fastvar_model import FastVAR_Infinity
+from models.skipvar.skipvar_model import SkipVAR_Infinity
+from models.scalekv.scale_kv import enable_scale_kv
 from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 
 
@@ -35,17 +35,271 @@ def extract_key_val(text):
     return key_val
 
 
-def load_tokenizer(t5_path =''):
-    print(f'[Loading tokenizer and text encoder]')
+def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=False):
+    if enable_positive_prompt:
+        print(f'before positive_prompt aug: {prompt}')
+        prompt = aug_with_positive_prompt(prompt)
+        print(f'after positive_prompt aug: {prompt}')
+    print(f'prompt={prompt}')
+    captions = [prompt]
+    tokens = text_tokenizer(text=captions, max_length=512, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
+    input_ids = tokens.input_ids.cuda(non_blocking=True)
+    mask = tokens.attention_mask.cuda(non_blocking=True)
+    text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
+    lens: List[int] = mask.sum(dim=-1).tolist()
+    cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
+    Ltext = max(lens)    
+    kv_compact = []
+    
+    for len_i, feat_i in zip(lens, text_features.unbind(0)):
+        kv_compact.append(feat_i[:len_i])
+    kv_compact = torch.cat(kv_compact, dim=0)
+    text_cond_tuple = (kv_compact, lens, cu_seqlens_k, Ltext)
+    
+    return text_cond_tuple
+
+
+def aug_with_positive_prompt(prompt):
+    for key in ['man', 'woman', 'men', 'women', 'boy', 'girl', 'child', 'person', 'human', 'adult', 'teenager', 'employee', 
+                'employer', 'worker', 'mother', 'father', 'sister', 'brother', 'grandmother', 'grandfather', 'son', 'daughter']:
+        if key in prompt:
+            prompt = prompt + '. very smooth faces, good looking faces, face to the camera, perfect facial features'
+            break
+    return prompt
+
+
+def gen_one_img(
+    infinity_test, 
+    vae, 
+    text_tokenizer,
+    text_encoder,
+    prompt, 
+    cfg_list=[],
+    tau_list=[],
+    negative_prompt='',
+    scale_schedule=None,
+    top_k=900,
+    top_p=0.97,
+    cfg_sc=3,
+    cfg_exp_k=0.0,
+    cfg_insertion_layer=-5,     # = [0]
+    vae_type=0,                 # = 32
+    gumbel=0,
+    softmax_merge_topk=-1,
+    gt_leak=-1,                 # = 0
+    gt_ls_Bl=None,
+    g_seed=None,                # e.g. 2343
+    sampling_per_bits=1,
+    enable_positive_prompt=0,
+    **kwargs,
+):
+    # for sparse attn layer count
+    from models.infinity.sparse_attn_layer_counter import singleton as layer_counter
+
+    sstt = time.time()
+    if not isinstance(cfg_list, list):
+        cfg_list = [cfg_list] * len(scale_schedule)
+    if not isinstance(tau_list, list):
+        tau_list = [tau_list] * len(scale_schedule)
+    text_cond_tuple = encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt)
+    if negative_prompt:
+        negative_label_B_or_BLT = encode_prompt(text_tokenizer, text_encoder, negative_prompt)
+    else:
+        negative_label_B_or_BLT = None
+    print(f'cfg: {cfg_list}, tau: {tau_list}')
+    Infinity.autoregressive_infer_cfg   # for debug
+    with autocast("cuda", dtype=torch.bfloat16, enabled=True, cache_enabled=True):
+        stt = time.time()
+        _, _, img_list = infinity_test.autoregressive_infer_cfg(
+            vae=vae,
+            scale_schedule=scale_schedule,
+            label_B_or_BLT=text_cond_tuple, g_seed=g_seed,
+            B=1, negative_label_B_or_BLT=negative_label_B_or_BLT, force_gt_Bhw=None,
+            cfg_sc=cfg_sc, cfg_list=cfg_list, tau_list=tau_list, top_k=top_k, top_p=top_p,
+            returns_vemb=1, ratio_Bl1=None, gumbel=gumbel, norm_cfg=False,
+            cfg_exp_k=cfg_exp_k, cfg_insertion_layer=cfg_insertion_layer,
+            vae_type=vae_type, softmax_merge_topk=softmax_merge_topk,
+            ret_img=True, trunk_scale=1000,
+            gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
+            sampling_per_bits=sampling_per_bits,
+            **kwargs,
+        )
+    
+    print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
+    img = img_list[0]
+
+    # for sparse attn layer count
+    layer_counter.reset()
+
+    return img
+
+
+def get_prompt_id(prompt):
+    md5 = hashlib.md5()
+    md5.update(prompt.encode('utf-8'))
+    prompt_id = md5.hexdigest()
+    
+    return prompt_id
+
+
+def save_slim_model(infinity_model_path, save_file=None, device='cpu', key='gpt_fsdp'):
+    print('[Save slim model]')
+    full_ckpt = torch.load(infinity_model_path, map_location=device)
+    infinity_slim = full_ckpt['trainer'][key]
+    # ema_state_dict = cpu_d['trainer'].get('gpt_ema_fsdp', state_dict)
+    if not save_file:
+        save_file = osp.splitext(infinity_model_path)[0] + '-slim.pth'
+    print(f'Save to {save_file}')
+    torch.save(infinity_slim, save_file)
+    print('[Save slim model] done')
+
+    return save_file
+
+
+def load_tokenizer(t5_path ='', load_weights=True):
+    print(f'[Loading tokenizer and text encoder (load_weights={load_weights})]')
 
     text_tokenizer: T5TokenizerFast = AutoTokenizer.from_pretrained(t5_path, revision=None, legacy=True)
     text_tokenizer.model_max_length = 512
-    text_encoder: T5EncoderModel = T5EncoderModel.from_pretrained(t5_path, torch_dtype=torch.float16)
-    text_encoder.to('cuda')
+
+    if load_weights:
+        text_encoder: T5EncoderModel = T5EncoderModel.from_pretrained(t5_path, dtype=torch.float16)
+        text_encoder.to('cuda')
+    else:
+        config = T5Config.from_pretrained(t5_path, dtype=torch.float16)
+        text_encoder = T5EncoderModel(config).to('cuda')
+
     text_encoder.eval()
     text_encoder.requires_grad_(False)
 
     return text_tokenizer, text_encoder
+
+
+def load_infinity(
+    rope2d_each_sa_layer, 
+    rope2d_normalized_by_hw, 
+    use_scale_schedule_embedding, 
+    pn, 
+    use_bit_label, 
+    add_lvl_embeding_only_first_block, 
+    model_path='', 
+    scale_schedule=None, 
+    vae=None, 
+    device='cuda', 
+    model_kwargs=None,
+    text_channels=2048,
+    apply_spatial_patchify=0,
+    use_flex_attn=False,
+    bf16=False,
+    checkpoint_type='torch',
+    args=None,
+    # todo: --- exp params ---
+    # freeze_kv_cache_last_n_scales: int = 4
+    attn_sink_scales: int = 5,
+    skip_last_scales: int = 0,
+    drop_uncond_last_scales: int = 3,
+):
+    text_maxlen = 512
+    print(f'[Loading Infinity]')
+    with autocast("cuda", dtype=torch.bfloat16, enabled=True, cache_enabled=True), torch.no_grad():
+        if model_kwargs.pop('fastvar', None) is not None:
+            # print(f'{args.prune_ratio.split(',')=}')
+            prune_ratio = tuple([float(item) for item in args.prune_ratio.split(',')])
+            infinity_test: Infinity = FastVAR_Infinity(
+                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
+                shared_aln=True, raw_scale_schedule=scale_schedule,
+                checkpointing='full-block',
+                customized_flash_attn=False,
+                fused_norm=True,
+                pad_to_multiplier=128,
+                use_flex_attn=use_flex_attn,
+                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
+                use_bit_label=use_bit_label,
+                rope2d_each_sa_layer=rope2d_each_sa_layer,
+                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+                pn=pn,
+                apply_spatial_patchify=apply_spatial_patchify,
+                inference_mode=True,
+                train_h_div_w_list=[1.0],
+                skip_last_scales=skip_last_scales,
+                # pruning setting
+                cached_scale=args.cached_scale,
+                # prune_ratio=tuple(args.prune_ratio),
+                # prune_ratio=(float(item) for item in args.prune_ratio.split(','))
+                prune_ratio=prune_ratio,
+                **model_kwargs,
+            ).to(device=device)
+            print(f'\n[you selected FastVAR with {model_kwargs=}] \
+                  model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
+        elif model_kwargs.pop('skipvar', None) is not None:
+            infinity_test: Infinity = SkipVAR_Infinity(
+                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
+                shared_aln=True, raw_scale_schedule=scale_schedule,
+                checkpointing='full-block',
+                customized_flash_attn=False,
+                fused_norm=True,
+                pad_to_multiplier=128,
+                use_flex_attn=use_flex_attn,
+                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
+                use_bit_label=use_bit_label,
+                rope2d_each_sa_layer=rope2d_each_sa_layer,
+                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+                pn=pn,
+                apply_spatial_patchify=apply_spatial_patchify,
+                inference_mode=True,
+                train_h_div_w_list=[1.0],
+                **model_kwargs,
+            ).to(device=device)
+            print(f'\n[you selected SkipVAR with {model_kwargs=}] \
+                  model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
+        else:
+            infinity_test: Infinity = Infinity(
+                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
+                shared_aln=True, raw_scale_schedule=scale_schedule,
+                checkpointing='full-block',
+                # customized_flash_attn=False,
+                fused_norm=True,
+                pad_to_multiplier=128,
+                use_flex_attn=use_flex_attn,
+                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
+                use_bit_label=use_bit_label,
+                rope2d_each_sa_layer=rope2d_each_sa_layer,
+                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+                pn=pn,
+                apply_spatial_patchify=apply_spatial_patchify,
+                inference_mode=True,
+                train_h_div_w_list=[1.0],
+                # todo: --- exp params ---
+                # freeze_kv_cache_last_n_scales=freeze_kv_cache_last_n_scales,
+                # base_cache_scales=base_cache_scales,
+                skip_last_scales=skip_last_scales,
+                attn_sink_scales=attn_sink_scales,
+                drop_uncond_last_scales=drop_uncond_last_scales,
+                **model_kwargs,
+            ).to(device=device)
+            print(f'\n[you selected Infinity with {model_kwargs=}] \
+                  model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
+
+        if bf16:
+            for block in infinity_test.unregistered_blocks:
+                block.bfloat16()
+
+        infinity_test.eval()
+        infinity_test.requires_grad_(False)
+
+        infinity_test.cuda()
+        torch.cuda.empty_cache()
+
+        print(f'[Load Infinity weights]')
+        if checkpoint_type == 'torch' and model_path is not None:
+            state_dict = torch.load(model_path, map_location=device, weights_only=True)
+            print(infinity_test.load_state_dict(state_dict))
+        elif checkpoint_type == 'torch_shard' and model_path is not None:
+            from transformers.modeling_utils import load_sharded_checkpoint
+            load_sharded_checkpoint(infinity_test, model_path, strict=False)
+        infinity_test.rng = torch.Generator(device=device)
+        
+        return infinity_test
 
 
 def transform(pil_img, tgt_h, tgt_w):
@@ -91,18 +345,11 @@ def joint_vi_vae_encode_decode(vae, image_path, scale_schedule, device, tgt_h, t
     gt_img = (inp[0] + 1) / 2
     gt_img = gt_img.permute(1, 2, 0).mul_(255).cpu().numpy().astype(np.uint8)
     print(recons_img.shape, gt_img.shape)
-    
+
     return gt_img, recons_img, all_bit_indices
 
 
-def get_prompt_id(prompt):
-    md5 = hashlib.md5()
-    md5.update(prompt.encode('utf-8'))
-    prompt_id = md5.hexdigest()
-    return prompt_id
-
-
-def load_visual_tokenizer(args):
+def load_visual_tokenizer(args, load_weights=True):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # load vae
     if args.vae_type in [14, 16, 18, 20, 24, 32, 64]:
@@ -118,141 +365,20 @@ def load_visual_tokenizer(args):
             patch_size = 16
             encoder_ch_mult=[1, 2, 4, 4, 4]
             decoder_ch_mult=[1, 2, 4, 4, 4]
-        vae = vae_model(args.vae_path, schedule_mode, codebook_dim, codebook_size, patch_size=patch_size, 
+
+        vae_path = args.vae_path if load_weights else None
+        vae = vae_model(vae_path, schedule_mode, codebook_dim, codebook_size, patch_size=patch_size,
                         encoder_ch_mult=encoder_ch_mult, decoder_ch_mult=decoder_ch_mult, test_mode=True).to(device)
     else:
         raise ValueError(f'vae_type={args.vae_type} not supported')
     return vae
 
 
-def save_slim_model(infinity_model_path, save_file=None, device='cpu', key='gpt_fsdp'):
-    print('[Save slim model]')
-    full_ckpt = torch.load(infinity_model_path, map_location=device)
-    infinity_slim = full_ckpt['trainer'][key]
-    # ema_state_dict = cpu_d['trainer'].get('gpt_ema_fsdp', state_dict)
-    if not save_file:
-        save_file = osp.splitext(infinity_model_path)[0] + '-slim.pth'
-    print(f'Save to {save_file}')
-    torch.save(infinity_slim, save_file)
-    print('[Save slim model] done')
-
-    return save_file
-
-
-def load_infinity(
-    rope2d_each_sa_layer, 
-    rope2d_normalized_by_hw, 
-    use_scale_schedule_embedding, 
-    pn, 
-    use_bit_label, 
-    add_lvl_embeding_only_first_block, 
-    model_path='', 
-    scale_schedule=None, 
-    vae=None, 
-    device='cuda', 
-    model_kwargs=None,
-    text_channels=2048,
-    apply_spatial_patchify=0,
-    use_flex_attn=False,
-    bf16=False,
-    checkpoint_type='torch',
-    # todo: --- exp params ---
-    # freeze_kv_cache_last_n_scales: int = 4
-    base_cache_scales: int = 5,
-    skip_last_scales: int = 0
-):
-    text_maxlen = 512
-    print(f'[Loading Infinity]')
-    with autocast("cuda", dtype=torch.bfloat16, enabled=True, cache_enabled=True), torch.no_grad():
-        if model_kwargs.pop('fastvar', None) is not None:
-            infinity_test: Infinity = FastVAR_Infinity(
-                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
-                shared_aln=True, raw_scale_schedule=scale_schedule,
-                checkpointing='full-block',
-                customized_flash_attn=False,
-                fused_norm=True,
-                pad_to_multiplier=128,
-                use_flex_attn=use_flex_attn,
-                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
-                use_bit_label=use_bit_label,
-                rope2d_each_sa_layer=rope2d_each_sa_layer,
-                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
-                pn=pn,
-                apply_spatial_patchify=apply_spatial_patchify,
-                inference_mode=True,
-                train_h_div_w_list=[1.0],
-                **model_kwargs,
-            ).to(device=device)
-        elif model_kwargs.pop('skipvar', None) is not None:
-            infinity_test: Infinity = SkipVAR_Infinity(
-                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
-                shared_aln=True, raw_scale_schedule=scale_schedule,
-                checkpointing='full-block',
-                customized_flash_attn=False,
-                fused_norm=True,
-                pad_to_multiplier=128,
-                use_flex_attn=use_flex_attn,
-                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
-                use_bit_label=use_bit_label,
-                rope2d_each_sa_layer=rope2d_each_sa_layer,
-                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
-                pn=pn,
-                apply_spatial_patchify=apply_spatial_patchify,
-                inference_mode=True,
-                train_h_div_w_list=[1.0],
-                **model_kwargs,
-            ).to(device=device)
-        else:
-            infinity_test: Infinity = Infinity(
-                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
-                shared_aln=True, raw_scale_schedule=scale_schedule,
-                checkpointing='full-block',
-                customized_flash_attn=False,
-                fused_norm=True,
-                pad_to_multiplier=128,
-                use_flex_attn=use_flex_attn,
-                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
-                use_bit_label=use_bit_label,
-                rope2d_each_sa_layer=rope2d_each_sa_layer,
-                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
-                pn=pn,
-                apply_spatial_patchify=apply_spatial_patchify,
-                inference_mode=True,
-                train_h_div_w_list=[1.0],
-                # todo: --- exp params ---
-                # freeze_kv_cache_last_n_scales=freeze_kv_cache_last_n_scales,
-                # base_cache_scales=base_cache_scales,
-                # skip_last_scales=skip_last_scales,
-                **model_kwargs,
-            ).to(device=device)
-        print(f'\n[you selected Infinity with {model_kwargs=}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
-
-        if bf16:
-            for block in infinity_test.unregistered_blocks:
-                block.bfloat16()
-
-        infinity_test.eval()
-        infinity_test.requires_grad_(False)
-
-        infinity_test.cuda()
-        torch.cuda.empty_cache()
-
-        print(f'[Load Infinity weights]')
-        if checkpoint_type == 'torch':
-            state_dict = torch.load(model_path, map_location=device, weights_only=True)
-            print(infinity_test.load_state_dict(state_dict))
-        elif checkpoint_type == 'torch_shard':
-            from transformers.modeling_utils import load_sharded_checkpoint
-            load_sharded_checkpoint(infinity_test, model_path, strict=False)
-        infinity_test.rng = torch.Generator(device=device)
-        return infinity_test
-
-
-def load_transformer(vae, args):
+def load_transformer(vae, args, load_weights=True):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model_path = args.model_path
+    model_path = args.model_path if load_weights else None
 
-    if args.checkpoint_type == 'torch': 
+    if args.checkpoint_type == 'torch':
         # copy large model to local; save slim to local; and copy slim to nas; load local slim model
         if osp.exists(args.cache_dir):
             local_model_path = osp.join(args.cache_dir, 'tmp', model_path.replace('/', '_'))
@@ -339,163 +465,25 @@ def load_transformer(vae, args):
         use_flex_attn=args.use_flex_attn,
         bf16=args.bf16,
         checkpoint_type=args.checkpoint_type,
+        args=args,
         # todo: --- exp params ---
         # freeze_kv_cache_last_n_scales=args.freeze_kv_cache_last_n_scales
-        # base_cache_scales=args.base_cache_scales,
-        # skip_last_scales=args.skip_last_scales,
+        attn_sink_scales=args.attn_sink_scales,
+        skip_last_scales=args.skip_last_scales,
+        drop_uncond_last_scales=args.drop_uncond_last_scales
     )
+
+    if 'scalekv' in args.model_type:
+        infinity = enable_scale_kv(infinity, window_size=16, max_capacity=650,
+                                   kernel_size=5, pooling='maxpool',
+                                   model_size=args.model_type.split('_')[-1])
+
     return infinity
 
 
-def aug_with_positive_prompt(prompt):
-    for key in ['man', 'woman', 'men', 'women', 'boy', 'girl', 'child', 'person', 'human', 'adult', 'teenager', 'employee', 
-                'employer', 'worker', 'mother', 'father', 'sister', 'brother', 'grandmother', 'grandfather', 'son', 'daughter']:
-        if key in prompt:
-            prompt = prompt + '. very smooth faces, good looking faces, face to the camera, perfect facial features'
-            break
-    return prompt
-
-
-def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=False):
-    if enable_positive_prompt:
-        print(f'before positive_prompt aug: {prompt}')
-        prompt = aug_with_positive_prompt(prompt)
-        print(f'after positive_prompt aug: {prompt}')
-    print(f'prompt={prompt}')
-    captions = [prompt]
-    tokens = text_tokenizer(text=captions, max_length=512, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
-    input_ids = tokens.input_ids.cuda(non_blocking=True)
-    mask = tokens.attention_mask.cuda(non_blocking=True)
-    text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
-    lens: List[int] = mask.sum(dim=-1).tolist()
-    cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
-    Ltext = max(lens)    
-    kv_compact = []
-    
-    for len_i, feat_i in zip(lens, text_features.unbind(0)):
-        kv_compact.append(feat_i[:len_i])
-    kv_compact = torch.cat(kv_compact, dim=0)
-    text_cond_tuple = (kv_compact, lens, cu_seqlens_k, Ltext)
-    
-    return text_cond_tuple
-
-
-def gen_one_img(
-    infinity_test, 
-    vae, 
-    text_tokenizer,
-    text_encoder,
-    prompt, 
-    cfg_list=[],
-    tau_list=[],
-    negative_prompt='',
-    scale_schedule=None,
-    top_k=900,
-    top_p=0.97,
-    cfg_sc=3,
-    cfg_exp_k=0.0,
-    cfg_insertion_layer=-5,     # = [0]
-    vae_type=0,                 # = 32
-    gumbel=0,
-    softmax_merge_topk=-1,
-    gt_leak=-1,                 # = 0
-    gt_ls_Bl=None,
-    g_seed=None,                # e.g. 2343
-    sampling_per_bits=1,
-    enable_positive_prompt=0,
-):
-    sstt = time.time()
-    if not isinstance(cfg_list, list):
-        cfg_list = [cfg_list] * len(scale_schedule)
-    if not isinstance(tau_list, list):
-        tau_list = [tau_list] * len(scale_schedule)
-    text_cond_tuple = encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt)
-    if negative_prompt:
-        negative_label_B_or_BLT = encode_prompt(text_tokenizer, text_encoder, negative_prompt)
-    else:
-        negative_label_B_or_BLT = None
-    print(f'cfg: {cfg_list}, tau: {tau_list}')
-    Infinity.autoregressive_infer_cfg   # for debug
-    with autocast("cuda", dtype=torch.bfloat16, enabled=True, cache_enabled=True):
-        stt = time.time()
-        _, _, img_list = infinity_test.autoregressive_infer_cfg(
-            vae=vae,
-            scale_schedule=scale_schedule,
-            label_B_or_BLT=text_cond_tuple, g_seed=g_seed,
-            B=1, negative_label_B_or_BLT=negative_label_B_or_BLT, force_gt_Bhw=None,
-            cfg_sc=cfg_sc, cfg_list=cfg_list, tau_list=tau_list, top_k=top_k, top_p=top_p,
-            returns_vemb=1, ratio_Bl1=None, gumbel=gumbel, norm_cfg=False,
-            cfg_exp_k=cfg_exp_k, cfg_insertion_layer=cfg_insertion_layer,
-            vae_type=vae_type, softmax_merge_topk=softmax_merge_topk,
-            ret_img=True, trunk_scale=1000,
-            gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
-            sampling_per_bits=sampling_per_bits,
-        )
-    
-    print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
-    img = img_list[0]
-
-    return img
-
-
-# def gen_one_img_SkipVAR(
-#     infinity_test,
-#     vae,
-#     text_tokenizer,
-#     text_encoder,
-#     prompt,
-#     cfg_list=[],
-#     tau_list=[],
-#     negative_prompt='',
-#     scale_schedule=None,
-#     top_k=900,
-#     top_p=0.97,
-#     cfg_sc=3,
-#     cfg_exp_k=0.0,
-#     cfg_insertion_layer=-5,
-#     vae_type=0,
-#     gumbel=0,
-#     softmax_merge_topk=-1,
-#     gt_leak=-1,
-#     gt_ls_Bl=None,
-#     g_seed=None,
-#     sampling_per_bits=1,
-#     enable_positive_prompt=0,
-# ):
-#     sstt = time.time()
-#     if not isinstance(cfg_list, list):
-#         cfg_list = [cfg_list] * len(scale_schedule)
-#     if not isinstance(tau_list, list):
-#         tau_list = [tau_list] * len(scale_schedule)
-#     text_cond_tuple = encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt)
-#     if negative_prompt:
-#         negative_label_B_or_BLT = encode_prompt(text_tokenizer, text_encoder, negative_prompt)
-#     else:
-#         negative_label_B_or_BLT = None
-#     print(f'cfg: {cfg_list}, tau: {tau_list}')
-#     with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16, cache_enabled=True):
-#         stt = time.time()
-#         _, _, img_list = infinity_test.autoregressive_infer_cfg_SkipVAR(
-#             vae=vae,
-#             scale_schedule=scale_schedule,
-#             label_B_or_BLT=text_cond_tuple, g_seed=g_seed,
-#             B=1, negative_label_B_or_BLT=negative_label_B_or_BLT, force_gt_Bhw=None,
-#             cfg_sc=cfg_sc, cfg_list=cfg_list, tau_list=tau_list, top_k=top_k, top_p=top_p,
-#             returns_vemb=1, ratio_Bl1=None, gumbel=gumbel, norm_cfg=False,
-#             cfg_exp_k=cfg_exp_k, cfg_insertion_layer=cfg_insertion_layer,
-#             vae_type=vae_type, softmax_merge_topk=softmax_merge_topk,
-#             ret_img=True, trunk_scale=1000,
-#             gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
-#             sampling_per_bits=sampling_per_bits,
-#         )
-#     print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
-#     img = img_list[0]
-#     return img
-
-
 def add_common_arguments(parser):
-    parser.add_argument('--cfg', type=str, default='4')     # '3'
-    parser.add_argument('--tau', type=float, default=0.5)     # 1
+    parser.add_argument('--cfg', type=str, default='3')
+    parser.add_argument('--tau', type=float, default=1)
     parser.add_argument('--pn', type=str, default='1M', choices=['0.06M', '0.25M', '1M'])
     parser.add_argument('--model_path', type=str, default='pretrained_models/infinity/Infinity/infinity_2b_reg.pth')
     parser.add_argument('--cfg_insertion_layer', type=int, default=0)
@@ -519,6 +507,20 @@ def add_common_arguments(parser):
     parser.add_argument('--checkpoint_type', type=str, default='torch')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--bf16', type=int, default=1, choices=[0,1])
+    # ------ FastVAR ------
+    parser.add_argument('--cached_scale', type=int, default=8)
+    # parser.add_argument("--prune_ratio", nargs='+', type=float, default=[0.4, 0.5], help="Pruning ratio for last 2 scales in FastVAR")
+    parser.add_argument("--prune_ratio", type=str, default="0.4,0.5", help="Pruning ratio for last 2 scales in FastVAR")
+    # ------ hart ------
+    parser.add_argument("--use_ema", type=bool, default=True)
+    parser.add_argument("--max_token_length", type=int, default=300)
+    parser.add_argument("--use_llm_system_prompt", type=bool, default=True)
+    parser.add_argument("--more_smooth", type=bool, help="Turn on for more visually smooth samples.", default=True)
+    # ------ exp params ------
+    # parser.add_argument('--freeze_kv_cache_last_n_scales', type=int, default=4)
+    parser.add_argument('--attn_sink_scales', type=int, default=5, help='Sink the attention maps of the last few scales')
+    parser.add_argument('--skip_last_scales', type=int, default=0, help='Skip the last few scales')
+    parser.add_argument('--drop_uncond_last_scales', type=int, default=0, help='Drop the unconditional branch of last few scales')
 
 
 if __name__ == '__main__':

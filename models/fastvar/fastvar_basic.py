@@ -14,8 +14,15 @@ from timm.layers import DropPath
 
 # Import flash_attn's attention
 from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
+# not slow attn, for torch >= 2.0.0 and CUDA backend, it support flash attn 2 for fast inference
+# https://docs.pytorch.org/docs/2.6/generated/torch.nn.functional.scaled_dot_product_attention.html#torch.nn.functional.scaled_dot_product_attention
+# from torch.nn.functional import scaled_dot_product_attention as slow_attn    # q, k, v: BHLc
+# -->
+from torch.nn.functional import scaled_dot_product_attention as torch_attn     # q, k, v: BHLc
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from models.infinity.basic_infinity import FFN, CrossAttention, FFNSwiGLU, get_dropout_layer
+
 
 # ? Uncomment this function if you want to benchmark sppedup with vanilla attn.
 # def slow_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
@@ -77,12 +84,33 @@ def masked_previous_scale_cache(cur_x, num_remain, cur_shape):
 # 1.333/1  (1, 36, 27), (1, 48, 36), (1, 60, 45), (1, 72, 54) (1,84,63)
 # 2/1:  (1, 46, 23), (1, 60, 30), (1, 74, 37), (1, 90, 45) (1,120,60)
 # 1/1 , (13, 32, 32), (15, 40, 40), (17, 48, 48), (21, 64, 64), (1, 84, 84)]
-def compute_merge(x: torch.Tensor, prune_scale_list=[32, 40], is_later_layer=False, x_shape=None) -> Tuple[Callable, ...]:
+# def compute_merge(x: torch.Tensor, prune_scale_list=[32, 40], is_later_layer=False, x_shape=None) -> Tuple[Callable, ...]:
+#     _, original_h, original_w = x_shape
+#     original_tokens = original_h * original_w
+
+#     if original_w in prune_scale_list and is_later_layer:
+#         ratio_hard_code = {32:0.4, 40:0.5}
+#         ratio = ratio_hard_code[original_w]
+#         r = int(x.shape[1] * ratio)
+#         m, u, id_fn = masked_previous_scale_cache(x, x.shape[1]-r, x_shape)
+#     else:
+#         m, u, id_fn = (do_nothing, do_nothing, do_nothing)
+
+#     m_a, u_a = (m, u)
+
+#     return m_a, u_a, id_fn  # Okay this is probably not very good
+
+
+# for w/o skip scales, cache scale-10 (40x40), prune scale-11 -12
+def compute_merge(
+    x: torch.Tensor, prune_scale_list=None, ratio_hard_code=None,
+    is_later_layer=False, x_shape=None
+) -> Tuple[Callable, ...]:
     _, original_h, original_w = x_shape
     original_tokens = original_h * original_w
 
     if original_w in prune_scale_list and is_later_layer:
-        ratio_hard_code = {32:0.4, 40:0.5}
+        # ratio_hard_code = {48:0.6, 64:0.7}
         ratio = ratio_hard_code[original_w]
         r = int(x.shape[1] * ratio)
         m, u, id_fn = masked_previous_scale_cache(x, x.shape[1]-r, x_shape)
@@ -167,12 +195,12 @@ class FastVARSelfAttention(nn.Module):
         self.pad_to_multiplier = pad_to_multiplier
 
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
-    
+
     def kv_caching(self, enable: bool): # kv caching: only used during inference
         self.caching = enable
         self.cached_k = None
         self.cached_v = None
-    
+
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, rope_idx=None, ori_len=0):
         """
@@ -234,16 +262,16 @@ class FastVARSelfAttention(nn.Module):
             if self.use_flex_attn and attn_fn is not None:
                 oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
             else:
-                # flashattn
-                q, k, v = q.transpose(1,2), k.transpose(1,2),v.transpose(1,2)
-                oup = flash_attn_func(q.to(v.dtype), k.to(v.dtype), v, dropout_p=0, softmax_scale=self.scale).reshape(B, L, C)
-                # slow attn
-                #oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0).transpose(1, 2).reshape(B, L, C) #b head l d
-
+                # --- flashattn ---
+                # q, k, v = q.transpose(1,2), k.transpose(1,2),v.transpose(1,2)
+                # oup = flash_attn_func(q.to(v.dtype), k.to(v.dtype), v, dropout_p=0, softmax_scale=self.scale).reshape(B, L, C)
+                # --- torch attn ---
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    oup = torch_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0).transpose(1, 2).reshape(B, L, C) #b head l d
             # oup: bf16
-        
+
         return self.proj_drop(self.proj(oup))
-    
+
     def extra_repr(self) -> str:
         tail = ''
         return f'using_flash={self.using_flash}, tau={self.tau}, cos_attn={self.cos_attn}{tail}'
@@ -256,6 +284,8 @@ class FastVARCrossAttnBlock(nn.Module):
         num_heads, mlp_ratio=4., drop=0., drop_path=0., tau=1, cos_attn=False,
         swiglu=False, customized_flash_attn=False, fused_mlp=False, fused_norm_func=None, checkpointing_sa_only=False,
         use_flex_attn=False, batch_size=2, pad_to_multiplier=1, apply_rope2d=False, rope2d_normalized_by_hw=False,
+        # pruning setting
+        cached_scale: int = 8, prune_ratio: tuple = (0.4, 0.5)
     ):
         super(FastVARCrossAttnBlock, self).__init__()
         self.C, self.D = embed_dim, cond_dim
@@ -292,13 +322,31 @@ class FastVARCrossAttnBlock(nn.Module):
         self.previous_scale_cache_self_attn = None
         self.previous_scale_cache_cross_attn = None
         self.previous_scale_cache_ffn = None
-        self.cached_size = [24, 24] # we cahce the scale at 24 as cached feature for subsequant feature restoration
-    
+        
+        scales_init = [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64]
+        # self.cached_size = [24, 24] # we cahce the scale at 24 as cached feature for subsequant feature restoration
+        self.cached_size = [scales_init[cached_scale], scales_init[cached_scale]]
+        self.prune_scale_list = scales_init[cached_scale+1:cached_scale+3]
+        print(f'\n[Pruning Setting] cache_scale={cached_scale}, scale size is {self.cached_size}')
+        if num_heads == 16:
+            self.prune_layer_range = range(3,28)
+            print(f'    2B model, pruning layers are {list(self.prune_layer_range)}')
+        else:
+            self.prune_layer_range = range(4,35)
+            print(f'    8B model, pruning layers are {list(self.prune_layer_range)}')
+        
+        assert len(self.prune_scale_list) == len(prune_ratio), f'pruning scale != pruning ratio'
+        self.ratio_hard_code = {}
+        for i, scale in enumerate(self.prune_scale_list):
+            print(f'Scale-{scale} use pruning, ratio is {prune_ratio[i]}')
+            self.ratio_hard_code[scale] = prune_ratio[i]
+
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, layer_idx=-1, x_shape=None):
         gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
-        is_later_layer = True if layer_idx in list(range(3,28)) else False
-        merge_fn, unmerge_fn, idx_fn = compute_merge(x, is_later_layer=is_later_layer,x_shape=x_shape)
+        is_later_layer = True if layer_idx in list(self.prune_layer_range) else False
+        merge_fn, unmerge_fn, idx_fn = compute_merge(x, prune_scale_list=self.prune_scale_list, ratio_hard_code=self.ratio_hard_code,
+                                                     is_later_layer=is_later_layer,x_shape=x_shape)
         shortcut = x
         x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=merge_fn(x), scale=scale1, shift=shift1)
         x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind, rope_idx=idx_fn, ori_len=shortcut.shape[1]).mul_(gamma1)
@@ -308,13 +356,15 @@ class FastVARCrossAttnBlock(nn.Module):
             self.previous_scale_cache_self_attn = x_sa
         x = shortcut + self.drop_path(x_sa)
 
-        merge_fn, unmerge_fn, idx_fn = compute_merge(x, is_later_layer=is_later_layer,x_shape=x_shape)
+        merge_fn, unmerge_fn, idx_fn = compute_merge(x, prune_scale_list=self.prune_scale_list, ratio_hard_code=self.ratio_hard_code,
+                                                     is_later_layer=is_later_layer,x_shape=x_shape)
         x_ca = unmerge_fn(self.ca(self.ca_norm(merge_fn(x)), ca_kv).float().mul_(self.ca_gamma),self.previous_scale_cache_cross_attn, self.cached_size)
         if x.shape[1] in [self.cached_size[0]*self.cached_size[1]]:
             self.previous_scale_cache_cross_attn = x_ca
         x = x + x_ca
 
-        merge_fn, unmerge_fn, idx_fn = compute_merge(x, is_later_layer=is_later_layer,x_shape=x_shape)
+        merge_fn, unmerge_fn, idx_fn = compute_merge(x, prune_scale_list=self.prune_scale_list, ratio_hard_code=self.ratio_hard_code,
+                                                     is_later_layer=is_later_layer,x_shape=x_shape)
         x_ffn = unmerge_fn(self.ffn(self.fused_norm_func(C=self.C, eps=self.norm_eps, x=merge_fn(x), scale=scale2, shift=shift2)).mul(gamma2),self.previous_scale_cache_ffn,self.cached_size)
         if x.shape[1] in [self.cached_size[0] * self.cached_size[1]]:
             self.previous_scale_cache_ffn = x_ffn

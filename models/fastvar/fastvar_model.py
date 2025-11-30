@@ -135,7 +135,10 @@ class FastVAR_Infinity(nn.Module):
         always_training_scales=20,
         apply_spatial_patchify = 0,
         inference_mode=False,
-        cache_dir=None          # debug, timm load_model has cache_dir default
+        cache_dir=None,          # debug, timm load_model has cache_dir default
+        skip_last_scales: int = 2,
+        cached_scale: int = 8,
+        prune_ratio: tuple = (0.4, 0.5),
     ):
         # set hyperparameters
         self.C = embed_dim
@@ -295,6 +298,8 @@ class FastVAR_Infinity(nn.Module):
                 swiglu=swiglu, customized_flash_attn=self.customized_flash_attn, fused_mlp=fused_mlp, fused_norm_func=fused_norm_func,
                 checkpointing_sa_only=self.checkpointing == 'self-attn',
                 use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+                # pruning setting
+                cached_scale=cached_scale, prune_ratio=prune_ratio,
             )
             self.unregistered_blocks.append(block)
         
@@ -320,9 +325,11 @@ class FastVAR_Infinity(nn.Module):
         print(
             f'\n[constructor]  ==== customized_flash_attn={self.customized_flash_attn} (using_flash={sum((b.sa.using_flash if self.t2i else b.attn.using_flash) for b in self.unregistered_blocks)}/{self.depth}), fused_mlp={fused_mlp} (fused_mlp={sum(b.ffn.fused_mlp_func is not None for b in self.unregistered_blocks)}/{self.depth}) ==== \n'
             f'    [Infinity config ] embed_dim={embed_dim}, num_heads={num_heads}, depth={depth}, mlp_ratio={mlp_ratio}, swiglu={swiglu} num_blocks_in_a_chunk={self.num_blocks_in_a_chunk}\n'
-            f'    [drop ratios] drop_rate={drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
+            f'    [drop ratios] drop_rate={drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})\n',
+            f'    [skip scales] skip last {skip_last_scales} scales',
             end='\n\n', flush=True
         )
+        self.skip_last_scales = skip_last_scales
 
         print(f"\nFastVAR (official)")
     
@@ -576,7 +583,12 @@ class FastVAR_Infinity(nn.Module):
 
         for si, pn in enumerate(scale_schedule): # si: [1, 2, 4, 6, 8, 12, 16, 20, cache(24), pruning(32, 40), skip(48, 64)]
             # For Infinity, we find use 100% pruning ratio at the last two scales is acceptable
-            if 48 == pn[2] or 64 == pn[2]:
+            # if 48 == pn[2] or 64 == pn[2]:
+            #     continue
+            # *-->
+            if self.skip_last_scales == 2 and (48 == pn[2] or 64 == pn[2]):
+                continue
+            elif self.skip_last_scales == 1 and 64 == pn[2]:
                 continue
 
             cfg = cfg_list[si]
