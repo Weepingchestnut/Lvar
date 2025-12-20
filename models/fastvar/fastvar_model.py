@@ -1,36 +1,33 @@
-"""
-Definition of Infinity transformer model.
-"""
-
 import math
 import random
 import time
 from contextlib import nullcontext
 from functools import partial
-from typing import List, Optional, Tuple, Union, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.models import register_model
-from torch.utils.checkpoint import checkpoint
-from PIL import Image
-import numpy as np
-# from torch.nn.attention.flex_attention import flex_attention
-from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
-from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
-from models.infinity.infinity_model import Infinity, MultiInpIdentity, MultipleLayers, SharedAdaLin, TextAttentivePool, sample_with_top_k_top_p_also_inplace_modifying_logits_
-import utils.dist as dist
-from utils.dist import for_visualize
-from models.infinity.basic_infinity import flash_fused_op_installed, AdaLNBeforeHead, CrossAttnBlock, SelfAttnBlock, CrossAttention, FastRMSNorm, precompute_rope2d_freqs_grid
-from models.fastvar.fastvar_basic import FastVARCrossAttnBlock
+from flash_attn import flash_attn_func  # q, k, or v: BLHc, ret: BLHc
 
+import utils.dist as dist
+from models.fastvar.fastvar_basic import FastVARCrossAttnBlock
+from models.infinity.basic_infinity import (AdaLNBeforeHead, FastRMSNorm,
+                                            SelfAttnBlock,
+                                            flash_fused_op_installed,
+                                            precompute_rope2d_freqs_grid)
 # from infinity.utils import misc
 from models.infinity.flex_attn import FlexAttn
+from models.infinity.infinity_model import (
+    MultiInpIdentity, MultipleLayers, SharedAdaLin, TextAttentivePool,
+    sample_with_top_k_top_p_also_inplace_modifying_logits_)
+from utils.dist import for_visualize
 from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 
 try:
-    from models.infinity.fused_op import fused_ada_layer_norm, fused_ada_rms_norm
+    from models.infinity.fused_op import (fused_ada_layer_norm,
+                                          fused_ada_rms_norm)
 except:
     fused_ada_layer_norm, fused_ada_rms_norm = None, None
 
@@ -183,7 +180,8 @@ class FastVAR_Infinity(nn.Module):
         customized_kernel_installed = any('Infinity' in arg_name for arg_name in flash_attn_func.__code__.co_varnames)
         self.customized_flash_attn = customized_flash_attn and customized_kernel_installed
         if customized_flash_attn and not customized_kernel_installed:
-            import inspect, warnings
+            import inspect
+            import warnings
             file_path = inspect.getsourcefile(flash_attn_func)
             line_number = inspect.getsourcelines(flash_attn_func)[1]
             info = (
@@ -798,8 +796,10 @@ if __name__ == '__main__':
 
     import argparse
     import time
+
     from torch import autocast
-    from tools.run_infinity import load_visual_tokenizer, load_transformer
+
+    from tools.run_infinity import load_transformer, load_visual_tokenizer
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     g_seed = random.randint(0, 10000)

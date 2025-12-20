@@ -1,28 +1,23 @@
-"""
-Definitions of blocks of VAR transformer model.
-"""
-
 import math
 from functools import partial
 from typing import Callable, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from timm.layers import DropPath
-
 # Import flash_attn's attention
-from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
+from flash_attn import flash_attn_func  # q, k, or v: BLHc, ret: BLHc
+from timm.layers import DropPath
+from torch.nn.attention import SDPBackend, sdpa_kernel
 # not slow attn, for torch >= 2.0.0 and CUDA backend, it support flash attn 2 for fast inference
 # https://docs.pytorch.org/docs/2.6/generated/torch.nn.functional.scaled_dot_product_attention.html#torch.nn.functional.scaled_dot_product_attention
 # from torch.nn.functional import scaled_dot_product_attention as slow_attn    # q, k, v: BHLc
 # -->
-from torch.nn.functional import scaled_dot_product_attention as torch_attn     # q, k, v: BHLc
-from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.functional import scaled_dot_product_attention as torch_attn  # q, k, v: BHLc
 
-from models.infinity.basic_infinity import FFN, CrossAttention, FFNSwiGLU, get_dropout_layer
-
+from models.infinity.basic_infinity import (FFN, CrossAttention, FFNSwiGLU,
+                                            get_dropout_layer)
 
 # ? Uncomment this function if you want to benchmark sppedup with vanilla attn.
 # def slow_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
@@ -38,10 +33,10 @@ from models.infinity.basic_infinity import FFN, CrossAttention, FFNSwiGLU, get_d
 
 # Import flash_attn's fused ops
 try:
+    from flash_attn.ops.fused_dense import fused_mlp_func
     from flash_attn.ops.layer_norm import dropout_add_layer_norm
     from flash_attn.ops.rms_norm import dropout_add_rms_norm
     from flash_attn.ops.rms_norm import rms_norm as rms_norm_impl
-    from flash_attn.ops.fused_dense import fused_mlp_func
     flash_fused_op_installed = True
 except ImportError:
     dropout_add_layer_norm = dropout_add_rms_norm = fused_mlp_func = None
@@ -49,8 +44,6 @@ except ImportError:
     
     def rms_norm_impl(x, weight, epsilon):
         return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True).add_(epsilon))) * weight
-
-from matplotlib import pyplot as plt
 
 
 def do_nothing(x: torch.Tensor, *args, **kwargs):
