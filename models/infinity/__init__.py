@@ -1,7 +1,8 @@
 import torch
 
 from timm.loss import SoftTargetCrossEntropy
-from timm.layers.drop import DropPath
+try: from timm.layers import DropPath
+except: from timm.models.layers.drop import DropPath
 
 
 def _ex_repr(self):

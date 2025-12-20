@@ -1,24 +1,28 @@
-from contextlib import nullcontext
-from functools import partial
 import math
 import random
+from contextlib import nullcontext
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
-import numpy as np
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models import register_model
 
-from models.infinity.flex_attn import FlexAttn
-from models.infinity.basic_infinity import AdaLNBeforeHead, CrossAttnBlock, SelfAttnBlock, flash_attn_func, flash_fused_op_installed, CrossAttention, FastRMSNorm, precompute_rope2d_freqs_grid
-
 import utils.dist as dist
+from models.infinity.basic_infinity import (AdaLNBeforeHead, CrossAttention,
+                                            CrossAttnBlock, FastRMSNorm,
+                                            SelfAttnBlock, flash_attn_func,
+                                            flash_fused_op_installed,
+                                            precompute_rope2d_freqs_grid)
+from models.infinity.flex_attn import FlexAttn
 from utils.dist import for_visualize
 from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 
 try:
-    from models.infinity.fused_op import fused_ada_layer_norm, fused_ada_rms_norm
+    from models.infinity.fused_op import (fused_ada_layer_norm,
+                                          fused_ada_rms_norm)
 except:
     fused_ada_layer_norm, fused_ada_rms_norm = None, None
 
@@ -167,6 +171,10 @@ class Infinity(nn.Module):
         inference_mode=False,
         cache_dir=None,          # debug, timm load_model has cache_dir default
         skip_last_scales: int = 0,
+        # --- exp params ---
+        attn_sink_scales: int = 5,
+        drop_uncond_last_scales: int = 0,
+        spsd_scale: int = 10,               # sparse decision scale
     ):
         # set hyperparameters
         self.C = embed_dim
@@ -212,7 +220,8 @@ class Infinity(nn.Module):
         # customized_kernel_installed = True    # for flex_attn test, false!
         self.customized_flash_attn = customized_flash_attn and customized_kernel_installed
         if customized_flash_attn and not customized_kernel_installed:
-            import inspect, warnings
+            import inspect
+            import warnings
             file_path = inspect.getsourcefile(flash_attn_func)
             line_number = inspect.getsourcelines(flash_attn_func)[1]
             info = (
@@ -237,8 +246,7 @@ class Infinity(nn.Module):
         assert round(t.sum().item()) in {0, dist.get_world_size()}, f'flash_fused_op_installed: {t}'
         
         super().__init__()
-        # self.rng = torch.Generator(device=dist.get_device())
-        self.rng = torch.Generator(device='cuda')
+        self.rng = torch.Generator(device=dist.get_device())
         self.maybe_record_function = nullcontext
         self.text_maxlen = text_maxlen
         self.t2i = text_channels != 0
@@ -365,7 +373,7 @@ class Infinity(nn.Module):
             full_scale_schedule = dynamic_resolution_h_w[h_div_w_template][self.pn]['scales']
             if self.inference_mode:
                 apply_flex_attn_scales = list(range(1, 1+len(full_scale_schedule)))
-                mask_type = "infinity_infer_mask_with_kv_cache"
+                mask_type = "var_infer_mask_with_kv_cache"
                 auto_padding = True
             else:
                 mask_type = 'var'
@@ -548,7 +556,7 @@ class Infinity(nn.Module):
             vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
         else:
             vae_scale_schedule = scale_schedule
-        
+
         # ------ text prompt process: for CFG ------
         kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
         if any(np.array(cfg_list) != 1):
@@ -570,12 +578,14 @@ class Infinity(nn.Module):
             bs = B
         # ------------------------------------------
 
+        # process text embeddings
         kv_compact = self.text_norm(kv_compact)     # FastRMSNorm
         sos = cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k))    # sos: [2, v_dim(2048)], cond_BD: [2, v_dim]
         kv_compact = self.text_proj_for_ca(kv_compact)                                      # kv_compact: [2*len, v_dim], linear -> tanh -> linear
         ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
         last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)      # [bs, 1, v_dim], Transformer first scale input
 
+        # init adaptive LN
         with torch.amp.autocast('cuda', enabled=False):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()      # shared_ada_lin: silu -> SharedAdaLin; gss: gamma, scale, shift for AdaLN
         accu_BChw, cur_L, ret = None, 0, []     # current length, list of reconstructed images
@@ -588,7 +598,7 @@ class Infinity(nn.Module):
             for block_chunk_ in self.block_chunks:
                 for module in block_chunk_.module.module:
                     (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True)
-        
+
         # ------ where and how to use CFG ------
         abs_cfg_insertion_layers = []
         add_cfg_on_logits, add_cfg_on_probs = False, False
@@ -604,13 +614,15 @@ class Infinity(nn.Module):
             else:
                 raise ValueError(f'cfg_insertion_layer: {item} is not valid')
         # ---------------------------------------
-        
+
         num_stages_minus_1 = len(scale_schedule) - 1
         summed_codes = 0
         # ------ auto-regressive scale ------             si: [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64]
         for si, pn in enumerate(scale_schedule):        # si: i-th segment, pn: current scale patch number
             # skip last scales
-            if self.skip_last_scales == 2 and (48 == pn[2] or 64 == pn[2]):
+            if self.skip_last_scales == 3 and (40 == pn[2] or 48 == pn[2] or 64 == pn[2]):
+                continue
+            elif self.skip_last_scales == 2 and (48 == pn[2] or 64 == pn[2]):
                 continue
             elif self.skip_last_scales == 1 and 64 == pn[2]:
                 continue
@@ -640,14 +652,19 @@ class Infinity(nn.Module):
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
                 
                 for m in b.module:
-                    last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+                    last_stage = m(
+                        x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, 
+                        attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, 
+                        scale_ind=si, 
+                    )
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
                         # print(f'add cfg={cfg} on {layer_idx}-th layer output')
                         last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
                         last_stage = torch.cat((last_stage, last_stage), 0)
                     layer_idx += 1
             # --------------------------------
-            
+
+            # get logits and sample
             if (cfg != 1) and add_cfg_on_logits:
                 # print(f'add cfg on add_cfg_on_logits')
                 logits_BlV = self.get_logits(last_stage, cond_BD).mul(1/tau_list[si])       # get 2*bs(cond and uncond)'s logits
@@ -807,8 +824,10 @@ if __name__ == '__main__':
 
     import argparse
     import time
+
     from torch import autocast
-    from tools.run_infinity import load_visual_tokenizer, load_transformer
+
+    from tools.run_infinity import load_transformer, load_visual_tokenizer
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     g_seed = random.randint(0, 10000)
@@ -854,7 +873,7 @@ if __name__ == '__main__':
             fused_mlp=False,                 # default: False
             fused_norm=True,
             pad_to_multiplier=128,
-            use_flex_attn=0,
+            use_flex_attn=0,                # default: 0
             add_lvl_embeding_only_first_block=1,
             use_bit_label=1,
             rope2d_each_sa_layer=1,

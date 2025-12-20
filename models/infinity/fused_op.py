@@ -12,7 +12,7 @@ def fused_rms_norm(x: torch.Tensor, weight: nn.Parameter, eps: float):
 
 
 # @torch.compile(fullgraph=True)
-@torch.compile      # default: @torch.compile(fullgraph=True); for vscode debug: @torch.compile / @torch.compile(dynamic=True)
+@torch.compile      # for vscode debug: @torch.compile / @torch.compile(dynamic=True)
 def fused_ada_layer_norm(C: int, eps: float, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor):
     x = x.float()
     x = F.layer_norm(input=x, normalized_shape=(C,), weight=None, bias=None, eps=eps)

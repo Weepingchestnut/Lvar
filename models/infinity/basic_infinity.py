@@ -12,23 +12,24 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
-from timm.layers import DropPath, drop_path
-
 # Import flash_attn's attention
-from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
+from flash_attn import flash_attn_func  # q, k, or v: BLHc, ret: BLHc
 from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
-
-# not slow attn, for torch 2.6.0, it's flash attn 2 
+from timm.layers import DropPath, drop_path
+from torch.nn.attention import SDPBackend, sdpa_kernel
+# not slow attn, for torch >= 2.0.0 and CUDA backend, it support flash attn 2 for fast inference
 # https://docs.pytorch.org/docs/2.6/generated/torch.nn.functional.scaled_dot_product_attention.html#torch.nn.functional.scaled_dot_product_attention
-from torch.nn.functional import scaled_dot_product_attention as slow_attn    # q, k, v: BHLc
+# from torch.nn.functional import scaled_dot_product_attention as slow_attn    # q, k, v: BHLc
+# -->
+from torch.nn.functional import scaled_dot_product_attention as torch_attn  # q, k, v: BHLc
+from torch.utils.checkpoint import checkpoint
 
 # Import flash_attn's fused ops
 try:
+    from flash_attn.ops.fused_dense import fused_mlp_func
     from flash_attn.ops.layer_norm import dropout_add_layer_norm
     from flash_attn.ops.rms_norm import dropout_add_rms_norm
     from flash_attn.ops.rms_norm import rms_norm as rms_norm_impl
-    from flash_attn.ops.fused_dense import fused_mlp_func
     flash_fused_op_installed = True
 except ImportError:
     dropout_add_layer_norm = dropout_add_rms_norm = fused_mlp_func = None
@@ -254,12 +255,11 @@ class SelfAttention(nn.Module):
 
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
 
-    
     def kv_caching(self, enable: bool): # kv caching: only used during inference
         self.caching = enable
         self.cached_k = None
         self.cached_v = None
-    
+
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]],
                 attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
@@ -310,7 +310,7 @@ class SelfAttention(nn.Module):
         if self.caching:    # kv caching: only used during inference
             if self.cached_k is None: self.cached_k = k; self.cached_v = v
             else: k = self.cached_k = torch.cat((self.cached_k, k), dim=L_dim); v = self.cached_v = torch.cat((self.cached_v, v), dim=L_dim)
-        
+
         if self.using_flash:
             if attn_bias_or_two_vector is not None: # training
                 kw = dict(VAR_visible_kvlen=attn_bias_or_two_vector[0], VAR_invisible_qlen=attn_bias_or_two_vector[1])
@@ -323,13 +323,19 @@ class SelfAttention(nn.Module):
             if self.use_flex_attn and attn_fn is not None:
                 oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
             else:
-                oup = (slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0)
-                       .transpose(1, 2)
-                       .reshape(B, L, C))
+                # oup = (slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0)
+                #        .transpose(1, 2)
+                #        .reshape(B, L, C))
+                # -->
+                # --- torch attn ---
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    oup = (torch_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0)
+                           .transpose(1, 2)
+                           .reshape(B, L, C))
             # oup: bf16
         
         return self.proj_drop(self.proj(oup))
-    
+
     def extra_repr(self) -> str:
         tail = ''
         return f'using_flash={self.using_flash}, tau={self.tau}, cos_attn={self.cos_attn}{tail}'
@@ -564,3 +570,52 @@ class AdaLNBeforeHead(nn.Module):
             return self.ln_wo_grad(x_BLC).mul(scale.add(1)).add_(shift)
         else:
             return self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x_BLC, scale=scale, shift=shift)
+
+
+if __name__ == '__main__':
+    embed_dim = 2048
+    num_heads = 2048 // 128
+    batch_size = 2
+    seq_len = 2304
+    pad_to_multiplier = 128
+    rope2d_normalized_by_hw = 2
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    attn = SelfAttention(
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        proj_drop=0.0,
+        tau=1.0,
+        cos_attn=True,
+        customized_flash_attn=False,
+        use_flex_attn=False,
+        batch_size=batch_size,
+        pad_to_multiplier=pad_to_multiplier,
+        rope2d_normalized_by_hw=rope2d_normalized_by_hw
+    ).to(device)
+
+    x = torch.randn(batch_size, seq_len, embed_dim, dtype=torch.float32, device=device)
+
+    from utils.dynamic_resolution import dynamic_resolution_h_w
+    scale_schedule = [(1, 1, 1), (1, 2, 2), (1, 4, 4), (1, 6, 6), (1, 8, 8), (1, 12, 12), 
+                      (1, 16, 16), (1, 20, 20), (1, 24, 24), (1, 32, 32), (1, 40, 40), 
+                      (1, 48, 48), (1, 64, 64)]
+    rope2d_freqs_grid = precompute_rope2d_freqs_grid(
+        dim=embed_dim // num_heads,
+        dynamic_resolution_h_w=dynamic_resolution_h_w,
+        pad_to_multiplier=pad_to_multiplier,
+        rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+        device=x.device
+    )
+
+    with torch.no_grad():
+        out = attn(
+            x,
+            attn_bias_or_two_vector=None,
+            attn_fn=None,
+            scale_schedule=scale_schedule,
+            rope2d_freqs_grid=rope2d_freqs_grid,
+            scale_ind=0
+        )
+    print(f"SelfAttention output shape: {out.shape}")
