@@ -57,7 +57,10 @@ python openai_evaluator.py VIRTUAL_imagenet256_labeled.npz <path_to_our_generati
 首先需安装经过自定义的`torch-fidelty`，安装命令如下：
 
 ```bash
-pip install -e git+https://github.com/LTH14/torch-fidelity.git@master#egg=torch-fidelity
+# pip install -e git+https://github.com/LTH14/torch-fidelity.git@master#egg=torch-fidelity
+
+# --src: set git download path
+pip install -e git+https://github.com/LTH14/torch-fidelity.git@master#egg=torch-fidelity --src evaluation/imagenet
 ```
 
 此外，需下载ImageNet的统计参考`.npz`数据集，

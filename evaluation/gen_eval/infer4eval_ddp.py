@@ -1,18 +1,16 @@
 import argparse
 import copy
 import json
-import torch.distributed as tdist
 
-from transformers import AutoModel, AutoTokenizer
+import torch.distributed as tdist
 from lightning_fabric import seed_everything
 from tqdm import trange
+from transformers import AutoModel, AutoTokenizer
 
+from models.hart.hart_transformer_t2i import HARTForT2I
 from tools.conf import HF_HOME, HF_TOKEN
 from tools.run_hart import gen_one_img_hart
 from tools.run_infinity import *
-
-from models.hart.hart_transformer_t2i import HARTForT2I
-
 
 # set environment variables
 os.environ['HF_TOKEN'] = HF_TOKEN
@@ -28,6 +26,7 @@ if __name__ == '__main__':
     parser.add_argument('--metadata_file', type=str, default='evaluation/gen_eval/prompts/evaluation_metadata.jsonl')
     parser.add_argument('--rewrite_prompt', type=int, default=0, choices=[0,1])
     parser.add_argument('--load_rewrite_prompt_cache', type=int, default=1, choices=[0,1])
+    parser.add_argument('--test_speed', type=bool, default=True, help="Enable latency measurement")
     args = parser.parse_args()
 
     # parse cfg
@@ -36,11 +35,12 @@ if __name__ == '__main__':
         args.cfg = args.cfg[0]
     
     # *Initialize distributed process group
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f'cuda:{local_rank}')
     tdist.init_process_group(backend='nccl')
     rank = tdist.get_rank()
     world_size = tdist.get_world_size()
-    torch.cuda.set_device(rank)
-    device = torch.device(f'cuda:{rank}')
     
     with open(args.metadata_file) as fp:
         metadatas = [json.loads(line) for line in fp]
@@ -91,12 +91,18 @@ if __name__ == '__main__':
             ema_hart = copy.deepcopy(hart)
             ema_hart.load_state_dict(torch.load(os.path.join(args.model_path, "ema_model.bin")))
 
+    tdist.barrier(device_ids=[local_rank])
     # hyperparameter setting
     tau = args.tau; cfg = args.cfg
     h_div_w_template = 1.000
     scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
     # tgt_h, tgt_w = dynamic_resolution_h_w[h_div_w_template][args.pn]['pixel']
+    
+    local_total_latency = 0.0
+    local_infinity_latency = 0.0
+    local_num_images = 0
+    warmup_steps = 5
     
     # for index, metadata in enumerate(metadatas):
     for index in trange(start_idx, end_idx, disable=rank!=0, desc=f"Rank {rank}"):
@@ -158,14 +164,28 @@ if __name__ == '__main__':
                 image = pipe(prompt).images[0]
             # ------------ Infinity ------------
             elif 'infinity' in args.model_type:
-                image = gen_one_img(
-                    infinity, vae, text_tokenizer, text_encoder,
-                    prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg,
-                    scale_schedule=scale_schedule,
-                    cfg_insertion_layer=[args.cfg_insertion_layer],
-                    vae_type=args.vae_type,
-                    g_seed=seed,
-                )
+                if args.test_speed and index > (warmup_steps-1):
+                    image, total_cost, infinity_cost = gen_one_img(
+                        infinity, vae, text_tokenizer, text_encoder,
+                        prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg,
+                        scale_schedule=scale_schedule,
+                        cfg_insertion_layer=[args.cfg_insertion_layer],
+                        vae_type=args.vae_type,
+                        g_seed=seed,
+                        test_speed=args.test_speed
+                    )
+                    local_total_latency += total_cost
+                    local_infinity_latency += infinity_cost
+                    local_num_images += 1
+                else:
+                    image = gen_one_img(
+                        infinity, vae, text_tokenizer, text_encoder,
+                        prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg,
+                        scale_schedule=scale_schedule,
+                        cfg_insertion_layer=[args.cfg_insertion_layer],
+                        vae_type=args.vae_type,
+                        g_seed=seed,
+                    )
             # ------------ HART ------------
             elif 'hart' in args.model_type:
                 image = gen_one_img_hart(
@@ -179,11 +199,11 @@ if __name__ == '__main__':
 
             alloc_after_gen = torch.cuda.memory_allocated(device=device) / (1024**2)
             peak_alloc_gen = torch.cuda.max_memory_allocated(device=device) / (1024**2)
-            print(f"\n===== [Rank {rank}] Generation Time / Memory Usage of Original Model =====")
+            print(f"\n====== [Rank {rank}] Generation Time / Memory Usage of Original Model ======")
+            print(f'{args.model_type} infer one image takes {t2-t1:.2f}s (w/ decoder)')
             print(f"GPU allocated before/after: {alloc_before_gen:.1f} MB -> {alloc_after_gen:.1f} MB (delta {alloc_after_gen - alloc_before_gen:+.1f} MB)")
             print(f"GPU peak allocated during gen: {peak_alloc_gen:.1f} MB (delta {peak_alloc_gen - alloc_before_gen:+.1f} MB)")
             print("=======================================================================\n")
-            print(f'[Rank {rank}] {args.model_type} infer one image takes {t2-t1:.2f}s')
             images.append(image)
 
         for i, image in enumerate(images):
@@ -193,8 +213,37 @@ if __name__ == '__main__':
             else:
                 image.save(save_file)
     
-    tdist.barrier()
+    tdist.barrier(device_ids=[local_rank])
+    # ---- distributed latency reduction ----
+    latency_tensor = torch.tensor(
+        [local_total_latency, local_infinity_latency, local_num_images],
+        device=device,
+        dtype=torch.float64
+    )
+    
+    tdist.all_reduce(latency_tensor, op=tdist.ReduceOp.SUM)
+    global_total_latency = latency_tensor[0].item()
+    global_infinity_latency = latency_tensor[1].item()
+    global_num_images = int(latency_tensor[2].item())
+    
     if rank == 0:
+        avg_total_latency = global_total_latency / max(global_num_images, 1)
+        avg_infinity_latency = global_infinity_latency / max(global_num_images, 1)
+        throughput_total = global_num_images / global_total_latency
+        throughput_infinity = global_num_images / global_infinity_latency
+        warmup_images = warmup_steps * args.n_samples
+        print("\n======== Benchmark Profile ========")
+        print(f"Total images: {global_num_images} + {warmup_images} = {global_num_images+warmup_images}")
+        print("------ w/ decoder ------")
+        print(f"Total inference time: {global_total_latency:.2f} s")
+        print(f"Average latency per image: {avg_total_latency:.4f} s")
+        print(f"Throughput: {throughput_total:.4f} images/sec")
+        print("------ w/o decoder ------")
+        print(f"Total inference time: {global_infinity_latency:.2f} s")
+        print(f"Average latency per image: {avg_infinity_latency:.4f} s")
+        print(f"Throughput: {throughput_infinity:.4f} images/sec")
+        print("===================================\n")
+        
         print("All processes finished generation.")
         # with open(prompt_rewrite_cache_file, 'w') as f:
         #     json.dump(prompt_rewrite_cache, f, indent=2)

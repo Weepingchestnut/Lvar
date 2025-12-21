@@ -28,6 +28,8 @@ pip install -U diffusers
 sudo apt install python3-tk
 wget https://dl.fbaipublicfiles.com/mmf/clip/bpe_simple_vocab_16e6.txt.gz
 # mv bpe_simple_vocab_16e6.txt.gz /home/tiger/.local/lib/python3.9/site-packages/hpsv2/src/open_clip
+
+# suppose your virtual environment name is 'torch260'
 mv bpe_simple_vocab_16e6.txt.gz ~/anaconda3/envs/torch260/lib/python3.12/site-packages/hpsv2/src/open_clip
 ```
 

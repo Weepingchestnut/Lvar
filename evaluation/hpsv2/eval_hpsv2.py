@@ -80,9 +80,6 @@ if __name__ == '__main__':
         # load infinity
         infinity = load_transformer(vae, args)
 
-        if 'scalekv' in args.model_type:
-            infinity = enable_scale_kv(infinity, window_size=16, max_capacity=650, kernel_size=5, pooling='maxpool')
-
         if args.rewrite_prompt:
             from tools.prompt_rewriter import PromptRewriter
             prompt_rewriter = PromptRewriter(system='', few_shot_history=[])
