@@ -2,6 +2,7 @@ import random
 import psutil
 import pynvml
 import torch
+lib = torch.cuda.cudart()
 import os
 import os.path as osp
 import cv2
@@ -13,17 +14,85 @@ from run_infinity import *
 from tools.latency_profile import format_memory, get_memory_usage
 
 
+# default_prompts = [
+#     "beautiful lady, freckles, big smile, blue eyes, short ginger hair, dark makeup, wearing a floral blue vest top, soft light, dark grey background",
+#     "anthropomorphic profile of the white snow owl Crystal priestess , art deco painting, pretty and expressive eyes, ornate costume, mythical, ethereal, intricate, elaborate, hyperrealism, hyper detailed, 3D, 8K, Ultra Realistic, high octane, ultra resolution, amazing detail, perfection, In frame, photorealistic, cinematic lighting, visual clarity, shading , Lumen Reflections, Super-Resolution, gigapixel, color grading, retouch, enhanced, PBR, Blender, V-ray, Procreate, zBrush, Unreal Engine 5, cinematic, volumetric, dramatic, neon lighting, wide angle lens ,no digital painting blur."
+#     "Bright scene, aerial view, ancient city, fantasy, gorgeous light, mirror reflection, high detail, wide angle lens.",
+#     "A 4k dslr image of a lemur wearing a red magician hat and a blue coat performing magic tricks with cards in a garden.",
+#     "A silhouette of a grand piano overlooking a dusky cityscape viewed from a top-floor penthouse, rendered in the bold and vivid sytle of a vintage travel poster.",
+#     "Crocodile in a sweater.",
+#     "Luffy from ONEPIECE, handsome face, fantasy.",
+#     "3d digital art of an adorable ghost, glowing within, holding a heart shaped pumpkin, Halloween, super cute, spooky haunted house background.",
+#     "an astronaut sitting in a diner, eating fries, cinematic, analog film",
+#     "Chinese architecture, ancient style,mountain, bird, lotus, pond, big tree, 4K Unity, octane rendering.",
+# ]
 default_prompts = [
-    "beautiful lady, freckles, big smile, blue eyes, short ginger hair, dark makeup, wearing a floral blue vest top, soft light, dark grey background",
-    "anthropomorphic profile of the white snow owl Crystal priestess , art deco painting, pretty and expressive eyes, ornate costume, mythical, ethereal, intricate, elaborate, hyperrealism, hyper detailed, 3D, 8K, Ultra Realistic, high octane, ultra resolution, amazing detail, perfection, In frame, photorealistic, cinematic lighting, visual clarity, shading , Lumen Reflections, Super-Resolution, gigapixel, color grading, retouch, enhanced, PBR, Blender, V-ray, Procreate, zBrush, Unreal Engine 5, cinematic, volumetric, dramatic, neon lighting, wide angle lens ,no digital painting blur."
-    "Bright scene, aerial view, ancient city, fantasy, gorgeous light, mirror reflection, high detail, wide angle lens.",
-    "A 4k dslr image of a lemur wearing a red magician hat and a blue coat performing magic tricks with cards in a garden.",
-    "A silhouette of a grand piano overlooking a dusky cityscape viewed from a top-floor penthouse, rendered in the bold and vivid sytle of a vintage travel poster.",
-    "Crocodile in a sweater.",
-    "Luffy from ONEPIECE, handsome face, fantasy.",
-    "3d digital art of an adorable ghost, glowing within, holding a heart shaped pumpkin, Halloween, super cute, spooky haunted house background.",
-    "an astronaut sitting in a diner, eating fries, cinematic, analog film",
-    "Chinese architecture, ancient style,mountain, bird, lotus, pond, big tree, 4K Unity, octane rendering.",
+    'A high-contrast photo of a panda riding a horse. The panda is wearing a wizard hat and is reading a book. The horse is standing on a street against a gray concrete wall. Colorful flowers and the word "PEACE" are painted on the wall. Green grass grows from cracks in the street. DSLR photograph. daytime lighting.',
+    'a red cube on the top of blue sphere, the behind is a yellow triangle. A cat is on the left and a dog is on the right',
+    'The red hat was on the left of the blue backpack.',
+    'woman lying on the beach',
+    'woman laying on grass',
+    'Epic anime artwork of a wizard atop a mountain at night casting a cosmic spell into the dark sky that says "VAR" made out of colorful energy',
+    'A board with text "Hello, VAR"',
+    'A paper reads "No!"',
+    'A photograph featuring a young woman standing in a field of tall green plants, possibly corn, with the sun shining through the foliage creating a warm, golden glow. The woman is looking off to the side with a gentle expression, and her face is partially obscured by the plants. The sunlight creates a lens flare effect, adding a dreamy quality to the image. The style of the image is naturalistic, capturing a moment of serenity in a rural setting.',
+    "A photo-realistic picture. A black and white photograph that captures a man in profile. The man has a beard and mustache, and his hair appears to be swept back. He is wearing a scarf or shawl that is wrapped around his neck and shoulders, adding texture to the image. The photograph is taken from a close-up angle, focusing on the man's face and the upper part of his torso. The lighting is dramatic, with strong contrasts between light and shadow, highlighting the contours of his face and the texture of his hair and clothing. The style of the image is reminiscent of a cinematic or artistic portrait, emphasizing mood and emotion over realism.",
+    'A man engaged in the activity of paddleboarding. He is balancing on a white paddleboard with a pink nose, which is partially submerged in the blue water. The man is wearing a black sleeveless top, blue shorts, and sunglasses. His hair is long and appears to be wet, suggesting he has been in the water. He is smiling and seems to be enjoying the moment, with his arms outstretched for balance. The background shows a clear sky and distant mountains, indicating that the setting is likely a large body of water, such as a lake or sea, on a sunny day. The photograph is taken in a realistic style, capturing the action and the natural environment.',
+    'a young woman standing in the grass,, in the style of stark black-and-white photography,, hasselblad 1600f,, coastal landscapes,, expressive facial features,, dutch landscapes,, soft atmospheric scenes,, powerful portraits',
+    'a digital painting of an old man with a beard and some dark grays,, in the style of photorealistic urban scenes,, uhd image,, algeapunk,, rusty debris,, vibrant portraits,, flickr,, soft-focus portraits',
+    'beautiful female warrior,, short blue hair,, shimmering jewels armor,, in the style of Alfons Mucha,, with emphasis on light play and the transparency of the glass,, High and short depth of field,, Ray tracing,, FHD,, hyper quality',
+    'a young female hobbit,, ultra realism,, lord of the rings,, snowy forest,, pale hues,, hobbit from lord of the rings who escaped Carn Dum,, grimy,, dirty,, black hair,, homely,, ugly',
+    'A dog is walking on a leash with its owner.',
+    'A man is running a marathon and crossing the finish line.',
+    'an oblong eggplant and a teardrop pear',
+    'an oblong cucumber and a teardrop pepper',
+    'a brown dog and a blue horse',
+    'a rabbit fights with a tiger',
+    'three women',
+    'three deer',
+    'a tree',
+    'a photo of a tree',
+    'grassland',
+    'a woman rides a tiger in the forest',
+    'a beautiful scenery area of russia',
+    'an oil painting of a house',
+    "two girls",
+    "three boys",
+    'two candles on a marble table next to a silver spoon',
+    'woman lying on the beach',
+    'woman laying on grass',
+    'woman laying on the beach',
+    'liberty of statue',
+    'a man full body shot',
+    'a woman full body shot',
+    'a set of sushi which consists of a US map shape',
+    'Asian girl near the beach',
+    'two women sitting in the sofa and hold red wine cup',
+    'a rabbit fights with a tiger',
+    'two ninjas fight with each other during night',
+    'a red cube on the top of blue sphere, the behind is a yellow triangle. A cat is on the left and a dog is on the right',
+    'Epic anime artwork of a wizard atop a mountain at night casting a cosmic spell into the dark sky that says "VAR" made out of colorful energy',
+    'a woman having a spa day',
+    'two men boxing',
+    'a Chinese woman laying on the beach',
+    'a man laying on a bed',
+    'A brand with "VAR DIT"',
+    'A board with text "Hello, VAR"',
+    'A paper reads "No!"',
+    'A paper reads "VAR Yes!"',
+    'American national flag',
+    'China national flag',
+    'Russia national flag',
+    'a woman lying on the beach sunbathing',
+    'ironman',
+    "Generate the text 'happy' with autumn leaves and cold colors.",
+    "Generate the text 'bytedance' with autumn leaves and cold colors.",
+    "Generate the text 'GenAI' in a supermarket.",
+    "Generate the text 'GenAI' in a grass.",
+    "Generate the text 'GenAI' in a ground.",
+    "Generate the text 'KCTG' in a book.",
+    "Generate the text 'GenAI' in a table.",
+    "a Chinese model is sitting on a train, magazine cover, photorealistic, futuristic style",
 ]
 
 
@@ -52,13 +121,50 @@ def encode_prompts(text_tokenizer, text_encoder, prompt, enable_positive_prompt=
     return text_cond_tuple
 
 
+def get_physical_device_index():
+    """
+    Gets the physical device index that pynvml can use,
+    even when CUDA_VISIBLE_DEVICES is set.
+    """
+    # Get the logical device index from PyTorch
+    logical_device_index = torch.cuda.current_device()
+
+    # Get the CUDA_VISIBLE_DEVICES environment variable
+    cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+
+    if cuda_visible_devices:
+        # If the variable is set, parse it and find the physical index
+        try:
+            # Split the comma-separated string into a list of device IDs
+            visible_devices = [int(d.strip()) for d in cuda_visible_devices.split(',')]
+            # Map the logical index to the physical index
+            if logical_device_index < len(visible_devices):
+                physical_device_index = visible_devices[logical_device_index]
+                return physical_device_index
+            else:
+                # This case should ideally not happen if PyTorch is configured correctly
+                raise IndexError("PyTorch logical device index is out of bounds of CUDA_VISIBLE_DEVICES.")
+        except (ValueError, IndexError) as e:
+            print(f"Warning: Could not parse CUDA_VISIBLE_DEVICES='{cuda_visible_devices}'. Error: {e}")
+            # Fallback to using the logical index directly, which might be incorrect
+            return logical_device_index
+    else:
+        # If the variable is not set, logical and physical indices are the same
+        return logical_device_index
+
+
 def main(args):
     # --- NVML init ---
     nvml_handle = None
     try:
         pynvml.nvmlInit()
         if torch.cuda.is_available():
-            nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+            # Use the helper function to get the correct physical device index
+            physical_device_index = get_physical_device_index()
+            # nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+            # -->
+            nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_index)
+            print(f"PyTorch is using device: cuda:{torch.cuda.current_device()}. Monitoring physical NVIDIA GPU index: {physical_device_index}")
     except pynvml.NVMLError as e:
         print(f"Warning: Could not initialize NVML. NVIDIA-SMI usage will not be reported. Error: {e}")
     # ----------------
@@ -87,8 +193,6 @@ def main(args):
         vae = load_visual_tokenizer(args)
         # load infinity
         infinity = load_transformer(vae, args)
-        if 'scalekv' in args.model_type:
-            infinity = enable_scale_kv(infinity, window_size=16, max_capacity=650, kernel_size=5, pooling='maxpool')
         
         # --- Memory analysis: After model load ---
         torch.cuda.synchronize()
@@ -120,19 +224,15 @@ def main(args):
         gt_leak=0
         gt_ls_Bl=None
 
-        prompts = random.sample(default_prompts, args.batch_size)
-
         with torch.inference_mode():
+            # for sparse attn layer count
+            from models.infinity.sparse_attn_layer_counter import singleton as layer_counter
+
             if not isinstance(cfg, list):
                 cfg_list = [cfg] * len(scale_schedule)
             if not isinstance(tau, list):
                 tau_list = [tau] * len(scale_schedule)
-            text_cond_tuple = encode_prompts(text_tokenizer, text_encoder, prompts, enable_positive_prompt)
-            if negative_prompt:
-                negative_label_B_or_BLT = encode_prompts(text_tokenizer, text_encoder, negative_prompt)
-            else:
-                negative_label_B_or_BLT = None
-            
+
             # --- Memory Analysis: Preparing for Inference ---
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)
@@ -142,8 +242,16 @@ def main(args):
             
             # warmup
             print(f"\nStarting GPU warm-up for {args.warmup_iter} iterations...")
-            with autocast("cuda", dtype=torch.bfloat16, enabled=True, cache_enabled=True):
-                for _ in tqdm(range(args.warmup_iter)):
+            for _ in tqdm(range(args.warmup_iter)):
+                prompts = random.sample(default_prompts, args.batch_size)
+                text_cond_tuple = encode_prompts(text_tokenizer, text_encoder, prompts, enable_positive_prompt)
+                if negative_prompt:
+                    negative_label_B_or_BLT = encode_prompts(text_tokenizer, text_encoder, negative_prompt)
+                else:
+                    negative_label_B_or_BLT = None
+
+                with autocast("cuda", dtype=torch.bfloat16, enabled=True, cache_enabled=True):
+                    lib.cudaProfilerStart()
                     _, _, img_list = infinity.autoregressive_infer_cfg(
                         vae=vae,
                         scale_schedule=scale_schedule,
@@ -157,11 +265,13 @@ def main(args):
                         gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
                         sampling_per_bits=args.sampling_per_bits,
                     )
+                    lib.cudaProfilerStop()
                     # --- Memory Analysis: Monitoring CPU and NVIDIA-SMI in a loop ---
                     cpu, _, nvsmi = get_memory_usage(device, nvml_handle)
                     peak_cpu_mem = max(peak_cpu_mem, cpu)
                     peak_nvsmi_gpu_mem = max(peak_nvsmi_gpu_mem, nvsmi)
                     # ----------------------------------------------------------------
+                layer_counter.reset()
             torch.cuda.synchronize(device=device)
             print("GPU warm-up finished.")
             
@@ -171,6 +281,9 @@ def main(args):
             sstart_time = time.time()
             for _ in tqdm(range(args.profile_iter)):
                 prompts = random.sample(default_prompts, args.batch_size)
+                print('\n====== prompts ======')
+                print(f'{prompts}')
+                print(f'=====================')
 
                 text_cond_tuple = encode_prompts(text_tokenizer, text_encoder, prompts, enable_positive_prompt)
                 if negative_prompt:
@@ -180,6 +293,7 @@ def main(args):
                 
                 with autocast("cuda", dtype=torch.bfloat16, enabled=True, cache_enabled=True):
                     start_time = time.perf_counter()    # for accurate timing
+                    lib.cudaProfilerStart()
                     _, _, img_list = infinity.autoregressive_infer_cfg(
                         vae=vae,
                         scale_schedule=scale_schedule,
@@ -194,15 +308,17 @@ def main(args):
                         sampling_per_bits=args.sampling_per_bits,
                     )
                     torch.cuda.synchronize(device=device)   # *Important*: Ensure that all CUDA operations are completed before recording the time
+                    lib.cudaProfilerStop()
+                    
                     end_time = time.perf_counter()
-                    timings.append(end_time - start_time)
+                    timings.append(end_time - start_time); print(f'%%%%%% {(end_time - start_time) * 1000:.2f}ms %%%%%%')
                     
                     # --- Memory Analysis: Monitoring CPU and NVIDIA-SMI in a loop ---
                     cpu, _, nvsmi = get_memory_usage(device, nvml_handle)
                     peak_cpu_mem = max(peak_cpu_mem, cpu)
                     peak_nvsmi_gpu_mem = max(peak_nvsmi_gpu_mem, nvsmi)
                     # ----------------------------------------------------------------
-            
+                layer_counter.reset()
             ttotal_time = time.time() - sstart_time
             print("Inference speed test finished.")
         
@@ -244,7 +360,8 @@ if __name__ == "__main__":
     parser.add_argument('--outdir', type=str, default='')
     # --- exp params --
     # parser.add_argument('--freeze_kv_cache_last_n_scales', type=int, default=4)
-    parser.add_argument('--base_cache_scales', type=int, default=5)
+    # parser.add_argument('--attn_sink_scales', type=int, default=5)
+    # parser.add_argument('--skip_last_scales', type=int, default=0)
     args = parser.parse_args()
 
     main(args)

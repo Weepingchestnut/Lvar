@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import time
+import yaml
 from collections import OrderedDict, deque
 from typing import Optional, Union
 
@@ -21,6 +22,61 @@ except ImportError as e:
     raise e
 
 import utils.dist as dist
+
+
+def _seed_everything(seed, benchmark: bool):
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = benchmark
+    if seed is None:
+        torch.backends.cudnn.deterministic = False
+    else:
+        torch.backends.cudnn.deterministic = True
+        seed = seed * dist.get_world_size() + dist.get_rank()
+        os.environ['PYTHONHASHSEED'] = str(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+
+
+def _set_tf32(tf32: bool):
+    if torch.cuda.is_available():
+        torch.backends.cudnn.allow_tf32 = bool(tf32)
+        torch.backends.cuda.matmul.allow_tf32 = bool(tf32)
+        if hasattr(torch, 'set_float32_matmul_precision'):
+            torch.set_float32_matmul_precision('high' if tf32 else 'highest')
+            print(f'[tf32] [precis] torch.get_float32_matmul_precision(): {torch.get_float32_matmul_precision()}')
+        print(f'[tf32] [ conv ] torch.backends.cudnn.allow_tf32: {torch.backends.cudnn.allow_tf32}')
+        print(f'[tf32] [matmul] torch.backends.cuda.matmul.allow_tf32: {torch.backends.cuda.matmul.allow_tf32}')
+
+
+def _compile_model(m, fast):
+    if fast == 0:
+        return m
+    return torch.compile(m, mode={
+        1: 'reduce-overhead',
+        2: 'max-autotune',
+        3: 'default',
+    }[fast]) if hasattr(torch, 'compile') else m
+
+
+def _get_yaml_loader():
+    #https://stackoverflow.com/questions/30458977/yaml-loads-5e-6-as-string-and-not-a-number
+    loader = yaml.SafeLoader
+    loader.add_implicit_resolver(
+        u'tag:yaml.org,2002:float',
+        re.compile(u'''^(?:
+        [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+        |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
+        |\\.[0-9_]+(?:[eE][-+][0-9]+)?
+        |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
+        |[-+]?\\.(?:inf|Inf|INF)
+        |\\.(?:nan|NaN|NAN))$''', re.X),
+        list(u'-+0123456789.'))
+
+    return loader
 
 
 class Args(Tap):
@@ -111,6 +167,7 @@ class Args(Tap):
     tf32: bool = True       # whether to use TensorFloat32
     device: str = 'cpu'     # [automatically set; don't specify this]
     seed: int = None        # seed
+    
     def seed_everything(self, benchmark: bool):
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = benchmark
@@ -127,6 +184,7 @@ class Args(Tap):
                 torch.cuda.manual_seed(seed)
                 torch.cuda.manual_seed_all(seed)
     same_seed_for_all_ranks: int = 0     # this is only for distributed sampler
+    
     def get_different_generator_for_each_rank(self) -> Optional[torch.Generator]:   # for random augmentation
         if self.seed is None:
             return None
@@ -553,6 +611,7 @@ def init_dist_and_get_args():
             break
     
     args = Args(explicit_bool=True).parse_args(known_only=True)     # known_only=True 仅解析已定义的参数，忽略未定义的参数
+    
     if args.local_debug:
         args.pn = '1_2_3'
         args.seed = 1

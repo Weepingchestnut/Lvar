@@ -818,7 +818,7 @@ class LlamaAttention(nn.Module):
             weight=self.qkv_proj.weight,
             bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias)),
         ).view(B, L, 3, self.num_heads, self.head_dim)
-        main_type = qkv.dtype
+        main_type = qkv.dtype       # torch.float16
         # qkv: BL3Hc
 
         using_flash = (
@@ -833,7 +833,7 @@ class LlamaAttention(nn.Module):
             dim_cat = 2  # q or k or v: BHLc
             dim_unsqueeze = 1
 
-        if self.attn_l2_norm:
+        if self.attn_l2_norm:       # False
             scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp()
             if using_flash or self.using_xform:
                 scale_mul = scale_mul.transpose(1, 2)  # 1H11 to 11H1
@@ -842,7 +842,7 @@ class LlamaAttention(nn.Module):
 
         ################## Use naive rotary embedding ##################
         # apply position embedding to visual tokens
-        if self.context_token == 0:
+        if self.context_token == 0:     # usually > 0
             # position_ids exist for c2i
             # or t2i when stage id != 0
             # or t2i training phase (stage id = -1)

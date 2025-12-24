@@ -1,6 +1,6 @@
 from typing import Optional
-
 from transformers import PretrainedConfig
+
 
 __all__ = [
     "HARTAutoEncoderConfig", 

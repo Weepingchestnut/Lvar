@@ -397,3 +397,10 @@ def get_world_size():
         return 1
     return tdist.get_world_size()
 
+
+def does_not_contain_substrings(main_string, substrings):
+    for substring in substrings:
+        if substring in main_string:
+            return False
+    return True
+

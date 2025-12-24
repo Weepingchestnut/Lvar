@@ -15,7 +15,7 @@ from models.hart.basic_hart import AdaLNBeforeHead, AdaLNSelfAttn, LlamaRMSNormF
 from models.hart.configuration import HARTForT2IConfig
 from models.hart.hart_autoencoder import HARTAutoEncoder
 from models.hart.hart_autoencoder_with_disc import HARTAutoEncoderWithDisc
-from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
+from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_, _list_ckpt_files, _load_all_states, _strip_majority_prefix
 from models.vae.hart_hybrid_quant import HARTHybridQuantizer
 
 
@@ -93,11 +93,57 @@ class HARTForT2I(PreTrainedModel):
             loc=1.0,
             scale=0.25)
 
-        vae_local = HARTAutoEncoderWithDisc.from_pretrained(vae_path).vae
-        # vae_local = vae_local.cuda()
-        # -->
-        vae_local = vae_local.to_empty(device="cuda")
-        vae_local.requires_grad_(False)
+        # vae_local = HARTAutoEncoderWithDisc.from_pretrained(vae_path).vae
+        # !====== to solve transformers (!=4.42.2) version mismatch ======
+        # ---------- 1) 先拿到backbone ----------
+        vae = HARTAutoEncoderWithDisc.from_pretrained(
+            vae_path,
+            # 新版 transformers 警告：用 dtype 替代 torch_dtype
+            dtype=torch.float16,
+            device_map=None,
+            low_cpu_mem_usage=False,   # 先关低内存懒加载
+        ).vae
+
+        # print("before to_empty, any_meta:", any(p.is_meta for p in vae.parameters()))
+
+        # ---------- 2) 将 meta 模块物化到 CPU ----------
+        # 这是 PyTorch 对“从 meta 移动设备”的推荐做法
+        if any(p.is_meta for p in vae.parameters()):
+            vae.to_empty(device='cpu')  # 关键一步：真正分配张量内存
+        # print("after  to_empty, any_meta:", any(p.is_meta for p in vae.parameters()))
+
+        # ---------- 3) 读取并合并所有权重文件 ----------
+        files = _list_ckpt_files(vae_path)
+        assert files, f"No checkpoint files under: {vae_path}"
+        state = _load_all_states(files)
+        assert isinstance(state, dict) and state, f"Empty/invalid state dict from {files}"
+
+        # ---------- 4) 去掉多余前缀 'vae.' 以对齐子模块 ----------
+        state = _strip_majority_prefix(state, prefix="vae.")
+
+        # （如仍有统一的 'module.' 等前缀，可再调用一次）
+        # state = _strip_majority_prefix(state, prefix="module.")
+
+        # ---------- 5) 加载权重（不解包返回值；很多自定义实现返回 None） ----------
+        vae.load_state_dict(state, strict=False)
+
+        # 打印对齐情况（自己做集合差最稳）
+        named = dict(vae.named_parameters())
+        missing = [k for k in named.keys() if k not in state]
+        unexpected = [k for k in state.keys() if k not in named]
+        # print(f"[manual load] missing={len(missing)}, unexpected={len(unexpected)}")
+        if missing[:10]:    print("  sample missing:", missing[:10])
+        if unexpected[:10]: print("  sample unexpected:", unexpected[:10])
+
+        # print("after  manual load, any_meta:", any(p.is_meta for p in vae.parameters()))
+
+        # ---------- 6) 再移动到 CUDA ----------
+        vae = vae.to("cuda", non_blocking=True)
+        vae.requires_grad_(False)
+        print("after  .to(cuda), any_meta:", any(p.is_meta for p in vae.parameters()))
+
+        vae_local = vae
+        # !==================================================================
 
         assert embed_dim % num_heads == 0
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
@@ -345,7 +391,7 @@ class HARTForT2I(PreTrainedModel):
 
         for b in self.blocks:
             b.attn.kv_caching(True)
-        for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment
+        for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment (1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64)
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
             if si > 0:

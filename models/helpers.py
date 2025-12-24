@@ -1,15 +1,19 @@
+import glob
+import os
+
 import torch
 from torch import nn as nn
 from torch.nn import functional as F
+from safetensors.torch import load_file
 
 
 def sample_with_top_k_top_p_(
-        logits_BlV: torch.Tensor,
-        top_k: int = 0,
-        top_p: float = 0.0,
-        rng=None,
-        num_samples=1
-    ) -> torch.Tensor:  # return idx, shaped (B, l)
+    logits_BlV: torch.Tensor,
+    top_k: int = 0,
+    top_p: float = 0.0,
+    rng=None,
+    num_samples=1,
+) -> torch.Tensor:  # return idx, shaped (B, l)
     B, l, V = logits_BlV.shape
     if top_k > 0:
         idx_to_remove = logits_BlV < logits_BlV.topk(
@@ -24,7 +28,7 @@ def sample_with_top_k_top_p_(
             sorted_idx_to_remove.scatter(
                 sorted_idx.ndim - 1, sorted_idx, sorted_idx_to_remove
             ),
-            -torch.inf
+            -torch.inf,
         )
     # sample (have to squeeze cuz torch.multinomial can only be used for 2D tensor)
     replacement = num_samples >= 0
@@ -33,18 +37,18 @@ def sample_with_top_k_top_p_(
         logits_BlV.softmax(dim=-1).view(-1, V),
         num_samples=num_samples,
         replacement=replacement,
-        generator=rng
+        generator=rng,
     ).view(B, l, num_samples)
 
 
 def gumbel_softmax_with_rng(
-        logits: torch.Tensor,
-        tau: float = 1,
-        hard: bool = False,
-        eps: float = 1e-10,
-        dim: int = -1,
-        rng: torch.Generator = None
-    ) -> torch.Tensor:
+    logits: torch.Tensor,
+    tau: float = 1,
+    hard: bool = False,
+    eps: float = 1e-10,
+    dim: int = -1,
+    rng: torch.Generator = None,
+) -> torch.Tensor:
     if rng is None:
         return F.gumbel_softmax(logits=logits, tau=tau, hard=hard, eps=eps, dim=dim)
     
@@ -68,11 +72,11 @@ def gumbel_softmax_with_rng(
 
 
 def drop_path(
-        x,
-        drop_prob: float = 0.,
-        training: bool = False,
-        scale_by_keep: bool = True
-    ):    # taken from timm
+    x,
+    drop_prob: float = 0.,
+    training: bool = False,
+    scale_by_keep: bool = True
+):    # taken from timm
     if drop_prob == 0. or not training: 
         return x
     
@@ -95,4 +99,39 @@ class DropPath(nn.Module):  # taken from timm
         return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
     
     def extra_repr(self):
-        return f'(drop_prob=...)'
+        return f"(drop_prob=...)"
+
+
+# to solve HART transformers version mismatch problem
+def _list_ckpt_files(path):
+    # 可能是单文件，也可能是分片（多个 .safetensors）
+    sts = sorted(glob.glob(os.path.join(path, "*.safetensors")))
+    if sts:
+        return sts
+    bins = sorted(glob.glob(os.path.join(path, "*.bin")))
+    return bins
+
+
+def _load_all_states(files):
+    merged = {}
+    for f in files:
+        if f.endswith(".safetensors"):
+            sd = load_file(f)
+        else:
+            sd = torch.load(f, map_location="cpu")
+        if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
+            sd = sd["state_dict"]
+        # 合并（分片时键不重复；若重复以最后一个为准）
+        merged.update(sd)
+    return merged
+
+
+def _strip_majority_prefix(state_dict, prefix="vae."):
+    # 如果“多数（>=80%）key 以 'vae.' 开头”，就去掉
+    keys = list(state_dict.keys())
+    if not keys:
+        return state_dict
+    cnt = sum(k.startswith(prefix) for k in keys)
+    if cnt >= 0.8 * len(keys):
+        return {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in state_dict.items()}
+    return state_dict

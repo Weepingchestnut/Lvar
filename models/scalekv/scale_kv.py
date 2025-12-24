@@ -194,14 +194,14 @@ class ScaleKVCluster:
         if key_len <= self.max_capacity:
             return key_states, value_states
 
-        current_scale_size = self.SCALE[original_scale_ind]
-        current_scale_start = max(0, key_len - current_scale_size)
-        current_scale_size_actual = key_len - current_scale_start
+        current_scale_size = self.SCALE[original_scale_ind]             # current scale token map size, e.g. scale=7, 20*20=400
+        current_scale_start = max(0, key_len - current_scale_size)      # start position of current sale token in all kv-cache
+        current_scale_size_actual = key_len - current_scale_start       # current scale actual token number
 
         selected_window_global = self._select_window_indices(
             current_scale_size_actual, current_scale_start, device, bsz, num_heads, key_len
         )
-        actual_window_size = selected_window_global.size(2)
+        actual_window_size = selected_window_global.size(2)     # [bs, 16, 16]
 
         if self.max_capacity < actual_window_size:
              warnings.warn(f"Layer {self.layer_idx}: Determined max_capacity ({self.max_capacity}) is less than actual selected window size ({actual_window_size}). "
@@ -240,7 +240,7 @@ class ScaleKVCluster:
                 window_query = torch.gather(
                     query_states, 2,
                     local_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-                )
+                )       # torch.Size([bs(2), num_heads, query_window, head_dim])
 
                 attn_weights = torch.matmul(window_query, key_states.transpose(2, 3)) / math.sqrt(head_dim)
 
@@ -301,11 +301,18 @@ class ScaleKVCluster:
         return sorted_k, sorted_v
 
 
-def get_cache_sizes():
+def get_cache_sizes(model_size='2b'):
     # Get the directory where the current .py file is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
     # full path
-    json_path = os.path.join(script_dir, 'budgets/2b_10%_budget.json')
+    if model_size == '2b':
+        json_path = os.path.join(script_dir, 'budgets/2b_10%_budget.json')
+        num_layers = 32
+    elif model_size == '8b':
+        json_path = os.path.join(script_dir, 'budgets/8b_10%_budget.json')
+        num_layers = 40
+    else:
+        raise ValueError(f"Model size {model_size} not supported!")
 
     with open(json_path, 'r') as f:
         scale_budgets = json.load(f)
@@ -319,7 +326,7 @@ def get_cache_sizes():
             max_cache = scale_data["Max"]
             min_cache = scale_data["Min"]
             block_cache = []
-            for block_num in range(32):
+            for block_num in range(num_layers):
                 block_key = f"Block {block_num}"
                 value = scale_data[block_key]
                 cache = max_cache if value == 1 else min_cache
@@ -327,11 +334,12 @@ def get_cache_sizes():
             cache_sizes[scale_number] = block_cache
         else:
             cache_sizes[scale_number] = []
-    
+
     return cache_sizes
 
+
 def enable_scale_kv(model, window_size=16, max_capacity=121,
-                    kernel_size=5, pooling='maxpool'):
+                    kernel_size=5, pooling='maxpool', model_size='2b'):
     
     def patched_self_attn_forward(self, x, attn_bias_or_two_vector=None,
                                   attn_fn=None, scale_schedule=None,
@@ -359,7 +367,7 @@ def enable_scale_kv(model, window_size=16, max_capacity=121,
 
         return output
     
-    cache_sizes = get_cache_sizes()
+    cache_sizes = get_cache_sizes(model_size)
 
 
     layer_idx = 0
@@ -378,5 +386,6 @@ def enable_scale_kv(model, window_size=16, max_capacity=121,
                 layer_idx=layer_idx
             )
             layer_idx += 1
-
+    
+    print(f"\nInfinity + ScaleKV")
     return model

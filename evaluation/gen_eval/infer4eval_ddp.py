@@ -102,7 +102,8 @@ if __name__ == '__main__':
     local_total_latency = 0.0
     local_infinity_latency = 0.0
     local_num_images = 0
-    warmup_steps = 5
+    warmup_steps = 2
+    local_warmup_images = warmup_steps * args.n_samples
     
     # for index, metadata in enumerate(metadatas):
     for index in trange(start_idx, end_idx, disable=rank!=0, desc=f"Rank {rank}"):
@@ -164,7 +165,7 @@ if __name__ == '__main__':
                 image = pipe(prompt).images[0]
             # ------------ Infinity ------------
             elif 'infinity' in args.model_type:
-                if args.test_speed and index > (warmup_steps-1):
+                if args.test_speed:
                     image, total_cost, infinity_cost = gen_one_img(
                         infinity, vae, text_tokenizer, text_encoder,
                         prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg,
@@ -174,9 +175,10 @@ if __name__ == '__main__':
                         g_seed=seed,
                         test_speed=args.test_speed
                     )
-                    local_total_latency += total_cost
-                    local_infinity_latency += infinity_cost
                     local_num_images += 1
+                    if local_num_images > local_warmup_images:
+                        local_total_latency += total_cost
+                        local_infinity_latency += infinity_cost
                 else:
                     image = gen_one_img(
                         infinity, vae, text_tokenizer, text_encoder,
@@ -224,16 +226,16 @@ if __name__ == '__main__':
     tdist.all_reduce(latency_tensor, op=tdist.ReduceOp.SUM)
     global_total_latency = latency_tensor[0].item()
     global_infinity_latency = latency_tensor[1].item()
-    global_num_images = int(latency_tensor[2].item())
+    global_warmup_images = local_warmup_images * world_size
+    global_num_images = int(latency_tensor[2].item()) - global_warmup_images
     
     if rank == 0:
         avg_total_latency = global_total_latency / max(global_num_images, 1)
         avg_infinity_latency = global_infinity_latency / max(global_num_images, 1)
         throughput_total = global_num_images / global_total_latency
         throughput_infinity = global_num_images / global_infinity_latency
-        warmup_images = warmup_steps * args.n_samples
-        print("\n======== Benchmark Profile ========")
-        print(f"Total images: {global_num_images} + {warmup_images} = {global_num_images+warmup_images}")
+        print("\n========== Benchmark Profile ==========")
+        print(f"Total images: {global_num_images} + {global_warmup_images}(warmup) = {global_num_images+global_warmup_images}({total_samples*args.n_samples})")
         print("------ w/ decoder ------")
         print(f"Total inference time: {global_total_latency:.2f} s")
         print(f"Average latency per image: {avg_total_latency:.4f} s")
@@ -242,7 +244,7 @@ if __name__ == '__main__':
         print(f"Total inference time: {global_infinity_latency:.2f} s")
         print(f"Average latency per image: {avg_infinity_latency:.4f} s")
         print(f"Throughput: {throughput_infinity:.4f} images/sec")
-        print("===================================\n")
+        print("=======================================\n")
         
         print("All processes finished generation.")
         # with open(prompt_rewrite_cache_file, 'w') as f:
