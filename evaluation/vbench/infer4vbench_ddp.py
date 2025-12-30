@@ -1,18 +1,17 @@
-# Copyright (c) 2025 FoundationVision
-# SPDX-License-Identifier: MIT
-import argparse
+import hashlib
 import json
 import os
 import os.path as osp
 import sys
 import time
+from typing import List
 
 import cv2
 import numpy as np
 import torch
 import torch.distributed as tdist
 from PIL import Image
-from tqdm import tqdm, trange
+from tqdm import tqdm
 
 from utils.load import load_video_visual_tokenizer
 
@@ -142,7 +141,7 @@ def perform_inference(pipe, data, args):
 def load_vbench_prompts(prompt_json_path):
     with open(prompt_json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    # data 是一个 list，每个元素类似：
+    # data is a list，per-item like：
     # {
     #   "prompt_en": "...",
     #   "refined_prompt": "...",
@@ -151,57 +150,63 @@ def load_vbench_prompts(prompt_json_path):
     return data
 
 
-def main():
+class InferArgs(Args):
+    
+    model_type: str = 'infinitystar_qwen8b'
+    pn: str = '0.90M'  # Pixel numbers, '0.90M' 720p, '0.40M' 480p
+    fps: int = 16
+    generation_duration: int = 5
+    video_frames: int = generation_duration * fps + 1
+    
+    model_path: str = 'pretrained_models/infinitystar/infinitystar_8b_720p_weights'
+    checkpoint_type: str = 'torch_shard'   # omnistore
+    vae_path: str = 'pretrained_models/infinitystar/infinitystar_videovae.pth'
+    text_encoder_ckpt: str = 'pretrained_models/infinitystar/text_encoder/flan-t5-xl-official/'
+    text_channels: int = 2048
+    
+    dynamic_scale_schedule: str = 'infinity_elegant_clip20frames_v2'
+    bf16: int = 1   # choices=[0,1]
+    use_apg: int = 1    # choices=[0,1]
+    use_cfg: int = 0
+    cfg: float = 34
+    tau_image: float = 1
+    tau_video: float = 0.4
+    apg_norm_threshold: float = 0.05
+    image_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]'
+    video_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 1, 1]'
+    # 使用 Tap 的 List 支持，这样终端可以直接输入 --image_scale_repetition 3 3 3 ...
+    # image_scale_repetition: List[int] = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+    append_duration2caption: int = 1
+    use_two_stage_lfq: int = 1
+    detail_scale_min_tokens: int = 750
+    semantic_scales: int = 12
+    max_repeat_times: int = 10000
+    
     # For optimal performance, enabling the prompt rewriter is recommended.
     # To utilize the GPT model, ensure the following environment variables are set:
     # export OPEN_API_KEY="YOUR_API_KEY"
     # export GLOBAL_AZURE_ENDPOINT="YOUR_ENDPOINT"
-    enable_rewriter=0
-    # checkpoints_dir = './'
-    checkpoints_dir = 'pretrained_models/infinitystar'
+    # *--> use official rewrite VBench_rewrited_prompt.json
+    enable_rewriter: int = 0
     
-
-    # infer args
-    args = Args()
-    args.pn='0.90M'
-    args.fps=16
-    args.video_frames=81
-    args.model_path=os.path.join(checkpoints_dir, 'infinitystar_8b_720p_weights')
-    args.checkpoint_type='torch_shard' # omnistore
-    args.vae_path=os.path.join(checkpoints_dir, 'infinitystar_videovae.pth')
-    args.text_encoder_ckpt=os.path.join(checkpoints_dir, 'text_encoder/flan-t5-xl-official/')
-    args.model_type='infinitystar_qwen8b'
-    args.text_channels=2048
-    args.dynamic_scale_schedule='infinity_elegant_clip20frames_v2'
-    args.bf16=1
-    args.use_apg=1
-    args.use_cfg=0
-    args.cfg=34
-    args.tau_image = 1
-    args.tau_video = 0.4
-    args.apg_norm_threshold=0.05
-    args.image_scale_repetition='[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]'
-    args.video_scale_repetition='[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 1, 1]'
-    args.append_duration2caption=1
-    args.use_two_stage_lfq=1
-    args.detail_scale_min_tokens=750
-    args.semantic_scales=12
-    args.max_repeat_times=10000
-    args.enable_rewriter=enable_rewriter
-
-    # --- for vbench ---
-    args.prompt_json='evaluation/vbench/VBench_rewrited_prompt_fixed_seed.json'
-    args.output_root='work_dir/evaluation/vbench/infinitystar_720p_81frames'
-    args.start_index=0
-    args.end_index=-1
-    args.num_samples_per_prompt=5
-    args.seed = 41
+    # -------- VBench Setting --------
+    prompt_json: str = 'evaluation/vbench/VBench_rewrited_prompt_fixed_seed.json'
+    output_root: str = 'work_dir/evaluation/vbench/infinitystar_480p_81frames'
+    start_index: int = 0
+    end_index: int = -1
+    num_samples_per_prompt: int = 5
+    seed: int = 41
     # only test the specified dimension, if empty list [], test all
-    args.target_dimensions = [
-        # 'background_consistency',
-        # 'aesthetic_quality',
-        # 'imaging_quality',
+    target_dimensions: List[str] = [
+        # 'human_action',
+        # 'scene',
+        # 'multiple_objects',
+        # 'appearance_style',
     ]
+
+
+def main():
+    args = InferArgs().parse_args()
     
     # *Initialize distributed process group
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -242,7 +247,6 @@ def main():
         vbench_items = all_vbench_items
     
     total_items = len(vbench_items)     # all dims are 946 prompts
-    tmp_fliker_dim_items = 0
     print(f"\n[Rank {rank}] Loaded {total_items} prompts from {args.prompt_json}")
 
     # *Distribute the data (prompts) across GPUs
@@ -262,6 +266,7 @@ def main():
     local_total_latency = 0.0
     local_num_videos = 0
     local_num_skip_videos = 0       # for re-test after an interrupt
+    local_tmp_fliker_dim_items = 0
     # warmup_steps = 2    # use 2 prompts for GPUs warm up
     # local_warmup_videos_count = warmup_steps * args.num_samples_per_prompt
     local_warmup_videos = 2
@@ -278,7 +283,7 @@ def main():
         # Temporal Flickering dimension, sample 25 videos
         if "temporal_flickering" in dims:
             n_samples = 25
-            tmp_fliker_dim_items += 1
+            local_tmp_fliker_dim_items += 1
         else:
             n_samples = args.num_samples_per_prompt
         
@@ -291,11 +296,15 @@ def main():
             continue
         # clean name
         # prompt_en = sanitize_filename(prompt_en)[:100] 
+        
+        # Compute refined_prompt hash --> for prompt_en same but refined_prompt different
+        prompt_hash = hashlib.md5(prompt.encode('utf-8')).hexdigest()[:6]
 
         for sample_idx in range(n_samples):
             # seed = args.seed + (global_idx * n_samples) + sample_idx
             seed = prompt_seed + n_samples * sample_idx
-            print(f'\n[Rank {rank}] {global_idx=} {sample_idx=} {seed=} %%%%%%%%%%')
+            print(f'\n[Rank {rank}] {global_idx=} {sample_idx=} {seed=} ==========')
+            print(f'{prompt_en=} {dims=}')
 
             data = {
                 'seed': seed,
@@ -305,10 +314,11 @@ def main():
             
             # base_name = f"idx{global_idx:04d}_s{sample_idx:02d}.mp4"
             base_name = f'{prompt_en}-{sample_idx}.mp4'
-            save_path = osp.join(videos_root, base_name)
+            physical_base_name = f'{prompt_en}-{prompt_hash}-{sample_idx}.mp4'
+            save_path = osp.join(videos_root, physical_base_name)
             
             if osp.exists(save_path):
-                print(f"[Rank {rank}] Skipping existing: {base_name}")
+                print(f"[Rank {rank}] Skipping existing: {physical_base_name}")
                 local_num_skip_videos += 1
                 pass
             else:
@@ -321,10 +331,10 @@ def main():
                         local_total_latency += output_dict['elapsed_time']
                     
                     save_video(video_np, fps=args.fps, save_filepath=save_path)
-                    print(f"[Rank {rank}] Video genernation done: {save_path=}\n")
+                    # print(f"[Rank {rank}] Video genernation done: {save_path=}\n")
                 
                 except Exception as e:
-                    print(f"[Rank {rank}] Error generating {base_name}: {e}")
+                    print(f"[Rank {rank}] Error generating {physical_base_name}: {e}")
                     continue
 
             # a video prompt may belong multiple Vbench dims
@@ -344,33 +354,36 @@ def main():
     tdist.barrier(device_ids=[local_rank])
     
     latency_tensor = torch.tensor(
-        [local_total_latency, local_num_videos, local_num_skip_videos],
+        [local_total_latency, local_num_videos, local_num_skip_videos,
+         local_tmp_fliker_dim_items],
         device=device,
         dtype=torch.float64
     )
     tdist.all_reduce(latency_tensor, op=tdist.ReduceOp.SUM)
     global_total_latency = latency_tensor[0].item()
+    global_num_videos = int(latency_tensor[1].item())
     # Compute global warmup videos
     global_warmup_videos_count = local_warmup_videos * world_size
     # Profile global videos
-    global_num_videos_profile = int(latency_tensor[1].item()) - global_warmup_videos_count
+    global_num_videos_profile = global_num_videos - global_warmup_videos_count
     global_num_skip_videos = int(latency_tensor[2].item())
+    global_tmp_fliker_dim_items = int(latency_tensor[3].item())
     
     if rank == 0:
         avg_total_latency = global_total_latency / max(global_num_videos_profile, 1)
         throughput_total = global_num_videos_profile / global_total_latency if global_total_latency > 0 else 0
-        total_videos = (total_items-tmp_fliker_dim_items)*args.num_samples_per_prompt + tmp_fliker_dim_items*25
+        total_videos = (total_items-global_tmp_fliker_dim_items)*args.num_samples_per_prompt + global_tmp_fliker_dim_items*25
         
-        print("\n======== VBench Distributed Generation Benchmark Profile ========")
+        print("\n=== VBench Distributed Generation Benchmark Profile ===")
         print(f"Target Dimensions: {args.target_dimensions if args.target_dimensions else 'ALL'}")
         if global_num_skip_videos > 0:
-            print(f"[Interrupt!] Skip videos: {total_videos-int(latency_tensor[1].item())}({global_num_skip_videos})")
-        print(f"Total videos: {global_num_videos_profile} + {global_warmup_videos_count}(warmup) = {int(latency_tensor[1].item())}({total_videos})")
+            print(f"[Interrupt!] Skip videos: {total_videos-global_num_videos}({global_num_skip_videos})")
+        print(f"Total videos: {global_num_videos_profile} + {global_warmup_videos_count}(warmup) = {global_num_videos}({total_videos})")
         print("---------- w/ decoder ----------")
         print(f"Total inference time: {global_total_latency:.2f} s")
         print(f"Average latency per video: {avg_total_latency:.4f} s")
         print(f"Throughput: {throughput_total:.4f} videos/sec")
-        print("=================================================================\n")
+        print("=======================================================\n")
     
         print("All videos generated.")
 
