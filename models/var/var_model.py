@@ -1,6 +1,6 @@
 import math
-from typing import List, Optional, Tuple, Union
 from functools import partial
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -8,15 +8,8 @@ import torch.nn as nn
 import utils.dist as dist
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vae.vqvae import VQVAE, VectorQuantizer2
-from models.var.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
+from models.var.basic_var import AdaLNBeforeHead, AdaLNSelfAttn, SharedAdaLin
 from tools.visual_attn import VisualAttnMap
-# from .basic_var import AdaLNBeforeHead, AdaLNGatedLinearAttn, AdaLNSelfAttn
-
-
-class SharedAdaLin(nn.Linear):
-    def forward(self, cond_BD):
-        C = self.weight.shape[0] // 6
-        return super().forward(cond_BD).view(-1, 1, 6, C)   # B16C
 
 
 class VAR(nn.Module):
@@ -339,6 +332,7 @@ class VAR(nn.Module):
 
 if __name__ == '__main__':
     import random
+
     import numpy as np
 
     MODEL_DEPTH = 30
