@@ -5,7 +5,7 @@ infer_eval_image_reward() {
     # single GPU
     # python evaluation/image_reward/infer4eval.py \
     # mutil GPUs
-    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/image_reward/infer4eval_ddp.py \
+    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/image_reward/infer4reward_ddp.py \
         --cfg ${cfg} \
         --tau ${tau} \
         --pn ${pn} \
@@ -42,7 +42,7 @@ infer_eval_image_reward() {
 }
 
 infer_eval_hpsv21() {
-    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/hpsv2/eval_hpsv2_ddp.py \
+    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/hpsv2/infer4hpsv2_ddp.py \
         --cfg ${cfg} \
         --tau ${tau} \
         --pn ${pn} \
@@ -98,16 +98,11 @@ test_gen_eval() {
         --prune_ratio ${prune_ratio} \
         2>&1 | tee ${out_dir}/eval_gen-eval.log
 
-        # --prune_ratio "${prune_ratio[@]}" \
-        # 2>&1 | tee ${out_dir}/eval_gen-eval.log
-
     # --- detect objects ---
-    # export CUDA_VISIBLE_DEVICES=1
     source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
     conda activate modelscope
 
-    # export CUDA_VISIBLE_DEVICES=0
-    export CUDA_LAUNCH_BLOCKING=1
+    # export CUDA_LAUNCH_BLOCKING=1
     python evaluation/gen_eval/evaluate_images.py ${out_dir}/images \
         --outfile ${out_dir}/results/det.jsonl \
         --model-config evaluation/gen_eval/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py \
@@ -117,7 +112,6 @@ test_gen_eval() {
     python evaluation/gen_eval/summary_scores.py ${out_dir}/results/det.jsonl > ${out_dir}/results/res.txt
     cat ${out_dir}/results/res.txt
 
-    # unset CUDA_VISIBLE_DEVICES
     unset CUDA_LAUNCH_BLOCKING
     conda deactivate
 
@@ -208,23 +202,26 @@ latency_profile() {
         --apply_spatial_patchify ${apply_spatial_patchify} \
         --cfg_insertion_layer ${cfg_insertion_layer} \
         --skip_last_scales ${skip_last_scales} \
+        --batch_size ${batch_size} \
         --cached_scale ${cached_scale} \
         --prune_ratio ${prune_ratio} \
-        2>&1| tee ${out_dir}/infer_profile.log
+        2>&1| tee ${out_dir}/infer_profile_batch-${batch_size}.log
 }
 
 # set arguments for inference
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-gpu_num=4
-master_port=29501
+export CUDA_VISIBLE_DEVICES=0,1
+gpu_num=2
+master_port=29502
 skip_last_scales=2
 cached_scale=8
 prune_ratio="0.4,0.5"
 
-model_type=fastvar_infinity_2b
+ model_type=fastvar_infinity_2b
 # model_type=fastvar_infinity_8b
+timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
 
- model_exp=${model_type}_skip-${skip_last_scales}_cache-${cached_scale}_prune-${prune_ratio}
+model_exp=${model_type}
+#model_exp=${model_type}_skip-${skip_last_scales}_cache-${cached_scale}_prune-${prune_ratio}
 
 if [ "$model_type" == "fastvar_infinity_2b" ]; then
     checkpoint_type='torch'
@@ -266,6 +263,16 @@ out_dir_root=work_dir/infer_profile/${model_exp}
 out_dir=${out_dir_root}/latency-profile_${sub_fix}
 mkdir -p ${out_dir}
 
+batch_size=1
+latency_profile
+
+batch_size=2
+latency_profile
+
+batch_size=4
+latency_profile
+
+batch_size=8
 latency_profile
 sleep 10
 
