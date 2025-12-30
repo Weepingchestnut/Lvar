@@ -1,6 +1,3 @@
-"""
-Definitions of blocks of VAR transformer model.
-"""
 import math
 from functools import partial
 from typing import Tuple, Union
@@ -9,21 +6,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from torch.nn.functional import scaled_dot_product_attention as slow_attn   # q, k, v: BHLc
-from timm.layers import DropPath, drop_path
+
+try: from timm.layers import DropPath, drop_path
+except: from timm.models.layers.drop import DropPath
 
 # Import flash_attn's attention
-from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
+from flash_attn import flash_attn_func  # q, k, or v: BLHc, ret: BLHc
 from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
+from torch.nn.attention import SDPBackend, sdpa_kernel
+# not slow attn, for torch >= 2.0.0 and CUDA backend, it support flash attn 2 for fast inference
+# https://docs.pytorch.org/docs/2.6/generated/torch.nn.functional.scaled_dot_product_attention.html#torch.nn.functional.scaled_dot_product_attention
+# from torch.nn.functional import scaled_dot_product_attention as slow_attn   # q, k, v: BHLc
+# -->
+from torch.nn.functional import scaled_dot_product_attention as torch_attn  # q, k, v: BHLc
 
-from models.infinity.basic_infinity import FFN, CrossAttention, FFNSwiGLU, apply_rotary_emb, get_dropout_layer
+from models.infinity.basic_infinity import (FFN, CrossAttention, FFNSwiGLU,
+                                            apply_rotary_emb,
+                                            get_dropout_layer)
 
 # Import flash_attn's fused ops
 try:
+    from flash_attn.ops.fused_dense import fused_mlp_func
     from flash_attn.ops.layer_norm import dropout_add_layer_norm
     from flash_attn.ops.rms_norm import dropout_add_rms_norm
     from flash_attn.ops.rms_norm import rms_norm as rms_norm_impl
-    from flash_attn.ops.fused_dense import fused_mlp_func
     flash_fused_op_installed = True
 except ImportError:
     dropout_add_layer_norm = dropout_add_rms_norm = fused_mlp_func = None
@@ -79,12 +85,11 @@ class SelfAttention(nn.Module):
 
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
 
-    
     def kv_caching(self, enable: bool): # kv caching: only used during inference
         self.caching = enable
         self.cached_k = None
         self.cached_v = None
-    
+
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]],
                 attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
@@ -148,15 +153,16 @@ class SelfAttention(nn.Module):
             if self.use_flex_attn and attn_fn is not None:
                 oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
             else:
-                oup = (slow_attn(query=q, key=k, value=v, scale=self.scale,
-                                 attn_mask=attn_bias_or_two_vector, dropout_p=0)
-                       .transpose(1, 2)
-                       .reshape(B, L, C))
+                # --- torch attn ---
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    oup = torch_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, 
+                                     dropout_p=0).transpose(1, 2).reshape(B, L, C)
             # oup: bf16
         
         return self.proj_drop(self.proj(oup))
+
     def forward_cond(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]],
-                attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
+                     attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0):
         # x: fp32
         B, L, C = x.shape
 
@@ -192,8 +198,7 @@ class SelfAttention(nn.Module):
             else:
                 k = self.cached_k = torch.cat((self.cached_k, k), dim=L_dim); v = self.cached_v = torch.cat(
                     (self.cached_v, v), dim=L_dim)
-
-
+        
         if self.using_flash:
             if attn_bias_or_two_vector is not None:  # training
                 kw = dict(VAR_visible_kvlen=attn_bias_or_two_vector[0], VAR_invisible_qlen=attn_bias_or_two_vector[1])
@@ -208,8 +213,10 @@ class SelfAttention(nn.Module):
             if self.use_flex_attn and attn_fn is not None:
                 oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
             else:
-                oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector,
-                                dropout_p=0).transpose(1, 2).reshape(B, L, C)
+                # --- torch attn ---
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    oup = torch_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, 
+                                     dropout_p=0).transpose(1, 2).reshape(B, L, C)
             # oup: bf16
 
         return self.proj_drop(self.proj(oup))

@@ -1,32 +1,32 @@
-"""
-Definition of Infinity transformer model.
-"""
-
 import math
 import random
 import time
 from contextlib import nullcontext
 from functools import partial
-from typing import List, Optional, Tuple, Union, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models import register_model
-from torch.utils.checkpoint import checkpoint
-from PIL import Image
-import numpy as np
 
 import utils.dist as dist
-from utils.dist import for_visualize
-from models.skipvar.basic_skipvar import flash_attn_func, flash_fused_op_installed, CrossAttnBlock
-from models.infinity.basic_infinity import AdaLNBeforeHead, FastRMSNorm, SelfAttnBlock, precompute_rope2d_freqs_grid
-from models.infinity.infinity_model import TIMM_KEYS, MultiInpIdentity, MultipleLayers, SharedAdaLin, TextAttentivePool, sample_with_top_k_top_p_also_inplace_modifying_logits_
+from models.infinity.basic_infinity import (AdaLNBeforeHead, FastRMSNorm,
+                                            SelfAttnBlock,
+                                            precompute_rope2d_freqs_grid)
 from models.infinity.flex_attn import FlexAttn
+from models.infinity.infinity_model import (
+    TIMM_KEYS, MultiInpIdentity, MultipleLayers, SharedAdaLin,
+    TextAttentivePool, sample_with_top_k_top_p_also_inplace_modifying_logits_)
+from models.skipvar.basic_skipvar import (CrossAttnBlock, flash_attn_func,
+                                          flash_fused_op_installed)
+from utils.dist import for_visualize
 from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 
 try:
-    from models.infinity.fused_op import fused_ada_layer_norm, fused_ada_rms_norm
+    from models.infinity.fused_op import (fused_ada_layer_norm,
+                                          fused_ada_rms_norm)
 except:
     fused_ada_layer_norm, fused_ada_rms_norm = None, None
 
@@ -107,7 +107,8 @@ class SkipVAR_Infinity(nn.Module):
         customized_kernel_installed = any('Infinity' in arg_name for arg_name in flash_attn_func.__code__.co_varnames)
         self.customized_flash_attn = customized_flash_attn and customized_kernel_installed
         if customized_flash_attn and not customized_kernel_installed:
-            import inspect, warnings
+            import inspect
+            import warnings
             file_path = inspect.getsourcefile(flash_attn_func)
             line_number = inspect.getsourcelines(flash_attn_func)[1]
             info = (
@@ -132,8 +133,8 @@ class SkipVAR_Infinity(nn.Module):
         assert round(t.sum().item()) in {0, dist.get_world_size()}, f'flash_fused_op_installed: {t}'
         
         super().__init__()
-        # self.rng = torch.Generator(device=dist.get_device())
-        self.rng = torch.Generator(device='cuda')
+        self.rng = torch.Generator(device=dist.get_device())
+        # self.rng = torch.Generator(device='cuda')
         self.maybe_record_function = nullcontext
         self.text_maxlen = text_maxlen
         self.t2i = text_channels != 0
@@ -244,7 +245,8 @@ class SkipVAR_Infinity(nn.Module):
             self.block_chunks = nn.ModuleList()
             for i in range(self.num_block_chunks):
                 self.block_chunks.append(MultipleLayers(self.unregistered_blocks, self.num_blocks_in_a_chunk, i*self.num_blocks_in_a_chunk))
-        import joblib ,os
+        import os
+        import joblib
         # self.decision_models_folder='./SkipVAR/'+'decision_model_ssim_84/'
         self.decision_models_folder='pretrained_models/skipvar/'+'decision_model_ssim_84/'
         self.skip_model = joblib.load(os.path.join(self.decision_models_folder+"skip_model_Logistic_Regression.pkl"))
@@ -426,27 +428,24 @@ class SkipVAR_Infinity(nn.Module):
     @torch.no_grad()
     # def autoregressive_infer_cfg_SkipVAR(
     def autoregressive_infer_cfg(
-            self,
-            vae=None,
-            scale_schedule=None,
-            label_B_or_BLT=None,
-            B=1, negative_label_B_or_BLT=None, force_gt_Bhw=None,
-            g_seed=None, cfg_list=[], tau_list=[], cfg_sc=3, top_k=0, top_p=0.0,
-            returns_vemb=0, ratio_Bl1=None, gumbel=0, norm_cfg=False,
-            cfg_exp_k: float = 0.0, cfg_insertion_layer=[-5],
-            vae_type=0, softmax_merge_topk=-1, ret_img=False,
-            trunk_scale=1000,
-            gt_leak=0, gt_ls_Bl=None,
-            inference_mode=False,
-            save_img_path=None,
-            sampling_per_bits=1,
-            select_model=None
+        self,
+        vae=None,
+        scale_schedule=None,
+        label_B_or_BLT=None,
+        B=1, negative_label_B_or_BLT=None, force_gt_Bhw=None,
+        g_seed=None, cfg_list=[], tau_list=[], cfg_sc=3, top_k=0, top_p=0.0,
+        returns_vemb=0, ratio_Bl1=None, gumbel=0, norm_cfg=False,
+        cfg_exp_k: float=0.0, cfg_insertion_layer=[-5],
+        vae_type=0, softmax_merge_topk=-1, ret_img=False,
+        trunk_scale=1000,
+        gt_leak=0, gt_ls_Bl=None,
+        inference_mode=False,
+        save_img_path=None,
+        sampling_per_bits=1,
+        select_model=None
     ):  # returns List[idx_Bl]
-        if g_seed is None:
-            rng = None
-        else:
-            self.rng.manual_seed(g_seed);
-            rng = self.rng
+        if g_seed is None: rng = None
+        else: self.rng.manual_seed(g_seed); rng = self.rng
         assert len(cfg_list) >= len(scale_schedule)
         assert len(tau_list) >= len(scale_schedule)
         with torch.amp.autocast('cuda', enabled=False):
@@ -463,7 +462,7 @@ class SkipVAR_Infinity(nn.Module):
         # scale_schedule is used by infinity, vae_scale_schedule is used by vae if there exists a spatial patchify,
         # we need to convert scale_schedule to vae_scale_schedule by multiply 2 to h and w
         if self.apply_spatial_patchify:
-            vae_scale_schedule = [(pt, 2 * ph, 2 * pw) for pt, ph, pw in scale_schedule]
+            vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
         else:
             vae_scale_schedule = scale_schedule
 
@@ -556,6 +555,8 @@ class SkipVAR_Infinity(nn.Module):
                 break
             if flags['skip1'] and si == 12:
                 break
+            # print(f"\n[debug] --- current scale: {si} ({pn[1]}x{pn[2]}) ---")
+            # print(f'{cond_BD_or_gss.shape=}')
 
             cfg = cfg_list[si]
             if si >= trunk_scale:
@@ -578,19 +579,20 @@ class SkipVAR_Infinity(nn.Module):
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
                 if not self.add_lvl_embeding_only_first_block:
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-                if layer_idx == 0 and ((flags['uncond1'] and si >= 12) or (flags['uncond2'] and si >= 11) or (
-                        flags['uncond3'] and si >= 10)):
+                if layer_idx == 0 and ((flags['uncond1'] and si >= 12) 
+                                       or (flags['uncond2'] and si >= 11) 
+                                       or (flags['uncond3'] and si >= 10)):
                     last_stage = last_stage[:B]
-                    cond_BD_or_gss = cond_BD_step12
+                    cond_BD_or_gss = cond_BD_step12; #print(f'{cond_BD_step12.shape=}')
                     ca_kv = ca_kv_step12
                     cond = True
 
                 for m in b.module:
                     if cond:
-                        last_stage = m.forward_cond(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv,
-                                                     attn_bias_or_two_vector=None,
-                                                     attn_fn=attn_fn, scale_schedule=scale_schedule,
-                                                     rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+                        last_stage = m.forward_cond(
+                            x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None,
+                            attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, 
+                            scale_ind=si)
                     else:
                         last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv,
                                        attn_bias_or_two_vector=None,
@@ -603,13 +605,10 @@ class SkipVAR_Infinity(nn.Module):
                     layer_idx += 1
             if cond:
                 if (cfg != 1) and add_cfg_on_logits:
-
                     cond_logits_BlV = self.get_logits(last_stage, cond_BD[:B]).mul(1 / tau_list[si])
                     logits_BlV = cfg * cond_logits_BlV + (1 - cfg) * cond_logits_BlV
                 else:
                     logits_BlV = self.get_logits(last_stage[:B], cond_BD[:B]).mul(1 / tau_list[si])
-
-
             else:
                 if (cfg != 1) and add_cfg_on_logits:
                     # print(f'add cfg on add_cfg_on_logits')
@@ -645,8 +644,7 @@ class SkipVAR_Infinity(nn.Module):
                     idx_Bld = idx_Bld.unsqueeze(1)  # [B, 1, h, w, d] or [B, 1, 2h, 2w, d]
 
                 idx_Bld_list.append(idx_Bld)
-                codes = vae.quantizer.lfq.indices_to_codes(idx_Bld,
-                                                           label_type='bit_label')  # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
+                codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type='bit_label')  # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
 
                 def extract_high_freq_sobel(image):
                     sobel_x = torch.tensor(
@@ -696,7 +694,6 @@ class SkipVAR_Infinity(nn.Module):
                     return hf_ratio  # Output shape should be [B, 1]
 
                 if si != num_stages_minus_1:
-
                     summed_codes += F.interpolate(codes, size=vae_scale_schedule[-1],
                                                   mode=vae.quantizer.z_interplote_up)
                     if si == 9:
@@ -718,17 +715,18 @@ class SkipVAR_Infinity(nn.Module):
                         skip_pred = self.skip_model.predict(skip_label)[0]
                         flags[skip_value_map[skip_pred]] = True
 
-                        #print(skip_pred)
+                        # print(f'{skip_pred=}')
                         cond_pred = None
                         if skip_pred == 0:
                             # Step 2: Uncondition Branch Replacement Prediciton
                             uncond_label = self.uncond_scaler.transform(sample_input)
                             uncond_pred = self.uncond_model.predict(uncond_label)[0]
                             flags[cond_value_map[uncond_pred]] = True
+                        # print(f'{flags=}')
                     if si == 8:
                         old_codes = summed_codes.clone()
 
-                    last_stage = F.interpolate(summed_codes, size=vae_scale_schedule[si + 1],
+                    last_stage = F.interpolate(summed_codes, size=vae_scale_schedule[si+1],
                                                mode=vae.quantizer.z_interplote_up)  # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
                     last_stage = last_stage.squeeze(-3)  # [B, d, h, w] or [B, d, 2h, 2w]
                     if self.apply_spatial_patchify:  # patchify operation
@@ -736,7 +734,6 @@ class SkipVAR_Infinity(nn.Module):
                     last_stage = last_stage.reshape(*last_stage.shape[:2], -1)  # [B, d, h*w] or [B, 4d, h*w]
                     last_stage = torch.permute(last_stage, [0, 2, 1])  # [B, h*w, d] or [B, h*w, 4d]
                 else:
-
                     summed_codes += codes
             else:
                 if si < gt_leak:
@@ -744,8 +741,7 @@ class SkipVAR_Infinity(nn.Module):
                 h_BChw = self.quant_only_used_in_inference[0].embedding(idx_Bl).float()  # BlC
 
                 # h_BChw = h_BChw.float().transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1])
-                h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1],
-                                                         scale_schedule[si][2])
+                h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1], scale_schedule[si][2])
                 ret.append(h_BChw if returns_vemb != 0 else idx_Bl)
                 idx_Bl_list.append(idx_Bl)
                 if si != num_stages_minus_1:
@@ -777,195 +773,6 @@ class SkipVAR_Infinity(nn.Module):
         img = (img + 1) / 2
         img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
         return ret, idx_Bl_list, img
-
-    # @torch.no_grad()
-    # def autoregressive_infer_cfg(
-    #     self,
-    #     vae=None,
-    #     scale_schedule=None,
-    #     label_B_or_BLT=None,
-    #     B=1, negative_label_B_or_BLT=None, force_gt_Bhw=None,
-    #     g_seed=None, cfg_list=[], tau_list=[], cfg_sc=3, top_k=0, top_p=0.0,
-    #     returns_vemb=0, ratio_Bl1=None, gumbel=0, norm_cfg=False,
-    #     cfg_exp_k: float=0.0, cfg_insertion_layer=[-5],
-    #     vae_type=0, softmax_merge_topk=-1, ret_img=False,
-    #     trunk_scale=1000,
-    #     gt_leak=0, gt_ls_Bl=None,
-    #     inference_mode=False,
-    #     save_img_path=None,
-    #     sampling_per_bits=1,
-    # ):   # returns List[idx_Bl]
-    #     if g_seed is None: rng = None
-    #     else: self.rng.manual_seed(g_seed); rng = self.rng
-    #     assert len(cfg_list) >= len(scale_schedule)
-    #     assert len(tau_list) >= len(scale_schedule)
-
-    #     # scale_schedule is used by infinity, vae_scale_schedule is used by vae if there exists a spatial patchify, 
-    #     # we need to convert scale_schedule to vae_scale_schedule by multiply 2 to h and w
-    #     if self.apply_spatial_patchify:
-    #         vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
-    #     else:
-    #         vae_scale_schedule = scale_schedule
-        
-    #     kv_compact, lens, cu_seqlens_k, max_seqlen_k = label_B_or_BLT
-    #     if any(np.array(cfg_list) != 1):
-    #         bs = 2*B
-    #         if not negative_label_B_or_BLT:
-    #             kv_compact_un = kv_compact.clone()
-    #             total = 0
-    #             for le in lens:
-    #                 kv_compact_un[total:total+le] = (self.cfg_uncond)[:le]
-    #                 total += le
-    #             kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
-    #             cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k[1:]+cu_seqlens_k[-1]), dim=0)
-    #         else:
-    #             kv_compact_un, lens_un, cu_seqlens_k_un, max_seqlen_k_un = negative_label_B_or_BLT
-    #             kv_compact = torch.cat((kv_compact, kv_compact_un), dim=0)
-    #             cu_seqlens_k = torch.cat((cu_seqlens_k, cu_seqlens_k_un[1:]+cu_seqlens_k[-1]), dim=0)
-    #             max_seqlen_k = max(max_seqlen_k, max_seqlen_k_un)
-    #     else:
-    #         bs = B
-
-    #     kv_compact = self.text_norm(kv_compact)
-    #     sos = cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [2, 4096]
-    #     kv_compact = self.text_proj_for_ca(kv_compact) # kv_compact shape: [304, 4096]
-    #     ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
-    #     last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
-
-    #     with torch.amp.autocast('cuda', enabled=False):
-    #         cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
-    #     accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
-    #     idx_Bl_list, idx_Bld_list = [], []
-
-    #     if inference_mode:
-    #         for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(True)
-    #     else:
-    #         assert self.num_block_chunks > 1
-    #         for block_chunk_ in self.block_chunks:
-    #             for module in block_chunk_.module.module:
-    #                 (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(True)
-        
-    #     abs_cfg_insertion_layers = []
-    #     add_cfg_on_logits, add_cfg_on_probs = False, False
-    #     leng = len(self.unregistered_blocks)
-    #     for item in cfg_insertion_layer:
-    #         if item == 0: # add cfg on logits
-    #             add_cfg_on_logits = True
-    #         elif item == 1: # add cfg on probs
-    #             add_cfg_on_probs = True # todo in the future, we may want to add cfg on logits and probs
-    #         elif item < 0: # determine to add cfg at item-th layer's output
-    #             assert leng+item > 0, f'cfg_insertion_layer: {item} is not valid since len(unregistered_blocks)={self.num_block_chunks}'
-    #             abs_cfg_insertion_layers.append(leng+item)
-    #         else:
-    #             raise ValueError(f'cfg_insertion_layer: {item} is not valid')
-        
-    #     num_stages_minus_1 = len(scale_schedule)-1
-    #     summed_codes = 0
-    #     for si, pn in enumerate(scale_schedule):   # si: i-th segment
-    #         cfg = cfg_list[si]
-    #         if si >= trunk_scale:
-    #             break
-    #         cur_L += np.array(pn).prod()
-
-    #         need_to_pad = 0
-    #         attn_fn = None
-    #         if self.use_flex_attn:
-    #             # need_to_pad = (self.pad_to_multiplier - cur_L % self.pad_to_multiplier) % self.pad_to_multiplier
-    #             # if need_to_pad:
-    #             #     last_stage = F.pad(last_stage, (0, 0, 0, need_to_pad))
-    #             attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
-
-    #         # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-    #         layer_idx = 0
-    #         for block_idx, b in enumerate(self.block_chunks):
-    #             # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
-    #             if self.add_lvl_embeding_only_first_block and block_idx == 0:
-    #                 last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-    #             if not self.add_lvl_embeding_only_first_block: 
-    #                 last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
-                
-    #             for m in b.module:
-    #                 last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
-    #                 if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
-    #                     # print(f'add cfg={cfg} on {layer_idx}-th layer output')
-    #                     last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
-    #                     last_stage = torch.cat((last_stage, last_stage), 0)
-    #                 layer_idx += 1
-            
-    #         if (cfg != 1) and add_cfg_on_logits:
-    #             # print(f'add cfg on add_cfg_on_logits')
-    #             logits_BlV = self.get_logits(last_stage, cond_BD).mul(1/tau_list[si])
-    #             logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
-    #         else:
-    #             logits_BlV = self.get_logits(last_stage[:B], cond_BD[:B]).mul(1/tau_list[si])
-            
-    #         if self.use_bit_label:
-    #             tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
-    #             logits_BlV = logits_BlV.reshape(tmp_bs, -1, 2)
-    #             idx_Bld = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
-    #             idx_Bld = idx_Bld.reshape(tmp_bs, tmp_seq_len, -1)
-    #         else:
-    #             idx_Bl = sample_with_top_k_top_p_also_inplace_modifying_logits_(logits_BlV, rng=rng, top_k=top_k or self.top_k, top_p=top_p or self.top_p, num_samples=1)[:, :, 0]
-    #         if vae_type != 0:
-    #             assert returns_vemb
-    #             if si < gt_leak:
-    #                 idx_Bld = gt_ls_Bl[si]
-    #             else:
-    #                 assert pn[0] == 1
-    #                 idx_Bld = idx_Bld.reshape(B, pn[1], pn[2], -1) # shape: [B, h, w, d] or [B, h, w, 4d]
-    #                 if self.apply_spatial_patchify: # unpatchify operation
-    #                     idx_Bld = idx_Bld.permute(0,3,1,2) # [B, 4d, h, w]
-    #                     idx_Bld = torch.nn.functional.pixel_shuffle(idx_Bld, 2) # [B, d, 2h, 2w]
-    #                     idx_Bld = idx_Bld.permute(0,2,3,1) # [B, 2h, 2w, d]
-    #                 idx_Bld = idx_Bld.unsqueeze(1) # [B, 1, h, w, d] or [B, 1, 2h, 2w, d]
-
-    #             idx_Bld_list.append(idx_Bld)
-    #             codes = vae.quantizer.lfq.indices_to_codes(idx_Bld, label_type='bit_label') # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
-    #             if si != num_stages_minus_1:
-    #                 summed_codes += F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
-    #                 last_stage = F.interpolate(summed_codes, size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_up) # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
-    #                 last_stage = last_stage.squeeze(-3) # [B, d, h, w] or [B, d, 2h, 2w]
-    #                 if self.apply_spatial_patchify: # patchify operation
-    #                     last_stage = torch.nn.functional.pixel_unshuffle(last_stage, 2) # [B, 4d, h, w]
-    #                 last_stage = last_stage.reshape(*last_stage.shape[:2], -1) # [B, d, h*w] or [B, 4d, h*w]
-    #                 last_stage = torch.permute(last_stage, [0,2,1]) # [B, h*w, d] or [B, h*w, 4d]
-    #             else:
-    #                 summed_codes += codes
-    #         else:
-    #             if si < gt_leak:
-    #                 idx_Bl = gt_ls_Bl[si]
-    #             h_BChw = self.quant_only_used_in_inference[0].embedding(idx_Bl).float()   # BlC
-
-    #             # h_BChw = h_BChw.float().transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1])
-    #             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.d_vae, scale_schedule[si][0], scale_schedule[si][1], scale_schedule[si][2])
-    #             ret.append(h_BChw if returns_vemb != 0 else idx_Bl)
-    #             idx_Bl_list.append(idx_Bl)
-    #             if si != num_stages_minus_1:
-    #                 accu_BChw, last_stage = self.quant_only_used_in_inference[0].one_step_fuse(si, num_stages_minus_1+1, accu_BChw, h_BChw, scale_schedule)
-            
-    #         if si != num_stages_minus_1:
-    #             last_stage = self.word_embed(self.norm0_ve(last_stage))
-    #             last_stage = last_stage.repeat(bs//B, 1, 1)
-
-    #     if inference_mode:
-    #         for b in self.unregistered_blocks: (b.sa if isinstance(b, CrossAttnBlock) else b.attn).kv_caching(False)
-    #     else:
-    #         assert self.num_block_chunks > 1
-    #         for block_chunk_ in self.block_chunks:
-    #             for module in block_chunk_.module.module:
-    #                 (module.sa if isinstance(module, CrossAttnBlock) else module.attn).kv_caching(False)
-
-    #     if not ret_img:
-    #         return ret, idx_Bl_list, []
-        
-    #     if vae_type != 0:
-    #         img = vae.decode(summed_codes.squeeze(-3))
-    #     else:
-    #         img = vae.viz_from_ms_h_BChw(ret, scale_schedule=scale_schedule, same_shape=True, last_one=True)
-
-    #     img = (img + 1) / 2
-    #     img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
-    #     return ret, idx_Bl_list, img
     
     @for_visualize
     def vis_key_params(self, ep):
@@ -1072,8 +879,10 @@ if __name__ == '__main__':
 
     import argparse
     import time
+
     from torch import autocast
-    from tools.run_infinity import load_visual_tokenizer, load_transformer
+
+    from tools.run_infinity import load_transformer, load_visual_tokenizer
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     g_seed = random.randint(0, 10000)
