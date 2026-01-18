@@ -1,8 +1,12 @@
 # set arguments for inference
+export CUDA_VISIBLE_DEVICES=0,2,3
+gpu_num=3
+skip_last_scales=0
+
 model_type=infinity_8b
 # model_type=infinity_2b
 
-out_dir_root=work_dir/evaluation/gen_eval/${model_type}_skip-1-scales
+out_dir_root=work_dir/evaluation/gen_eval/${model_type}_skip-${skip_last_scales}
 
 if [ "$model_type" == "infinity_2b" ]; then
     checkpoint_type='torch'
@@ -47,8 +51,8 @@ mkdir -p ${out_dir}
 # python evaluation/gen_eval/infer4eval.py \
 # mutil GPUs
 # unset CUDA_VISIBLE_DEVICES
-export CUDA_VISIBLE_DEVICES=4,5,6,7
-torchrun --nproc_per_node=4 --master-port 29501 evaluation/gen_eval/infer4eval_ddp.py \
+# export CUDA_LAUNCH_BLOCKING=1
+torchrun --nproc_per_node=${gpu_num} --master-port 29501 evaluation/gen_eval/infer4eval_ddp.py \
     --cfg ${cfg} \
     --tau ${tau} \
     --pn ${pn} \
@@ -69,7 +73,8 @@ torchrun --nproc_per_node=4 --master-port 29501 evaluation/gen_eval/infer4eval_d
     --apply_spatial_patchify ${apply_spatial_patchify} \
     --cfg_insertion_layer ${cfg_insertion_layer} \
     --outdir ${out_dir}/images \
-    --rewrite_prompt ${rewrite_prompt} 2>&1 | tee ${out_dir}/eval_gen_eval.log
+    --rewrite_prompt ${rewrite_prompt} \
+    --skip_last_scales ${skip_last_scales} 2>&1 | tee ${out_dir}/eval_gen_eval.log
 
 # --- detect objects ---
 source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
@@ -85,3 +90,5 @@ python evaluation/gen_eval/evaluate_images.py ${out_dir}/images \
 # --- accumulate results ---
 python evaluation/gen_eval/summary_scores.py ${out_dir}/results/det.jsonl > ${out_dir}/results/res.txt
     cat ${out_dir}/results/res.txt
+
+

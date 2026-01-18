@@ -1,8 +1,12 @@
 # set arguments for inference
+export CUDA_VISIBLE_DEVICES=0,2,3
+gpu_num=3
+skip_last_scales=0
+
 model_type=infinity_8b
 # model_type=infinity_2b
 
-out_dir_root=work_dir/evaluation/image_reward/${model_type}_skip-2-scales
+out_dir_root=work_dir/evaluation/hpsv2/${model_type}_skip-1-scale
 
 if [ "$model_type" == "infinity_2b" ]; then
     checkpoint_type='torch'
@@ -37,17 +41,15 @@ text_channels=2048
 cfg_insertion_layer=0
 sub_fix=cfg${cfg}_tau${tau}_cfg_insertion_layer${cfg_insertion_layer}
 
-# ImageReward
-out_dir=${out_dir_root}/image_reward_${sub_fix}
+# HPS v2.1
+out_dir=${out_dir_root}/hpsv21_${sub_fix}
 mkdir -p ${out_dir}
-# export CUDA_VISIBLE_DEVICES=1
 
-# --- step 1, infer images ---
-# single GPU
-# python evaluation/image_reward/infer4eval.py \
-# mutil GPUs
-unset CUDA_VISIBLE_DEVICES
-torchrun --nproc_per_node=4 evaluation/image_reward/infer4eval_ddp.py \
+# --- single GPU ---
+# python evaluation/hpsv2/eval_hpsv2.py \
+# --- mutil GPUs ---
+# unset CUDA_VISIBLE_DEVICES
+torchrun --nproc_per_node=${gpu_num} evaluation/hpsv2/eval_hpsv2_ddp.py \
     --cfg ${cfg} \
     --tau ${tau} \
     --pn ${pn} \
@@ -67,8 +69,5 @@ torchrun --nproc_per_node=4 evaluation/image_reward/infer4eval_ddp.py \
     --text_channels ${text_channels} \
     --apply_spatial_patchify ${apply_spatial_patchify} \
     --cfg_insertion_layer ${cfg_insertion_layer} \
-    --outdir ${out_dir} 2>&1 | tee ${out_dir}/eval_image_reward.log
-
-# --- step 2, compute image reward ---
-python evaluation/image_reward/cal_imagereward.py \
-    --meta_file ${out_dir}/metadata.jsonl 2>&1 | tee ${out_dir}/cal_image_reward.log
+    --outdir ${out_dir}/images \
+    --skip_last_scales ${skip_last_scales} 2>&1 | tee ${out_dir}/eval_hpsv2.log

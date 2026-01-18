@@ -1,8 +1,12 @@
 # set arguments for inference
+export CUDA_VISIBLE_DEVICES=0,2,3
+gpu_num=3
+skip_last_scales=0
+
 model_type=infinity_8b
 # model_type=infinity_2b
 
-out_dir_root=work_dir/evaluation/hpsv2/${model_type}_skip-1-scale
+out_dir_root=work_dir/evaluation/dpg-bench/${model_type}_skip-${skip_last_scales}
 
 if [ "$model_type" == "infinity_2b" ]; then
     checkpoint_type='torch'
@@ -37,15 +41,17 @@ text_channels=2048
 cfg_insertion_layer=0
 sub_fix=cfg${cfg}_tau${tau}_cfg_insertion_layer${cfg_insertion_layer}
 
-# HPS v2.1
-out_dir=${out_dir_root}/hpsv21_${sub_fix}
+# DPG-Bench
+out_dir=${out_dir_root}/dpg-bench_${sub_fix}
 mkdir -p ${out_dir}
 
-# --- single GPU ---
-# python evaluation/hpsv2/eval_hpsv2.py \
-# --- mutil GPUs ---
-unset CUDA_VISIBLE_DEVICES
-torchrun --nproc_per_node=4 evaluation/hpsv2/eval_hpsv2_ddp.py \
+# --- run inference ---
+# single GPU
+# python evaluation/dpg_bench/infer4dpg.py \
+# mutil GPUs
+# unset CUDA_VISIBLE_DEVICES
+# export CUDA_VISIBLE_DEVICES=0,1
+torchrun --nproc_per_node=${gpu_num} evaluation/dpg_bench/infer4dpg_ddp.py \
     --cfg ${cfg} \
     --tau ${tau} \
     --pn ${pn} \
@@ -65,4 +71,35 @@ torchrun --nproc_per_node=4 evaluation/hpsv2/eval_hpsv2_ddp.py \
     --text_channels ${text_channels} \
     --apply_spatial_patchify ${apply_spatial_patchify} \
     --cfg_insertion_layer ${cfg_insertion_layer} \
-    --outdir ${out_dir}/images 2>&1 | tee ${out_dir}/eval_hpsv2.log
+    --outdir ${out_dir}/images \
+    --skip_last_scales ${skip_last_scales} 2>&1 | tee ${out_dir}/eval_dpg-bench.log
+
+
+# --- calculate metrics ---
+source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
+conda activate modelscope
+
+IMAGE_ROOT_PATH=${out_dir}/images
+RESOLUTION=1024
+PIC_NUM=${PIC_NUM:-4}
+PROCESSES=${PROCESSES:-${gpu_num}}   # default GPU number
+PORT=${PORT:-29500}
+
+export MODELSCOPE_CACHE="./pretrained_models/.modelscope_cache"
+# mkdir -p $MODELSCOPE_CACHE
+
+accelerate launch --num_machines 1 --num_processes $PROCESSES --multi_gpu --mixed_precision "fp16" --main_process_port $PORT \
+    evaluation/dpg_bench/compute_dpg_bench.py \
+    --image-root-path $IMAGE_ROOT_PATH \
+    --resolution $RESOLUTION \
+    --pic-num $PIC_NUM \
+    --vqa-model mplug 2>&1 | tee ${out_dir}/matrics_dpg-bench.log
+
+# single GPU
+# python evaluation/dpg_bench/compute_dpg_bench.py \
+#   --image-root-path $IMAGE_ROOT_PATH \
+#   --resolution $RESOLUTION \
+#   --pic-num $PIC_NUM \
+#   --vqa-model mplug
+
+# conda deactivate

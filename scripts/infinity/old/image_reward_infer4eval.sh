@@ -1,9 +1,12 @@
 # set arguments for inference
-skip_scale=$1
+export CUDA_VISIBLE_DEVICES=0,2,3
+gpu_num=3
+skip_last_scales=0
+
 model_type=infinity_8b
 # model_type=infinity_2b
 
-out_dir_root=work_dir/infer_profile/${model_type}_skip-${skip_scale}-scale
+out_dir_root=work_dir/evaluation/image_reward/${model_type}_skip-${skip_last_scales}
 
 if [ "$model_type" == "infinity_2b" ]; then
     checkpoint_type='torch'
@@ -11,15 +14,15 @@ if [ "$model_type" == "infinity_2b" ]; then
     vae_type=32
     vae_path=pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth
     apply_spatial_patchify=0
-    cfg=3
-    tau=0.5
+    cfg=4
+    tau=1
 elif [ "$model_type" == "infinity_8b" ]; then
     checkpoint_type='torch_shard'
     infinity_model_path=pretrained_models/infinity/Infinity/infinity_8b_weights
     vae_type=14
     vae_path=pretrained_models/infinity/Infinity/infinity_vae_d56_f8_14_patchify.pth
     apply_spatial_patchify=1
-    cfg=3
+    cfg=4
     tau=1
 else
     echo "Unknown model_type '$model_type'"
@@ -27,7 +30,6 @@ else
     exit 1
 fi
 
-skip_last_scales=${skip_scale}
 pn=1M
 use_scale_schedule_embedding=0
 use_bit_label=1
@@ -39,13 +41,17 @@ text_channels=2048
 cfg_insertion_layer=0
 sub_fix=cfg${cfg}_tau${tau}_cfg_insertion_layer${cfg_insertion_layer}
 
-out_dir=${out_dir_root}/latency-profile_${sub_fix}
+# ImageReward
+out_dir=${out_dir_root}/image_reward_${sub_fix}
 mkdir -p ${out_dir}
+# export CUDA_VISIBLE_DEVICES=1
 
-# --- run inference ---
+# --- step 1, infer images ---
 # single GPU
-# export CUDA_VISIBLE_DEVICES=7
-python tools/latency_profile_infinity.py \
+# python evaluation/image_reward/infer4eval.py \
+# mutil GPUs
+# unset CUDA_VISIBLE_DEVICES
+torchrun --nproc_per_node=${gpu_num} evaluation/image_reward/infer4eval_ddp.py \
     --cfg ${cfg} \
     --tau ${tau} \
     --pn ${pn} \
@@ -65,4 +71,9 @@ python tools/latency_profile_infinity.py \
     --text_channels ${text_channels} \
     --apply_spatial_patchify ${apply_spatial_patchify} \
     --cfg_insertion_layer ${cfg_insertion_layer} \
-    --skip_last_scales ${skip_last_scales} 2>&1 | tee ${out_dir}/infer_profile.log
+    --outdir ${out_dir} \
+    --skip_last_scales ${skip_last_scales} 2>&1 | tee ${out_dir}/eval_image_reward.log
+
+# --- step 2, compute image reward ---
+python evaluation/image_reward/cal_imagereward.py \
+    --meta_file ${out_dir}/metadata.jsonl 2>&1 | tee ${out_dir}/cal_image_reward.log
