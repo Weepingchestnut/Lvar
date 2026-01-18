@@ -16,13 +16,35 @@ checkpoints
 local_output
 logs
 wandb
+work_dir/
+output/
+evaluation_results*
 
 # pretrain models
 *.pb
-pretrained_models/
 *.npz
+*.pth
+pretrained_models/
+
+
+# pkgs
+*.whl
+*.zip
+
+# kernels
+models/hart/kernels/build/
+models/hart/kernels/hart_backend.egg-info/
+models/hart/kernels/dist
+*.so
 
 # dev ing...
-models/kernels/
+*.pkl
+tools/conf.py
+
+models/fastvar/old_version/
+models/lpd/orders/
+models/infinity copy/
 mytest/
-work_dir/
+
+scripts/exp*
+scripts/spattn_exp/

@@ -1,5 +1,6 @@
 import random
-import psutil
+from typing import Union
+# import psutil
 import pynvml
 import torch
 lib = torch.cuda.cudart()
@@ -96,25 +97,29 @@ default_prompts = [
 ]
 
 
-def encode_prompts(text_tokenizer, text_encoder, prompt, enable_positive_prompt=False):
+def encode_prompts(text_tokenizer, text_encoder, prompt: Union[str, List[str]], enable_positive_prompt=False):
+    if isinstance(prompt, str):
+        prompt = [prompt]
+    
     if enable_positive_prompt:
         print(f'before positive_prompt aug: {prompt}')
         prompt = aug_with_positive_prompt(prompt)
         print(f'after positive_prompt aug: {prompt}')
-    # print(f'prompt={prompt}')
-    # captions = [prompt]
+    
     captions = prompt
-    tokens = text_tokenizer(text=captions, max_length=512, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
+    tokens = text_tokenizer(text=captions, max_length=512, padding='max_length', truncation=True, return_tensors='pt')
     input_ids = tokens.input_ids.cuda(non_blocking=True)
     mask = tokens.attention_mask.cuda(non_blocking=True)
     text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
+    
     lens: List[int] = mask.sum(dim=-1).tolist()
     cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
-    Ltext = max(lens)    
-    kv_compact = []
+    Ltext = max(lens)
     
+    kv_compact = []
     for len_i, feat_i in zip(lens, text_features.unbind(0)):
         kv_compact.append(feat_i[:len_i])
+    
     kv_compact = torch.cat(kv_compact, dim=0)
     text_cond_tuple = (kv_compact, lens, cu_seqlens_k, Ltext)
     
@@ -180,11 +185,11 @@ def main(args):
         # --- Memory Analysis: Initial State ---
         torch.cuda.empty_cache()
         start_cpu, start_pytorch_gpu, start_nvsmi_gpu = get_memory_usage(device, nvml_handle)
-        print("--- Memory Usage (Initial) ---")
+        print("-------- Memory Usage (Initial) --------")
         print(f"CPU Memory: {format_memory(start_cpu)}")
         print(f"GPU Memory (PyTorch): {format_memory(start_pytorch_gpu)}")
         print(f"GPU Memory (NVIDIA-SMI): {format_memory(start_nvsmi_gpu)}")
-        print("-" * 30)
+        print("-" * 40)
         # --------------------------------------
 
         # load text encoder
@@ -207,7 +212,8 @@ def main(args):
         # hyperparameter setting
         tau = args.tau; cfg = args.cfg
         h_div_w = 1/1 # Aspect Ratio
-        seed = random.randint(0, 10000)
+        # seed = random.randint(0, 10000)
+        seed = 42
         enable_positive_prompt = 0
 
         h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w_templates-h_div_w))]
@@ -226,7 +232,7 @@ def main(args):
 
         with torch.inference_mode():
             # for sparse attn layer count
-            from models.infinity.sparse_attn_layer_counter import singleton as layer_counter
+            from models.sparvar.sparse_attn_layer_counter import singleton as layer_counter
 
             if not isinstance(cfg, list):
                 cfg_list = [cfg] * len(scale_schedule)
@@ -311,7 +317,7 @@ def main(args):
                     lib.cudaProfilerStop()
                     
                     end_time = time.perf_counter()
-                    timings.append(end_time - start_time); print(f'%%%%%% {(end_time - start_time) * 1000:.2f}ms %%%%%%')
+                    timings.append(end_time - start_time); print(f'%%%%%% {(end_time - start_time)/args.batch_size * 1000:.2f}ms %%%%%%')
                     
                     # --- Memory Analysis: Monitoring CPU and NVIDIA-SMI in a loop ---
                     cpu, _, nvsmi = get_memory_usage(device, nvml_handle)
@@ -326,9 +332,12 @@ def main(args):
         print(f"\nGeneration with batch_size = {args.batch_size} take {average_time:2f}s per step (w/ text encoder).")
 
         batch_size = args.batch_size
-        avg_latency = sum(timings) / len(timings)
-        std_latency = torch.tensor(timings).std().item()
-        throughput = batch_size / avg_latency if avg_latency > 0 else float('inf')
+        avg_batch_latency = sum(timings) / len(timings)
+        std_batch_latency = torch.tensor(timings).std().item()
+        throughput = batch_size / avg_batch_latency if avg_batch_latency > 0 else float('inf')
+        # per-image latency
+        avg_latency = avg_batch_latency / batch_size
+        std_latency = std_batch_latency / batch_size
 
         print(f"\n--- Inference Performance ---")
         print(f"Batch Size: {batch_size}")
@@ -339,11 +348,11 @@ def main(args):
 
         # --- Memory Analysis: final report ---
         peak_pytorch_gpu_mem = torch.cuda.max_memory_allocated(device) / 1024**2
-        print("\n--- Memory Usage (Peak during Inference) ---")
+        print("\n----------- Memory Usage (Peak during Inference) -----------")
         print(f"Peak CPU Memory: {format_memory(peak_cpu_mem)} (Total Used: {format_memory(peak_cpu_mem - start_cpu)})")
         print(f"Peak GPU Memory (PyTorch): {format_memory(peak_pytorch_gpu_mem)} (Total Used: {format_memory(peak_pytorch_gpu_mem - start_pytorch_gpu)})")
         print(f"Peak GPU Memory (NVIDIA-SMI): {format_memory(peak_nvsmi_gpu_mem)} (Total Used: {format_memory(peak_nvsmi_gpu_mem - start_nvsmi_gpu)})")
-        print("-" * 45)
+        print("-" * 60)
 
     finally:
         if nvml_handle:
@@ -358,10 +367,6 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_iter", type=int, default=50)
     parser.add_argument("--profile_iter", type=int, default=100)
     parser.add_argument('--outdir', type=str, default='')
-    # --- exp params --
-    # parser.add_argument('--freeze_kv_cache_last_n_scales', type=int, default=4)
-    # parser.add_argument('--attn_sink_scales', type=int, default=5)
-    # parser.add_argument('--skip_last_scales', type=int, default=0)
     args = parser.parse_args()
 
     main(args)
