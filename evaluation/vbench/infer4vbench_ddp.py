@@ -1,7 +1,9 @@
+import datetime
 import hashlib
 import json
 import os
 import os.path as osp
+import random
 import sys
 import time
 from typing import List
@@ -93,8 +95,8 @@ def perform_inference(pipe, data, args):
 
     generated_image_list = []
     negative_prompt=''
-    prompt = f'{prompt}, Close-up on big objects, emphasize scale and detail'
-    negative_prompt = ""
+    if args.append_enlarge2captain:
+        prompt = f'{prompt}, Close-up on big objects, emphasize scale and detail'       # 特写大型物体，突出尺寸与细节
     if args.append_duration2caption:
         prompt = f'<<<t={mapped_duration}s>>>' + prompt
     
@@ -162,6 +164,7 @@ class InferArgs(Args):
     checkpoint_type: str = 'torch_shard'   # omnistore
     vae_path: str = 'pretrained_models/infinitystar/infinitystar_videovae.pth'
     text_encoder_ckpt: str = 'pretrained_models/infinitystar/text_encoder/flan-t5-xl-official/'
+    videovae: int = 10
     text_channels: int = 2048
     
     dynamic_scale_schedule: str = 'infinity_elegant_clip20frames_v2'
@@ -176,6 +179,7 @@ class InferArgs(Args):
     video_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 1, 1]'
     # 使用 Tap 的 List 支持，这样终端可以直接输入 --image_scale_repetition 3 3 3 ...
     # image_scale_repetition: List[int] = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+    append_enlarge2captain: int = 1
     append_duration2caption: int = 1
     use_two_stage_lfq: int = 1
     detail_scale_min_tokens: int = 750
@@ -212,12 +216,12 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     device = torch.device(f'cuda:{local_rank}')
-    tdist.init_process_group(backend='nccl')
+    # tdist.init_process_group(backend='nccl')
     # explicitly set timeout to 3 hours
-    # tdist.init_process_group(
-    #     backend='nccl', 
-    #     timeout=datetime.timedelta(minutes=180)
-    # )
+    tdist.init_process_group(
+        backend='nccl', 
+        timeout=datetime.timedelta(minutes=180)
+    )
     rank = tdist.get_rank()
     world_size = tdist.get_world_size()
 
@@ -308,8 +312,9 @@ def main():
 
             data = {
                 'seed': seed,
-                "prompt": prompt,
-                "image_path": None,     # Vbench T2V
+                'prompt': prompt,
+                'image_path': None,     # Vbench T2V
+                'duration': args.generation_duration,
             }
             
             # base_name = f"idx{global_idx:04d}_s{sample_idx:02d}.mp4"
@@ -343,14 +348,24 @@ def main():
                 dim_dir = osp.join(videos_by_dim_root, d)
                 os.makedirs(dim_dir, exist_ok=True)
                 dim_video_path = osp.join(dim_dir, base_name)
+                
+                # [核心优化] 引入随机睡眠，错开 4 个进程的时间，极大降低碰撞概率
+                # time.sleep(random.uniform(0.01, 0.05))
+                
                 if not osp.exists(dim_video_path):
                     try:
+                        # print(f'[Rank {rank}] {save_path=} {dim_video_path=}')
                         os.symlink(osp.abspath(save_path), dim_video_path)
+                        # print(f'[Rank {rank}] Create symlink ')
+                    except FileExistsError:
+                        print(f'[Rank {rank}] FileExistsError: {save_path=} {dim_video_path=}')
+                        pass
                     except OSError:
                         # fall back to copy when no permission
                         import shutil
                         shutil.copy2(save_path, dim_video_path)
     
+    print(f"[Rank {rank}] Finished tasks. Waiting for others...")
     tdist.barrier(device_ids=[local_rank])
     
     latency_tensor = torch.tensor(
