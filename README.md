@@ -10,13 +10,52 @@ Learn visual autoregressive
 - VAR (NeurIPS'2024 **Best Paper Award**)
 
 ### Text-to-Image Generation Models
+
+Baseline Models
 - Infinity (CVPR'2025 Oral)
+
+Acceleration Method
 - FastVAR (ICCV'2025)
-- ScaleKV
+- SparseVAR (ICCV'2025)
+- ScaleKV (NeurIPS'2025)
 - SkipVAR
 
 
-## ⚙️Installation
+## ⚙️ Installation
+
+### Basic Env.
+- Some customized Kernels are written for **Hopper** GPUs, and depend on optimizations specific to CUDA Toolkit version ≥ 12.8 (recommend `12.8.1`!).
+- For PyTorch, the recommended version is `2.7.1` or later.
+
+```bash
+conda create -n torch271 python=3.12
+
+# for CUDA 12.8
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+# flash-attention
+MAX_JOBS=16 pip install flash-attn --no-build-isolation
+
+cd Lvar
+pip install -r requirements.txt
+
+# Since dev, the Python path should be set manually
+vim ~/.bashrc
+export PYTHONPATH=$PYTHONPATH:{your-path}/Lvar
+```
+
+### Kernel Compile
+Our SparVAR
+```bash
+
+```
+
+HART
+```bash
+cd models/hart/kernels
+bash install.sh
+```
+
+---
 
 ### Model Zoo
 
@@ -34,10 +73,9 @@ These three lines will download flan-t5-xl to your ~/.cache/huggingface director
 or 
 
 ```python
-mkdir pretrained_models/infinity/flan-t5-xl
-cd pretrained_models/infinity/flan-t5-xl
+cd pretrained_models/infinity
 
-huggingface-cli download google/flan-t5-xl --local-dir ./
+bash hf_down.sh
 ```
 ---
 

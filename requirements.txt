@@ -2,9 +2,12 @@
 clean-fid
 clip_benchmark
 Pillow
+psutil
 httpx
 huggingface_hub
+lightning-fabric
 matplotlib
+ninja
 numpy
 nvidia-ml-py
 openai
@@ -15,6 +18,6 @@ seaborn
 transformers
 tabulate
 typed-argument-parser
-tensorflow-io
+# tensorflow-io
 tensorboard
 wandb
