@@ -901,7 +901,7 @@ class SparseDiffAttn(nn.Module):
         #     5,      # scale 11 
         #     7,      # scale 12
         # ]
-        wind_size_init = attn_config['win_size']
+        wind_size_init = attn_config['cs4a_ws']
         wind_size = wind_size_init[len(scales)-len(scales_init):]
         print(f'{wind_size=}')
 
@@ -1015,11 +1015,11 @@ class SparseDiffAttn(nn.Module):
             #* ---------- 2. TopK and get sparse KV index ----------
             inds = torch.topk(bs, k=indices_count, dim=-1).indices; #print(f'TopK: {inds.shape}')      # e.g. [batch, num_heads, q_blocks(9), 640]
 
-            # --- Visualize decision scale index ---
-            save_attention_selection_visuals(
-                inds_K=inds, q_len=q.shape[-2], kv_len=k.shape[-2], bm=bm,
-                out_dir=f'work_dir/analysis/index_visual/scale_10/layer-{layer_ind}'
-            )
+            # # --- Visualize decision scale index ---
+            # save_attention_selection_visuals(
+            #     inds_K=inds, q_len=q.shape[-2], kv_len=k.shape[-2], bm=bm,
+            #     out_dir=f'work_dir/analysis/index_visual/scale_10/layer-{layer_ind}'
+            # )
 
             counts = torch.full(
                 (q.shape[0], q.shape[1], triton.cdiv(q.shape[-2], bm)), 
@@ -1101,12 +1101,12 @@ class SparseDiffAttn(nn.Module):
         indices_count = s_indices_count + local_count        # add local sparse index
         assert indices_count % multiple_of == 0, f"after add local sparse index, mismatch {multiple_of=}"
 
-        # --- Visualize decision scale index ---
-        if scale_ind == 10:
-            save_attention_selection_visuals(
-                inds_K=inds, q_len=q.shape[-2], kv_len=k.shape[-2], bm=bm,
-                out_dir=f'work_dir/analysis/index_visual/kv_map_scale_{int(math.sqrt(q.shape[-2]))}-{attn_config['top_keys']}/layer-{layer_ind}'
-            )
+        # # --- Visualize decision scale index ---
+        # if scale_ind == 10:
+        #     save_attention_selection_visuals(
+        #         inds_K=inds, q_len=q.shape[-2], kv_len=k.shape[-2], bm=bm,
+        #         out_dir=f'work_dir/analysis/index_visual/kv_map_scale_{int(math.sqrt(q.shape[-2]))}-{attn_config['top_keys']}/layer-{layer_ind}'
+        #     )
 
         # inds change, need pad again
         counts = torch.full(

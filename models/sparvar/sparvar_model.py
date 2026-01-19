@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models import register_model
 
+from kernels.sparse_attn.sparse_attn_config import GLOBAL_CONFIG, load_from_file
 from models.infinity.flex_attn import FlexAttn
 from models.infinity.basic_infinity import (
     AdaLNBeforeHead, 
@@ -26,7 +27,7 @@ from models.infinity.infinity_model import (
     TextAttentivePool, 
     sample_with_top_k_top_p_also_inplace_modifying_logits_
 )
-from models.sparvar.basic_sparvar import CrossAttnBlock
+from models.sparvar.basic_sparvar import CrossAttnBlock, SparseFlexAttn
 
 import utils.dist as dist
 from utils.dist import for_visualize
@@ -71,6 +72,7 @@ class SparVAR_Infinity(nn.Module):
         inference_mode=False,
         cache_dir=None,          # debug, timm load_model has cache_dir default
         skip_last_scales: int = 0,
+        attn_sink_scales: int = 6,
         drop_uncond_last_scales: int = 0,
     ):
         # set hyperparameters
@@ -215,6 +217,9 @@ class SparVAR_Infinity(nn.Module):
         else:
             fused_norm_func = None
         
+        load_from_file("models/sparvar/sparse-attn-config.yml")
+        attn_config = GLOBAL_CONFIG['attn']
+        
         # [backbone and head]
         self.use_flex_attn = use_flex_attn
         self.attn_fn_compile_dict = {}
@@ -232,6 +237,7 @@ class SparVAR_Infinity(nn.Module):
                 swiglu=swiglu, customized_flash_attn=self.customized_flash_attn, fused_mlp=fused_mlp, fused_norm_func=fused_norm_func,
                 checkpointing_sa_only=self.checkpointing == 'self-attn',
                 use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+                attn_config=attn_config,
             )
             self.unregistered_blocks.append(block)
         
@@ -265,6 +271,56 @@ class SparVAR_Infinity(nn.Module):
         )
         self.skip_last_scales = skip_last_scales
         self.drop_uncond_last_scales = drop_uncond_last_scales
+        
+        #* ------ CLSA: attn sink + block-wise local sparse attn ------
+        attn_sink_scales = attn_config['attn_sink']
+        kernel_schedule = attn_config['win_size']
+        assert len(kernel_schedule) == 13, f'kernel_schedule mismatch 13 scales'
+
+        print(f'[w/ Block-wise Local Sparse Attention]')
+        print(f"Attn sink scale: Keep the first {attn_sink_scales} scales KV cache")
+        self.attn_sink_scale: int = attn_sink_scales
+        
+        scale_schedule = [
+            (1, 1), (2, 2), (4, 4), (6, 6), (8, 8), (12, 12), (16, 16),
+            (20, 20), (24, 24), (32, 32), (40, 40), (48, 48), (64, 64)
+        ]
+        
+        spattn_fn_10 = SparseFlexAttn(
+            scale_schedule=scale_schedule,
+            kernel_schedule=kernel_schedule,
+            q_scale_idx=10,
+            attn_sink_scale=attn_sink_scales,
+            # block_size=block_size,
+            num_heads=num_heads,
+        )
+        spattn_fn_11 = SparseFlexAttn(
+            scale_schedule=scale_schedule,
+            kernel_schedule=kernel_schedule,
+            q_scale_idx=11,
+            attn_sink_scale=attn_sink_scales,
+            # block_size=block_size,
+            num_heads=num_heads,
+        )
+        spattn_fn_12 = SparseFlexAttn(
+            scale_schedule=scale_schedule,
+            kernel_schedule=kernel_schedule,
+            q_scale_idx=12,
+            attn_sink_scale=attn_sink_scales,
+            # block_size=block_size,
+            num_heads=num_heads,
+        )
+        self.spattn_compile_list = [
+            None, None, None, None, None, None, None, None, None, None,
+            spattn_fn_10,   # 40x40
+            spattn_fn_11,   # 48x48
+            spattn_fn_12,   # 64x64
+        ]
+        
+        for i in range(len(self.spattn_compile_list)):
+            if self.spattn_compile_list[i] is not None:
+                print(f'Scale-{i} use sparse-attn, local window size is {kernel_schedule[i]}')
+        print(f'Local window schedule: {kernel_schedule}')
 
     def compile_flex_attn(self):
         attn_fn_compile_dict = {}
@@ -573,6 +629,7 @@ class SparVAR_Infinity(nn.Module):
                         x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, 
                         attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, 
                         scale_ind=si, layer_ind=layer_idx, 
+                        spattn_fn=self.spattn_compile_list[si]
                     )
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
                         # print(f'add cfg={cfg} on {layer_idx}-th layer output')

@@ -1,12 +1,19 @@
 import math
 import sys
 debugger_attached = hasattr(sys, 'gettrace') and sys.gettrace() is not None
+import numpy as np
 from functools import partial
 from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import (
+    _DEFAULT_SPARSE_BLOCK_SIZE,
+    create_block_mask,
+    create_mask,
+    flex_attention,
+)
 from torch.utils.checkpoint import checkpoint
 from timm.layers import DropPath, drop_path
 
@@ -17,10 +24,6 @@ from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
 from models.infinity.basic_infinity import FFN, CrossAttention, FFNSwiGLU, apply_rotary_emb, get_dropout_layer, precompute_rope2d_freqs_grid
 from models.sparvar.sparse_attn import SparseDiffAttn
 from models.sparvar.sparse_attn_layer_counter import LayerCounter
-# from models.sparvar.sparse_attn_config import GLOBAL_CONFIG, load_from_file
-# load_from_file("models/sparvar/sparse-attn-config.yml")
-from kernels.sparse_attn.sparse_attn_config import GLOBAL_CONFIG, load_from_file
-load_from_file("models/sparvar/sparse-attn-config.yml")
 
 # not slow attn, for torch 2.6.0, it's flash attn 2 
 # https://docs.pytorch.org/docs/2.6/generated/torch.nn.functional.scaled_dot_product_attention.html#torch.nn.functional.scaled_dot_product_attention
@@ -41,12 +44,162 @@ except ImportError:
         return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True).add_(epsilon))) * weight
 
 
+class SparseFlexAttn(nn.Module):
+    def __init__(self, scale_schedule, kernel_schedule, q_scale_idx, attn_sink_scale, block_size=_DEFAULT_SPARSE_BLOCK_SIZE, num_heads: int = 16):
+        super().__init__()
+
+        S_q = scale_schedule[q_scale_idx][0] * scale_schedule[q_scale_idx][1]
+        S_kv = sum([h * w for h, w in scale_schedule[:q_scale_idx + 1]])
+        self.block_size = block_size
+
+        self.flex_attention = torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+
+        self.mask_mod = self.create_cross_scale_block_attn_mask(
+            scale_schedule=scale_schedule,
+            kernel_schedule=kernel_schedule,
+            q_scale_idx=q_scale_idx,
+            attn_sink_scale=attn_sink_scale
+        )
+
+        self.block_mask = create_block_mask(
+            self.mask_mod,
+            B=1,
+            H=num_heads,
+            Q_LEN=S_q,
+            KV_LEN=S_kv,
+            device='cuda',
+            BLOCK_SIZE=block_size
+        )
+
+    def create_cross_scale_block_attn_mask(
+        self,
+        scale_schedule=None,
+        kernel_schedule=None,
+        q_scale_idx: int = 12,
+        attn_sink_scale: int = 5,
+        device: str = "cuda",
+    ):
+        """
+        一个统一的稀疏 attention mask mod，用于为Infinity模型的完整注意力矩阵
+        （例如 4096x10521）进行局部稀疏化。
+
+        该函数能够根据 Key/Value 的一维索引 kv_idx，自动推断其所属的历史尺度、
+        该尺度的网格尺寸，以及在该尺度内的局部坐标，然后应用局部注意力逻辑。
+        """
+
+        H_q, W_q = scale_schedule[q_scale_idx]
+        S_q = H_q * W_q
+
+        # 计算所有历史 Key/Value 尺度的 token 数量和边界
+        relevant_schedule = scale_schedule[:q_scale_idx + 1]
+        relevant_kernel_schedule = kernel_schedule[:q_scale_idx + 1]
+
+        kv_tokens_per_scale = [h * w for h, w in relevant_schedule]
+        kv_cumulative_tokens = np.cumsum(kv_tokens_per_scale)
+        kv_slice_indices = np.insert(kv_cumulative_tokens, 0, 0)
+        S_k = kv_cumulative_tokens[-1]
+
+        # Calculate the token boundary for the dense attention sink
+        attn_sink_boundary = int(kv_slice_indices[attn_sink_scale]) if attn_sink_scale > 0 else 0
+
+        scale_schedule_tensor = torch.tensor(relevant_schedule, device=device, dtype=torch.int)
+        kv_slice_indices_tensor = torch.tensor(kv_slice_indices, device=device, dtype=torch.int)
+        kernel_schedule_tensor = torch.tensor(relevant_kernel_schedule, device=device, dtype=torch.int)
+
+        def gen_fine_grained_mask_mod(b, h, q_idx, kv_idx):
+
+            # Condition 1: Is the Key/Value token in the dense "attention sink" region?
+            # If so, it's always attended to.
+            attn_sink_mask = (kv_idx < attn_sink_boundary)
+
+            # --- The rest of the logic is for the sparse region ---
+            # 1. 计算 Query 的 2D 坐标 (这部分不变)
+            q_y, q_x = q_idx // W_q, q_idx % W_q
+            
+            # 2. 核心逻辑: 确定每个 kv_idx 属于哪个历史尺度
+            #    torch.searchsorted 是一个高效的查找操作，它会返回每个 kv_idx
+            #    应该插入到 slice_indices 中的哪个位置，从而确定其所属的尺度。
+            #    我们减去1来获得正确的0-based尺度索引。
+            scale_index_k = torch.searchsorted(kv_slice_indices_tensor, kv_idx, right=True) - 1
+            
+            # 3. 根据尺度索引，获取该尺度的网格尺寸 (H_k, W_k)
+            #    使用 torch.gather 来避免在 vmap 环境中的索引问题
+            H_k_tensor = torch.gather(scale_schedule_tensor[:, 0], 0, scale_index_k)
+            W_k_tensor = torch.gather(scale_schedule_tensor[:, 1], 0, scale_index_k)
+            
+            # 4. 计算 kv_idx 在其自身尺度内的局部一维索引
+            start_indices_k = torch.gather(kv_slice_indices_tensor, 0, scale_index_k)
+            kernel_size_k = torch.gather(kernel_schedule_tensor, 0, scale_index_k)
+            relative_kv_idx = kv_idx - start_indices_k
+            
+            # 5. 计算 Key/Value 的 2D 坐标 Calculate Key/Value's 2D coordinates
+            kv_y, kv_x = relative_kv_idx // W_k_tensor, relative_kv_idx % W_k_tensor
+            
+            # 6. 坐标重缩放，找到 Query 在 Key 网格中的对应中心点 Rescale coordinates
+            center_y = torch.round((q_y.float() / H_q) * H_k_tensor)
+            center_x = torch.round((q_x.float() / W_q) * W_k_tensor)
+            
+            # 7. 判断 Key/Value token 是否在中心点 KERNEL_SIZE//2 的邻域内
+                # Check neighborhood using the per-scale kernel size
+            half_kernel = kernel_size_k // 2
+            vertical_mask = (center_y - kv_y).abs() <= half_kernel
+            horizontal_mask = (center_x - kv_x).abs() <= half_kernel
+            is_in_sparse_region = vertical_mask & horizontal_mask
+            
+            # return vertical_mask & horizontal_mask
+            # A token is attended to if it's in the dense region OR in the local sparse region.
+            return attn_sink_mask | is_in_sparse_region
+    
+        # print("Step 1: Generating internal fine-grained mask...")
+        fine_grained_mask = create_mask(gen_fine_grained_mask_mod, 1, 1, S_q, S_k, device=device).squeeze()
+
+        # --- Step 2: Convert to a Pure Block-Sparse Mask ---
+        # print(f"Step 2: Converting to {block_size}x{block_size} block-sparse format...")
+        # Pad the fine-grained mask to be divisible by block_size
+        pad_q = (self.block_size - S_q % self.block_size) % self.block_size
+        pad_k = (self.block_size - S_k % self.block_size) % self.block_size
+        padded_mask = F.pad(fine_grained_mask, (0, pad_k, 0, pad_q), "constant", False)
+
+        padded_S_q, padded_S_k = padded_mask.shape
+        num_q_blocks = padded_S_q // self.block_size
+        num_k_blocks = padded_S_k // self.block_size
+
+        # Reshape, permute, and reduce to get the block-level mask
+        # The logic is: if ANY value in a block is True, the whole block becomes True.
+        block_level_mask = (
+            padded_mask.reshape(num_q_blocks, self.block_size, num_k_blocks, self.block_size)
+            .permute(0, 2, 1, 3)
+            .any(dim=(-1, -2))
+        )
+
+        # --- Step 3: Return a Simple Lookup Function ---
+        # print("Step 3: Returning simplified block-lookup mask function.")
+        
+        # This closure captures the pre-computed block_level_mask
+        def final_block_mask_mod(b, h, q_idx, kv_idx):
+            q_block_idx = q_idx // self.block_size
+            k_block_idx = kv_idx // self.block_size
+            # This is now a simple, fast lookup
+            return block_level_mask[q_block_idx, k_block_idx]
+
+        return final_block_mask_mod
+    
+    def forward(self, q, k, v, scale=None):
+        oup = self.flex_attention(
+            q.to(v.dtype), k.to(v.dtype), v, 
+            block_mask=self.block_mask, 
+            scale=scale
+        )
+
+        return oup
+
+
 class SelfAttention(nn.Module):
     def __init__(
         self, embed_dim=768, num_heads=12,
         proj_drop=0., tau=1, cos_attn=False, customized_flash_attn=True, use_flex_attn=False, 
         batch_size=2, pad_to_multiplier=1, rope2d_normalized_by_hw=0,
-        spsd_scale: int = 10,    # sparse decision scale
+        attn_config=None,
     ):
         """
         :param embed_dim: model's width
@@ -91,22 +244,19 @@ class SelfAttention(nn.Module):
 
         self.rope2d_normalized_by_hw = rope2d_normalized_by_hw
 
-        #* add sparse_attn
-        attn_config = GLOBAL_CONFIG['attn']
+        #* ------ CS4A + CSLA ------
+        # attn_config = GLOBAL_CONFIG['attn']
+        # print('f    In SelfAttention:')
+        # print(f'{attn_config=}')
         spsd_scale = attn_config['decision_scale']
+        self.bound_layer = attn_config['bound_layer']
+        print(f'--- [boundary layer]: {self.bound_layer} ---')
         
         layer_num, layer_counter = LayerCounter.build_for_layer(is_attn_sparse=True)
-        self.sparse_attn = SparseDiffAttn(layer_num, layer_counter, 
-                                          use_o_cache=True, spsd_scale=spsd_scale, 
-                                        #   wind_size=[5, 7]
-                                          )
-        # --- for skip last 2 scales
-        # self.sparse_attn = SparseDiffAttn(layer_num, layer_counter, 
-        #                                   use_o_cache=True, 
-        #                                   scales=[1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40],
-        #                                   spsd_scale=spsd_scale, 
-        #                                   wind_size=[3]
-        #                                   )
+        self.sparse_attn = SparseDiffAttn(
+            layer_num, layer_counter, use_o_cache=True, spsd_scale=spsd_scale, 
+            # wind_size=[5, 7]
+        )
         self.spsd_scale = spsd_scale
     
     # ---- 新增：在切换 train/eval、加载权重后自动失效缓存 ----
@@ -139,7 +289,7 @@ class SelfAttention(nn.Module):
     
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]],
-                attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, layer_ind=0):
+                attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, layer_ind=0, spattn_fn=None):
         """
         :param (fp32) x: shaped (B or batch_size, L or seq_length, C or hidden_dim); if seq-parallel is used, the `L` dim would be shared
         :param (fp32) attn_bias_or_two_vector:
@@ -211,14 +361,21 @@ class SelfAttention(nn.Module):
             # else: q, k, v are in bf16
             if self.use_flex_attn and attn_fn is not None:
                 oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
-            # --- for TopK sparse ---
-            elif scale_ind == self.spsd_scale:
+            #* --- for Local sparse ---
+            elif spattn_fn is not None and layer_ind > self.bound_layer:
+                # print('     CSLA')
+                oup = spattn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
+            #* --- for TopK sparse ---
+            elif scale_ind == self.spsd_scale and layer_ind <= self.bound_layer:
+                # print('     CS4A decision scale')
                 oup = self.sparse_attn(q.to(v.dtype), k.to(v.dtype), v, scale=self.scale, do_full_step=True, 
                                        scale_ind=scale_ind, layer_ind=layer_ind).transpose(1, 2).reshape(B, L, C)
-            elif scale_ind > self.spsd_scale:
+            elif scale_ind > self.spsd_scale and layer_ind <= self.bound_layer:
+                # print('     CS4A sparse scale')
                 oup = self.sparse_attn(q.to(v.dtype), k.to(v.dtype), v, scale=self.scale, 
                                        scale_ind=scale_ind, layer_ind=layer_ind).transpose(1, 2).reshape(B, L, C)
             else:
+                # print('     o, _ = torch.ops.chipmunk.dense_attn(q.to(v.dtype), k.to(v.dtype), v)')
                 # oup = (slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0)
                 #        .transpose(1, 2)
                 #        .reshape(B, L, C))
@@ -243,6 +400,7 @@ class CrossAttnBlock(nn.Module):
         num_heads, mlp_ratio=4., drop=0., drop_path=0., tau=1, cos_attn=False,
         swiglu=False, customized_flash_attn=False, fused_mlp=False, fused_norm_func=None, checkpointing_sa_only=False,
         use_flex_attn=False, batch_size=2, pad_to_multiplier=1, apply_rope2d=False, rope2d_normalized_by_hw=False,
+        attn_config=None
     ):
         super(CrossAttnBlock, self).__init__()
         self.C, self.D = embed_dim, cond_dim
@@ -251,6 +409,7 @@ class CrossAttnBlock(nn.Module):
         self.sa = SelfAttention(
             embed_dim=embed_dim, num_heads=num_heads, proj_drop=drop, tau=tau, cos_attn=cos_attn, customized_flash_attn=customized_flash_attn,
             use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
+            attn_config=attn_config,
         )
         self.ca = CrossAttention(embed_dim=embed_dim, kv_dim=kv_dim, num_heads=num_heads, proj_drop=drop, cos_attn=cos_attn)
         self.using_swiglu = swiglu
@@ -277,7 +436,7 @@ class CrossAttnBlock(nn.Module):
     
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, 
-                scale_ind=0, layer_ind=0):
+                scale_ind=0, layer_ind=0, spattn_fn=None):
         with torch.autocast('cuda', enabled=False):     # disable half precision
             if self.shared_aln: # always True;                   (1, 1, 6, C)  + (B, 1, 6, C)
                 gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
@@ -299,7 +458,7 @@ class CrossAttnBlock(nn.Module):
                 x_sa = checkpoint(self.sa, x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, use_reentrant=False)
             else:
                 x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, 
-                               scale_ind=scale_ind, layer_ind=layer_ind)
+                               scale_ind=scale_ind, layer_ind=layer_ind, spattn_fn=spattn_fn)
             x = x + self.drop_path(x_sa.mul_(gamma1))
             x = x + self.ca(self.ca_norm(x), ca_kv).float().mul_(self.ca_gamma)
             x = x + self.drop_path(self.ffn(self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale2, shift=shift2)).mul(gamma2)) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP

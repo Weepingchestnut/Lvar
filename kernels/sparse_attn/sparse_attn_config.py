@@ -126,6 +126,6 @@ def load_from_file(config_file: str) -> None:
     if yaml_config:
         _deep_update(GLOBAL_CONFIG, yaml_config)
         # update_global_config(yaml_config)
-        print(f"SparseVAR: using config file {config_file}")
+        print(f"SparVAR: using config file {config_file}")
         # print(yaml_config)
         print(yaml.dump(yaml_config, sort_keys=False, allow_unicode=True, default_flow_style=False))

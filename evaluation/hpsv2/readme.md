@@ -29,8 +29,8 @@ sudo apt install python3-tk
 wget https://dl.fbaipublicfiles.com/mmf/clip/bpe_simple_vocab_16e6.txt.gz
 # mv bpe_simple_vocab_16e6.txt.gz /home/tiger/.local/lib/python3.9/site-packages/hpsv2/src/open_clip
 
-# suppose your virtual environment name is 'torch260'
-mv bpe_simple_vocab_16e6.txt.gz ~/anaconda3/envs/torch260/lib/python3.12/site-packages/hpsv2/src/open_clip
+# Remember change your virtual environment name in `{your_vir-env_name}` and python version in `{python3.11}`
+mv bpe_simple_vocab_16e6.txt.gz ~/anaconda3/envs/{your_vir-env_name}/lib/{python3.11}/site-packages/hpsv2/src/open_clip
 ```
 
 由于需要从Huggingface中下载文件，因此需先设置好 `tools/conf.py` 中的huggingface token。
