@@ -77,7 +77,7 @@ def drop_path(
     training: bool = False,
     scale_by_keep: bool = True
 ):    # taken from timm
-    if drop_prob == 0. or not training: 
+    if drop_prob == 0. or not training:
         return x
     
     keep_prob = 1 - drop_prob

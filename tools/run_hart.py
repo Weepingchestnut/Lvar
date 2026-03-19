@@ -1,19 +1,20 @@
+import copy
 import os
-
-import numpy as np
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import time
-from PIL import Image
 from typing import Dict, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
-from torch import autocast
 import transformers
+from PIL import Image
+from torch import autocast
+from transformers import AutoModel, AutoTokenizer
 
-from models.hart.hart_transformer_t2i import HARTForT2I
-
+from models.fastvar.fastvar_model_hart import FastVAR_HART
+from models.hart.hart_transformer_t2i import HARTForT2I     # important for transformers pkg register
 
 # ============
 # * constants
@@ -188,6 +189,39 @@ def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
         f.write("\n".join(prompts))
 
 
+def load_hart_tokenizer(args, device='cuda'):
+    text_tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_ckpt)
+    text_model = AutoModel.from_pretrained(args.text_encoder_ckpt).to(device)
+    text_model.eval()
+
+    return text_tokenizer, text_model
+
+
+def load_hart(args, device='cuda'):
+
+    # with autocast("cuda", dtype=torch.bfloat16, enabled=True, cache_enabled=True), torch.no_grad():
+    if args.model_type == 'hart':
+        model = AutoModel.from_pretrained(args.model_path)
+        print(f'\n[you selected HART] \
+                model size: {sum(p.numel() for p in model.parameters())/1e9:.2f}B')
+    elif args.model_type == 'fastvar_hart':
+        model = FastVAR_HART.from_pretrained(args.model_path)
+        print(f'\n[you selected FastVAR (HART)] \
+                model size: {sum(p.numel() for p in model.parameters())/1e9:.2f}B')
+    
+    model = model.to(device)
+    model.eval()
+
+    if args.use_ema:
+        ema_model = copy.deepcopy(model)
+        ema_model.load_state_dict(
+            torch.load(os.path.join(args.model_path, "ema_model.bin"))
+        )
+        print('     Use ema model.')
+
+    return model, ema_model
+
+
 def gen_one_img_hart(
     hart_test,
     use_ema,
@@ -200,6 +234,7 @@ def gen_one_img_hart(
     use_llm_system_prompt: bool = True,
     more_smooth: bool = True,
     g_seed=None,
+    test_speed=False,           # evaluate benchmark average latency
     **kwargs,
 ):
     with torch.inference_mode():
@@ -235,12 +270,16 @@ def gen_one_img_hart(
                 context_mask=context_mask,
             )
     
-    print(f"cost: {time.time() - sstt}, hart cost={time.time() - stt}, text_encoder cost={(time.time() - sstt) - (time.time() - stt)}")
+    cost, hart_cost = time.time() - sstt, time.time() - stt
+    print(f"cost: {cost}, hart cost={hart_cost}, text_encoder cost={cost - hart_cost}")
 
     sample_imgs_np = output_imgs.clone().mul_(255).cpu().numpy()
     num_imgs = sample_imgs_np.shape[0]
     assert num_imgs == 1, f'Evaluation only need 1 image, but now have {num_imgs}'
     cur_img = sample_imgs_np[0]
     cur_img = cur_img.transpose(1, 2, 0).astype(np.uint8)
+
+    if test_speed:
+        return Image.fromarray(cur_img), cost, hart_cost
 
     return Image.fromarray(cur_img)

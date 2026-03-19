@@ -1,4 +1,22 @@
 
+## VBench 环境配置
+
+- https://github.com/Vchitect/VBench
+
+```bash
+conda create -n vbench python=3.10
+# Please install PyTorch with 11.6<=CUDA<=12.1
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+
+# install detectron2 from a local clone:
+git clone https://github.com/facebookresearch/detectron2.git
+cd detectron2
+python -m pip install -e . --no-build-isolation
+
+# install vbench
+git clone https://github.com/Vchitect/VBench.git
+pip install -e . --no-build-isolation
+```
 
 
 ## Fix Seed

@@ -8,7 +8,7 @@ from typing import Union
 import pytz
 import torch
 import torch.distributed as tdist
-import torch.multiprocessing as mp
+
 
 # VAR repo
 __rank, __local_rank, __world_size, __device = 0, 0, 1, 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -46,7 +46,7 @@ def __initialize(fork=False, backend='nccl', gpu_id_if_not_distibuted=0, timeout
         mp.set_start_method(method)
     """
     tdist.init_process_group(backend=backend,
-                             device_id=torch.device(f"cuda:{local_rank}"),
+                            #  device_id=torch.device(f"cuda:{local_rank}"),    # infinitystar delete
                              timeout=datetime.timedelta(seconds=timeout_minutes*60))
     
     # ------ VAR repo ------
@@ -71,14 +71,12 @@ def get_rank():
     return __rank
 
 
-# --- Infinity repo add ---
 def get_rank_given_group(group: tdist.ProcessGroup):
     return tdist.get_rank(group=group)
 
 
 def get_rank_str_zfill():
     return __rank_str_zfill
-# -------------------------
 
 
 def get_local_rank():
@@ -94,8 +92,7 @@ def get_device():
 
 
 def set_gpu_id(gpu_id: int):
-    if gpu_id is None:
-        return
+    if gpu_id is None: return
     global __device
     if isinstance(gpu_id, (str, int)):
         torch.cuda.set_device(int(gpu_id))
@@ -112,7 +109,6 @@ def is_local_master():
     return __local_rank == 0
 
 
-# --- Infinity repo add ---
 def is_visualizer():
     return __rank == 0
     # return __rank == max(__world_size - 8, 0)
@@ -124,7 +120,6 @@ def parallelize(net, syncbn=False):
     net = net.cuda()
     net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[get_local_rank()], find_unused_parameters=False, broadcast_buffers=False)
     return net
-# -------------------------
 
 
 def new_group(ranks: List[int]):
@@ -133,13 +128,11 @@ def new_group(ranks: List[int]):
     return None
 
 
-# --- Infinity repo add ---
 def new_local_machine_group():
     if __initialized:
         cur_subgroup, subgroups = tdist.new_subgroups()
         return cur_subgroup
     return None
-# -------------------------
 
 
 def barrier():
@@ -264,7 +257,6 @@ def finalize():
         tdist.destroy_process_group()
 
 
-# --- Infinity repo add ---
 def init_distributed_mode(local_out_path, fork=False, only_sync_master=False, timeout_minutes=30):
     try:
         __initialize(fork=fork, timeout_minutes=timeout_minutes)
@@ -344,4 +336,98 @@ class BackupStreamToFile(object):
     
     def __del__(self):
         self.close()
-# --------------------------
+
+
+def distributed_gpu_warmup(
+    device,
+    rank,
+    world_size,
+    matmul_size=4096,
+    warmup_iters=10,
+    attn_warmup_iters=5,
+    dtype=torch.bfloat16,
+):
+    """
+    Distributed GPU warm-up before benchmark.
+
+    This warm-up triggers:
+      - cuBLAS / cuBLASLt GEMM
+      - Tensor Core (fp16 / bf16)
+      - autocast paths
+      - FlashAttention / SDPA kernels
+      - Triton JIT
+      - NCCL communicator initialization
+
+    Args:
+        device: torch.device("cuda:x")
+        rank: current process rank
+        world_size: total number of GPUs
+        matmul_size: GEMM matrix size (e.g., 2048 / 4096)
+        warmup_iters: number of GEMM warmup iterations
+        attn_warmup_iters: number of attention warmup iterations
+        dtype: torch.float16 or torch.bfloat16
+    """
+
+    if rank == 0:
+        print(
+            f"\n[Warmup] Distributed GPU warmup start | "
+            f"GEMM={matmul_size}x{matmul_size}, "
+            f"GEMM iters={warmup_iters}, "
+            f"ATTN iters={attn_warmup_iters}, "
+            f"dtype={dtype}"
+        )
+
+    # --------------------------------------------------
+    # 1. Ensure NCCL communicator is initialized
+    # --------------------------------------------------
+    tdist.barrier(device_ids=[device.index])
+    torch.cuda.synchronize(device)
+
+    # --------------------------------------------------
+    # 2. GEMM warmup (cuBLAS / Tensor Core)
+    # --------------------------------------------------
+    with torch.autocast("cuda", dtype=dtype, enabled=True):
+        a = torch.randn(matmul_size, matmul_size, device=device, dtype=dtype)
+        b = torch.randn(matmul_size, matmul_size, device=device, dtype=dtype)
+
+        for _ in range(warmup_iters):
+            c = torch.matmul(a, b)
+            # force materialization
+            _ = c.sum()
+
+    torch.cuda.synchronize(device)
+
+    # --------------------------------------------------
+    # 3. Attention kernel warmup (FlashAttention / SDPA)
+    # --------------------------------------------------
+    # Typical transformer-like shape:
+    #   B=8, H=32, L=1024, D=128
+    B, H, L, D = 8, 32, 1024, 128
+
+    with torch.autocast("cuda", dtype=dtype, enabled=True):
+        q = torch.randn(B, H, L, D, device=device, dtype=dtype)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+
+        for _ in range(attn_warmup_iters):
+            attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            _ = attn_out.sum()
+
+    torch.cuda.synchronize(device)
+
+    # --------------------------------------------------
+    # 4. Optional: lightweight collective to finalize NCCL
+    # --------------------------------------------------
+    # (helps avoid first-iteration comm jitter)
+    dummy = torch.tensor(1.0, device=device)
+    tdist.all_reduce(dummy, op=tdist.ReduceOp.SUM)
+
+    torch.cuda.synchronize(device)
+
+    # --------------------------------------------------
+    # 5. Final barrier to align all ranks
+    # --------------------------------------------------
+    tdist.barrier(device_ids=[device.index])
+
+    if rank == 0:
+        print("[Warmup] Distributed GPU warmup finished.\n")

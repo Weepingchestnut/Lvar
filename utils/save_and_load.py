@@ -137,3 +137,39 @@ def auto_resume(args: arg_util.Args, pattern='ckpt*.pth') -> Tuple[List[str], in
     info.append(f'[auto_resume success] resume from ep{ep}, it{it},    eval_milestone: {eval_milestone}')
 
     return info, ep, it, ckpt.get('acc_str', '[no acc str]'), eval_milestone, ckpt['trainer'], ckpt['args']
+
+
+def merge_ckpt(omnistore_ckpt_path, output_path, fsdp_save_flatten_model, save=False):
+    print(f'merging omnistore ckpt into torch-format ckpt')
+    start = time.time()
+    from omnistore.utilities.ckpt_format_tool import omnistore_ckpt_to_pytorch_ckpt
+    state_dict = omnistore_ckpt_to_pytorch_ckpt(
+        save_path=omnistore_ckpt_path,
+        output_path=output_path,
+        framework="fsdp",
+        model_only=True,
+        return_dict=True,
+        fsdp_save_flatten_model=fsdp_save_flatten_model,
+    )
+    print(f"ckpt merged in {time.time() - start:.2f} seconds")
+    state_dict_model = state_dict["model"]
+    if '.cfg_uncond' in state_dict_model:
+        state_dict_model['cfg_uncond'] = state_dict_model['.cfg_uncond']
+        del state_dict_model['.cfg_uncond']
+    if '.pos_start' in state_dict_model:
+        state_dict_model['pos_start'] = state_dict_model['.pos_start']
+        del state_dict_model['.pos_start']
+    if '.sos_token' in state_dict_model:
+        state_dict_model['sos_token'] = state_dict_model['.sos_token']
+        del state_dict_model['.sos_token']
+    if 'semantic_head.weight' in state_dict_model:
+        print(f'[rush_resume] replace semantic_head with semantic_head2')
+        state_dict_model['semantic_head2.weight'] = state_dict_model['semantic_head.weight']
+        state_dict_model['semantic_head2.bias'] = state_dict_model['semantic_head.bias']
+        del state_dict_model['semantic_head.weight']
+        del state_dict_model['semantic_head.bias']
+    if save:
+        save_file = os.path.join(output_path, "slim-model.pt")
+        print(f'save to {save_file}')
+        torch.save(state_dict_model, save_file)
+    return state_dict_model

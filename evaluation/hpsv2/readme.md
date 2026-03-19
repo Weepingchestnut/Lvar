@@ -22,6 +22,8 @@
 
 ## How to eval
 
+注意：HPSv2.1 的测试不需要单独配置一个虚拟环境，直接在支持 infinity 系列模型推理的虚拟环境中安装即可
+
 ```python
 pip install hpsv2
 pip install -U diffusers
@@ -33,7 +35,7 @@ wget https://dl.fbaipublicfiles.com/mmf/clip/bpe_simple_vocab_16e6.txt.gz
 mv bpe_simple_vocab_16e6.txt.gz ~/anaconda3/envs/{your_vir-env_name}/lib/{python3.11}/site-packages/hpsv2/src/open_clip
 ```
 
-由于需要从Huggingface中下载文件，因此需先设置好 `tools/conf.py` 中的huggingface token。
+<!-- 由于需要从Huggingface中下载文件，因此需先设置好 `tools/conf.py` 中的huggingface token。 -->
 
 运行脚本
 ```shell

@@ -1,10 +1,11 @@
 # torch~=2.6.0
 clean-fid
 clip_benchmark
-Pillow
-psutil
+decord
+einops
 httpx
 huggingface_hub
+imageio
 lightning-fabric
 matplotlib
 ninja
@@ -12,10 +13,13 @@ numpy
 nvidia-ml-py
 openai
 opencv-python
+Pillow
+psutil
+pytest
 pytorch_lightning
 pytz
 seaborn
-transformers
+transformers==4.57.6
 tabulate
 typed-argument-parser
 # tensorflow-io

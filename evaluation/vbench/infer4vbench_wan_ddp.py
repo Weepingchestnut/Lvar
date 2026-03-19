@@ -3,102 +3,94 @@ import hashlib
 import json
 import os
 import os.path as osp
-import random
-import sys
 import time
 from typing import List
 
-import cv2
 import numpy as np
 import torch
 import torch.distributed as tdist
-from PIL import Image
+from diffusers import AutoencoderKLWan, AutoModel, WanPipeline
+from diffusers.schedulers.scheduling_unipc_multistep import \
+    UniPCMultistepScheduler
+from diffusers.utils import export_to_video
 from tqdm import tqdm
+from transformers import UMT5EncoderModel
 
-sys.path.append(osp.dirname(osp.dirname(__file__)))
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+from utils.arg_util_video import Args
 
-from models.infinitystar.self_correction import SelfCorrection
-from models.schedules import get_encode_decode_func
-from models.schedules.dynamic_resolution import (
-    get_dynamic_resolution_meta, get_first_full_spatial_size_scale_index)
-from tools.run_infinity import (InferencePipe, gen_one_video, 
-                                save_video, transform)
-from utils.arg_util_video import InferArgs
+
+class InferArgs(Args):
+    
+    model_type: str = 'Wan-AI/Wan2.1-T2V-1.3B-Diffusers'    # Available models: Wan-AI/Wan2.1-T2V-14B-Diffusers, Wan-AI/Wan2.1-T2V-1.3B-Diffusers
+    resolution: str = '480p'
+    res_dict: dict = {
+        '480p': {'height': 480, 'width': 832},
+        '720p': {'height': 720, 'width': 1280}
+    }
+    fps: int = 16
+    generation_duration: int = 5
+    video_frames: int = generation_duration * fps + 1       # default 81 frames --> 5s video
+    
+    cfg: float = 5.0                # for WAN2.1
+    diff_steps: int = 50
+    if resolution == '480p':        # 5.0 for 720P, 3.0 for 480P
+        flow_shift: float = 3.0
+    else:
+        flow_shift: float = 5.0
+    
+    # For optimal performance, enabling the prompt rewriter is recommended.
+    # To utilize the GPT model, ensure the following environment variables are set:
+    # export OPEN_API_KEY="YOUR_API_KEY"
+    # export GLOBAL_AZURE_ENDPOINT="YOUR_ENDPOINT"
+    # *--> use official rewrite VBench_rewrited_prompt.json
+    enable_rewriter: int = 0
+    
+    # -------- VBench Setting --------
+    prompt_json: str = 'evaluation/vbench/VBench_rewrited_prompt_fixed_seed.json'
+    output_root: str = f'work_dir/evaluation/vbench/{model_type.split("/")[-1]}_480p_81frames'
+    start_index: int = 0
+    end_index: int = -1
+    num_samples_per_prompt: int = 5
+    seed: int = 41
+    # only test the specified dimension, if empty list [], test all dims
+    target_dimensions: List[str] = [
+        # 'human_action',
+        # 'scene',
+        # 'multiple_objects',
+        # 'appearance_style',
+    ]
 
 
 def perform_inference(pipe, data, args):
     
     prompt = data["prompt"]
     seed = data["seed"]
-    mapped_duration=args.generation_duration    # default: 5 seconds
-    num_frames=args.video_frames                # default: 81 frames
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    num_frames=args.video_frames
+    resolution = args.res_dict[args.resolution]
 
-    # If an image_path is provided, perform image-to-video generation.
-    image_path = data.get("image_path", None)
-
-    dynamic_resolution_h_w, h_div_w_templates = get_dynamic_resolution_meta(args.dynamic_scale_schedule, args.video_frames)
-    h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w_templates-0.571))]
-    scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['pt2scale_schedule'][(num_frames-1)//4+1]
-    args.first_full_spatial_size_scale_index = get_first_full_spatial_size_scale_index(scale_schedule)
-    args.tower_split_index = args.first_full_spatial_size_scale_index + 1
-    context_info = pipe.get_scale_pack_info(scale_schedule, args.first_full_spatial_size_scale_index, args)    
-    scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['pt2scale_schedule'][(num_frames-1)//4+1]
-    tau = [args.tau_image] * args.tower_split_index + [args.tau_video] * (len(scale_schedule) - args.tower_split_index)
-    tgt_h, tgt_w = scale_schedule[-1][1] * 16, scale_schedule[-1][2] * 16
-    gt_leak, gt_ls_Bl = -1, None
-
-    if image_path is not None:
-        ref_image = [cv2.imread(image_path)[:,:,::-1]]
-        ref_img_T3HW = [transform(Image.fromarray(frame).convert("RGB"), tgt_h, tgt_w) for frame in ref_image]
-        ref_img_T3HW = torch.stack(ref_img_T3HW, 0) # [t,3,h,w]
-        ref_img_bcthw = ref_img_T3HW.permute(1,0,2,3).unsqueeze(0) # [c,t,h,w] -> [b,c,t,h,w]
-        _, _, gt_ls_Bl, _, _, _ = pipe.video_encode(pipe.vae, ref_img_bcthw.cuda(), vae_features=None, self_correction=pipe.self_correction, args=args, infer_mode=True, dynamic_resolution_h_w=dynamic_resolution_h_w)
-        gt_leak=len(scale_schedule)//2
-
-    generated_image_list = []
-    negative_prompt=''
-    if args.append_enlarge2captain:
-        prompt = f'{prompt}, Close-up on big objects, emphasize scale and detail'       # 特写大型物体，突出尺寸与细节
-    if args.append_duration2caption:
-        prompt = f'<<<t={mapped_duration}s>>>' + prompt
+    negative_prompt = """
+    Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality,
+    low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured,
+    misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards
+    """
     
     start_time = time.time()
-    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=True, cache_enabled=True), torch.no_grad():
-        generated_image, _ = gen_one_video(
-            pipe.infinity,
-            pipe.vae,
-            pipe.text_tokenizer,
-            pipe.text_encoder,
-            prompt,
-            negative_prompt=negative_prompt,
-            g_seed=seed,
-            gt_leak=gt_leak,
-            gt_ls_Bl=gt_ls_Bl,
-            cfg_list=args.cfg, 
-            tau_list=tau,
-            scale_schedule=scale_schedule,
-            cfg_insertion_layer=[0],
-            vae_type=args.vae_type,
-            sampling_per_bits=1,
-            enable_positive_prompt=0,
-            low_vram_mode=True,
-            args=args,
-            get_visual_rope_embeds=pipe.get_visual_rope_embeds,
-            context_info=context_info,
-            noise_list=None,
-        )
-        if len(generated_image.shape) == 3:
-            generated_image = generated_image.unsqueeze(0)
-        print(generated_image.shape)
-        generated_image_list.append(generated_image)
-            
-    generated_image = torch.cat(generated_image_list, 2)
+    output = pipe(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        height=resolution['height'],
+        width=resolution['width'],
+        num_frames=num_frames,
+        guidance_scale=args.cfg,
+        num_inference_steps=args.diff_steps,
+        generator=generator
+    ).frames[0]
     end_time = time.time()
-    elapsed_time = end_time - start_time    
+    elapsed_time = end_time - start_time
     
     return {
-        "output": generated_image.cpu().numpy(),
+        "output": output,
         "elapsed_time": elapsed_time,
     }
 
@@ -117,7 +109,7 @@ def load_vbench_prompts(prompt_json_path):
 
 def main():
     args = InferArgs().parse_args()
-    
+
     # *Initialize distributed process group
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
@@ -131,10 +123,33 @@ def main():
     rank = tdist.get_rank()
     world_size = tdist.get_world_size()
 
-    # load models
+    # ------ load HF WAN models ------
     print(f"[Rank {rank}] Loading models on device {device}...")
-    pipe = InferencePipe(args, device)
+
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        args.model_type, subfolder="text_encoder", torch_dtype=torch.bfloat16)
+    vae = AutoencoderKLWan.from_pretrained(
+        args.model_type, subfolder="vae", torch_dtype=torch.float32)
+    transformer = AutoModel.from_pretrained(
+        args.model_type, subfolder="transformer", torch_dtype=torch.bfloat16)
+    
+    pipe = WanPipeline.from_pretrained(
+        args.model_type,
+        text_encoder=text_encoder,
+        vae=vae,
+        transformer=transformer,
+        torch_dtype=torch.bfloat16
+    )
+    # 调整调度器：WAN官方推荐使用 UniPCMultistepScheduler
+    scheduler = UniPCMultistepScheduler.from_config(
+        pipe.scheduler.config,
+        flow_shift=args.flow_shift,
+    )
+    pipe.scheduler = scheduler
+    pipe.to(device)
+
     tdist.barrier(device_ids=[local_rank])      # wait all processes have loaded the model
+    # --------------------------------
 
     # load vbench prompts
     all_vbench_items = load_vbench_prompts(args.prompt_json)
@@ -198,7 +213,8 @@ def main():
             n_samples = args.num_samples_per_prompt
         
         # use refined_prompt, if None then use prompt_en
-        prompt = item.get("refined_prompt") or item.get("prompt_en")
+        # prompt = item.get("refined_prompt") or item.get("prompt_en")
+        prompt = item.get("prompt_en")
         prompt_en = item.get("prompt_en")   # for video name like $prompt-$index.mp4
         prompt_seed = item.get("seed")
         if prompt is None:
@@ -207,7 +223,7 @@ def main():
         # clean name
         # prompt_en = sanitize_filename(prompt_en)[:100] 
         
-        # Compute refined_prompt hash --> for prompt_en same but refined_prompt different
+        # *Compute refined_prompt hash --> for prompt_en same but refined_prompt different !!!
         prompt_hash = hashlib.md5(prompt.encode('utf-8')).hexdigest()[:6]
 
         for sample_idx in range(n_samples):
@@ -235,13 +251,13 @@ def main():
             else:
                 try:
                     output_dict = perform_inference(pipe, data, args)
-                    video_np = output_dict["output"]  # [bs, t, h, w, 3] in uint8
+                    video = output_dict["output"]
                     
                     local_num_videos += 1
                     if local_num_videos > local_warmup_videos:
                         local_total_latency += output_dict['elapsed_time']
                     
-                    save_video(video_np, fps=args.fps, save_filepath=save_path)
+                    export_to_video(video, save_path, fps=args.fps)
                     # print(f"[Rank {rank}] Video genernation done: {save_path=}\n")
                 
                 except Exception as e:
@@ -311,3 +327,13 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+    # --- download HF weights ---
+    # text_encoder = UMT5EncoderModel.from_pretrained("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", subfolder="text_encoder", torch_dtype=torch.bfloat16)
+    # vae = AutoModel.from_pretrained("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", subfolder="vae", torch_dtype=torch.float32)
+    # transformer = AutoModel.from_pretrained("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", subfolder="transformer", torch_dtype=torch.bfloat16)
+
+    # text_encoder = UMT5EncoderModel.from_pretrained("Wan-AI/Wan2.1-T2V-14B-Diffusers", subfolder="text_encoder", torch_dtype=torch.bfloat16)
+    # vae = AutoModel.from_pretrained("Wan-AI/Wan2.1-T2V-14B-Diffusers", subfolder="vae", torch_dtype=torch.float32)
+    # transformer = AutoModel.from_pretrained("Wan-AI/Wan2.1-T2V-14B-Diffusers", subfolder="transformer", torch_dtype=torch.bfloat16)
+

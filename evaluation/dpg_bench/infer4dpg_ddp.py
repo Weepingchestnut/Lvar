@@ -1,5 +1,4 @@
 import argparse
-import copy
 
 import cv2
 import numpy as np
@@ -8,10 +7,8 @@ import torch.distributed as tdist
 from lightning_fabric import seed_everything
 from PIL import Image
 from tqdm import trange
-from transformers import AutoModel
 
-from models.hart.hart_transformer_t2i import HARTForT2I
-from tools.run_hart import gen_one_img_hart
+from tools.run_hart import gen_one_img_hart, load_hart, load_hart_tokenizer
 from tools.run_infinity import *
 
 
@@ -128,16 +125,9 @@ def main():
     elif 'hart' in args.model_type:
         print(f"[Rank {rank}] Loading HART model...")
         # load text encoder
-        text_tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_ckpt)
-        text_encoder = AutoModel.from_pretrained(args.text_encoder_ckpt).to(device)
-        text_encoder.eval()
+        text_tokenizer, text_encoder = load_hart_tokenizer(args, device)
         # load hart
-        hart = AutoModel.from_pretrained(args.model_path)
-        hart = hart.to(device)
-        hart.eval()
-        if args.use_ema:
-            ema_hart = copy.deepcopy(hart)
-            ema_hart.load_state_dict(torch.load(os.path.join(args.model_path, "ema_model.bin")))
+        hart, ema_hart = load_hart(args, device)
 
     # Create main output directory and synchronize
     if rank == 0:
@@ -210,11 +200,16 @@ def main():
                     )
             # ------------ HART ------------
             elif 'hart' in args.model_type:
-                image = gen_one_img_hart(
+                image, total_cost, hart_cost = gen_one_img_hart(
                     hart, args.use_ema, ema_hart, text_tokenizer, text_encoder,
                     prompt, cfg, args.max_token_length, args.use_llm_system_prompt,
                     args.more_smooth,
+                    test_speed=True
                 )
+                local_num_images += 1
+                if local_num_images > local_warmup_images:
+                    local_total_latency += total_cost
+                    local_infinity_latency += hart_cost
             else:
                 raise ValueError
             t2 = time.time()
@@ -226,7 +221,10 @@ def main():
             print(f"GPU allocated before/after: {alloc_before_gen:.1f} MB -> {alloc_after_gen:.1f} MB (delta {alloc_after_gen - alloc_before_gen:+.1f} MB)")
             print(f"GPU peak allocated during gen: {peak_alloc_gen:.1f} MB (delta {peak_alloc_gen - alloc_before_gen:+.1f} MB)")
             print("=======================================================================\n")
-            images.append(image.cpu().numpy())
+            if 'infinity' in args.model_type:
+                images.append(image.cpu().numpy())
+            else:
+                images.append(image)
 
         # Image gridding and saving
         if len(images) == args.n_samples:

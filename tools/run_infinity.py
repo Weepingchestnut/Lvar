@@ -170,7 +170,7 @@ def gen_one_img(
         )
     cost, infinity_cost = time.time() - sstt, time.time() - stt
     # print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
-    print(f"cost: {cost}, infinity cost={infinity_cost}")
+    print(f"cost: {cost}, infinity cost={infinity_cost}, text_encoder cost={cost - infinity_cost}")
     
     if batch == 1: img = img_list[0]
     else: pass      # TODO: batch test
@@ -655,20 +655,20 @@ def load_transformer(vae, args, load_weights=True):
     elif args.model_type == 'skipvar_infinity_8b':
         kwargs_model = dict(depth=40, embed_dim=3584, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8,
                             skipvar=True)
-    # --- add SparseVAR1 (ICCV'2025) ---
+    # --- add SparseVAR (ICCV'2025) ---
     elif args.model_type == 'sparsevar_infinity_2b':
         kwargs_model = dict(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8,
-                            sparsevar1=True)
+                            sparsevar=True)
     elif args.model_type == 'sparsevar_infinity_8b':
         kwargs_model = dict(depth=40, embed_dim=3584, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8,
-                            sparsevar1=True)
-    # --- add SparseVAR ---
+                            sparsevar=True)
+    # --- add SparVAR ---
     elif args.model_type == 'sparvar_infinity_2b':
         kwargs_model = dict(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8,
-                            sparsevar=True)
+                            sparvar=True)
     elif args.model_type == 'sparvar_infinity_8b':
         kwargs_model = dict(depth=40, embed_dim=3584, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8,
-                            sparsevar=True)
+                            sparvar=True)
     
     infinity = load_infinity(
         rope2d_each_sa_layer=args.rope2d_each_sa_layer, 
@@ -766,21 +766,37 @@ def load_video_transformer(vae, args):
 
 
 def add_common_arguments(parser):
-    parser.add_argument('--cfg', type=str, default='3')
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument(
+        '--cfg',
+        type=str,
+        help="Classifier-free guidance scale.",
+        default='3')
     parser.add_argument('--tau', type=float, default=1)
+
+    parser.add_argument('--model_type', type=str, default='infinity_2b')
+    parser.add_argument(
+        '--model_path',
+        type=str,
+        help="The path to Infinity / HART model.",
+        default='pretrained_models/infinity/Infinity/infinity_2b_reg.pth')
+    parser.add_argument(
+        '--text_encoder_ckpt',
+        type=str,
+        help="The path to text model, Infinity --> Flan-t5-xl, HART --> Qwen2-VL-1.5B-Instruct by default.",
+        default='pretrained_models/infinity/flan-t5-xl')
+
+    # ------ Infinity ------
     parser.add_argument('--pn', type=str, default='1M', choices=['0.06M', '0.25M', '1M'])
-    parser.add_argument('--model_path', type=str, default='pretrained_models/infinity/Infinity/infinity_2b_reg.pth')
     parser.add_argument('--cfg_insertion_layer', type=int, default=0)
     parser.add_argument('--vae_type', type=int, default=32)
     parser.add_argument('--vae_path', type=str, default='pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth')
     parser.add_argument('--add_lvl_embeding_only_first_block', type=int, default=1, choices=[0,1])
     parser.add_argument('--use_bit_label', type=int, default=1, choices=[0,1])
-    parser.add_argument('--model_type', type=str, default='infinity_2b')
     parser.add_argument('--rope2d_each_sa_layer', type=int, default=1, choices=[0,1])
     parser.add_argument('--rope2d_normalized_by_hw', type=int, default=2, choices=[0,1,2])
     parser.add_argument('--use_scale_schedule_embedding', type=int, default=0, choices=[0,1])
     parser.add_argument('--sampling_per_bits', type=int, default=1, choices=[1,2,4,8,16])
-    parser.add_argument('--text_encoder_ckpt', type=str, default='pretrained_models/infinity/flan-t5-xl')
     parser.add_argument('--text_channels', type=int, default=2048)
     parser.add_argument('--apply_spatial_patchify', type=int, default=0, choices=[0,1])
     parser.add_argument('--h_div_w_template', type=float, default=1.000)
@@ -789,12 +805,23 @@ def add_common_arguments(parser):
     parser.add_argument('--cache_dir', type=str, default='/dev/shm')
     parser.add_argument('--enable_model_cache', type=int, default=0, choices=[0,1])
     parser.add_argument('--checkpoint_type', type=str, default='torch')
-    parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--bf16', type=int, default=1, choices=[0,1])
+
+    # ------ HART ------
+    parser.add_argument("--use_ema", type=bool, default=True)
+    parser.add_argument("--max_token_length", type=int, default=300)
+    parser.add_argument("--use_llm_system_prompt", type=bool, default=True)
+    parser.add_argument(
+        "--more_smooth",
+        type=bool,
+        help="Turn on for more visually smooth samples.",
+        default=True)
+    
     # ------ FastVAR ------
     parser.add_argument('--cached_scale', type=int, default=8)
     # parser.add_argument("--prune_ratio", nargs='+', type=float, default=[0.4, 0.5], help="Pruning ratio for last 2 scales in FastVAR")
     parser.add_argument("--prune_ratio", type=str, default="0.4,0.5", help="Pruning ratio for last 2 scales in FastVAR")
+    
     # ------ SparseVAR ------
     parser.add_argument("--compress_method", type=str, help="compress method", default="sparsevar")
     parser.add_argument("--compress_ratio", type=float, help="compress ratio", default=0.6)
@@ -802,11 +829,7 @@ def add_common_arguments(parser):
     parser.add_argument("--start_prune_stage", type=int, default=10)
     parser.add_argument("--specific_mse_layer", type=int, default=3)
     parser.add_argument("--local_window_size", type=int, default=4)
-    # ------ HART ------
-    parser.add_argument("--use_ema", type=bool, default=True)
-    parser.add_argument("--max_token_length", type=int, default=300)
-    parser.add_argument("--use_llm_system_prompt", type=bool, default=True)
-    parser.add_argument("--more_smooth", type=bool, help="Turn on for more visually smooth samples.", default=True)
+    
     # ------ exp params ------
     # parser.add_argument('--freeze_kv_cache_last_n_scales', type=int, default=4)
     parser.add_argument('--attn_sink_scales', type=int, default=5, help='Sink the attention maps of the last few scales')

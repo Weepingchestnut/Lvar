@@ -1,5 +1,4 @@
 import argparse
-import copy
 import json
 import os
 import time
@@ -9,11 +8,9 @@ import torch
 import torch.distributed as tdist
 from pytorch_lightning import seed_everything
 from tqdm import trange
-from transformers import AutoModel
 
-from models.hart.hart_transformer_t2i import HARTForT2I
 from tools.conf import HF_HOME, HF_TOKEN
-from tools.run_hart import gen_one_img_hart
+from tools.run_hart import gen_one_img_hart, load_hart, load_hart_tokenizer
 from tools.run_infinity import *
 
 # set environment variables
@@ -105,20 +102,13 @@ def main():
     elif 'hart' in args.model_type:
         print(f"[Rank {rank}] Loading HART model...")
         # load text encoder
-        text_tokenizer = AutoTokenizer.from_pretrained(args.text_encoder_ckpt)
-        text_encoder = AutoModel.from_pretrained(args.text_encoder_ckpt).to(device)
-        text_encoder.eval()
+        text_tokenizer, text_encoder = load_hart_tokenizer(args, device)
         # load hart
-        hart = AutoModel.from_pretrained(args.model_path)
-        hart = hart.to(device)
-        hart.eval()
-        if args.use_ema:
-            ema_hart = copy.deepcopy(hart)
-            ema_hart.load_state_dict(torch.load(os.path.join(args.model_path, "ema_model.bin")))
+        hart, ema_hart = load_hart(args, device)
 
-        if args.rewrite_prompt:
-            from tools.prompt_rewriter import PromptRewriter
-            prompt_rewriter = PromptRewriter(system='', few_shot_history=[])
+    if args.rewrite_prompt:
+        from tools.prompt_rewriter import PromptRewriter
+        prompt_rewriter = PromptRewriter(system='', few_shot_history=[])
     
     # Use barrier to sync before any process starts writing files
     tdist.barrier(device_ids=[local_rank])
@@ -235,11 +225,16 @@ def main():
                     )
             # ------------ HART ------------
             elif 'hart' in args.model_type:
-                image = gen_one_img_hart(
+                image, total_cost, hart_cost = gen_one_img_hart(
                     hart, args.use_ema, ema_hart, text_tokenizer, text_encoder,
                     prompt, cfg, args.max_token_length, args.use_llm_system_prompt,
                     args.more_smooth,
+                    test_speed=True
                 )
+                local_num_images += 1
+                if local_num_images > local_warmup_images:
+                    local_total_latency += total_cost
+                    local_infinity_latency += hart_cost
             else:
                 raise ValueError
             t2 = time.time()
