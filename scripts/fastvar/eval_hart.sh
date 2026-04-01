@@ -1,0 +1,211 @@
+#!/bin/bash
+
+infer_eval_image_reward() {
+    # --- step 1, infer images ---
+    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/image_reward/infer4reward_ddp.py \
+        --model_path ${hart_model_path} \
+        --model_type ${model_type} \
+        --use_ema ${use_ema} \
+        --max_token_length ${max_token_length} \
+        --use_llm_system_prompt ${use_llm_system_prompt} \
+        --cfg ${cfg} \
+        --more_smooth ${more_smooth} \
+        --text_encoder_ckpt ${text_encoder_ckpt} \
+        --outdir ${out_dir} \
+        --skip_last_scales ${skip_last_scales} \
+        2>&1 | tee ${out_dir}/eval_image-reward.log
+
+    # --- step 2, compute image reward ---
+    source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
+    conda activate modelscope                         # Requires Flash-Attention version >=2.7.1,<=2.8.0
+
+    python evaluation/image_reward/cal_imagereward.py \
+        --meta_file ${out_dir}/metadata.jsonl 2>&1 | tee ${out_dir}/cal_image_reward.log
+    
+    conda deactivate
+}
+
+infer_eval_hpsv21() {
+    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/hpsv2/infer4hpsv2_ddp.py \
+        --model_path ${hart_model_path} \
+        --model_type ${model_type} \
+        --use_ema ${use_ema} \
+        --max_token_length ${max_token_length} \
+        --use_llm_system_prompt ${use_llm_system_prompt} \
+        --cfg ${cfg} \
+        --more_smooth ${more_smooth} \
+        --text_encoder_ckpt ${text_encoder_ckpt} \
+        --outdir ${out_dir}/images \
+        --skip_last_scales ${skip_last_scales} \
+        2>&1 | tee ${out_dir}/eval_hpsv2.log
+}
+
+test_gen_eval() {
+    # --- run inference ---
+    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/gen_eval/infer4eval_ddp.py \
+        --model_path ${hart_model_path} \
+        --model_type ${model_type} \
+        --use_ema ${use_ema} \
+        --max_token_length ${max_token_length} \
+        --use_llm_system_prompt ${use_llm_system_prompt} \
+        --cfg ${cfg} \
+        --more_smooth ${more_smooth} \
+        --text_encoder_ckpt ${text_encoder_ckpt} \
+        --outdir ${out_dir}/images \
+        --rewrite_prompt ${rewrite_prompt} \
+        --skip_last_scales ${skip_last_scales} \
+        2>&1 | tee ${out_dir}/eval_gen-eval.log
+
+    # --- detect objects ---
+    source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
+    conda activate modelscope
+
+    python evaluation/gen_eval/evaluate_images.py ${out_dir}/images \
+        --outfile ${out_dir}/results/det.jsonl \
+        --model-config evaluation/gen_eval/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py \
+        --model-path pretrained_models/mask2former
+
+    # --- accumulate results ---
+    python evaluation/gen_eval/summary_scores.py ${out_dir}/results/det.jsonl > ${out_dir}/results/res.txt
+    cat ${out_dir}/results/res.txt
+
+    conda deactivate
+
+    # --- low-level matrics ---
+    python tools/compute_metrics.py \
+        --is_gt \
+        --input_root_preds ${out_dir}/images \
+        --input_root_gts ${gen_eval_gts}/images \
+        2>&1 | tee ${out_dir}/gen_eval_low-level_metrics.log
+}
+
+test_dpg_bench() {
+    # --- run inference ---
+    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/dpg_bench/infer4dpg_ddp.py \
+        --model_path ${hart_model_path} \
+        --model_type ${model_type} \
+        --use_ema ${use_ema} \
+        --max_token_length ${max_token_length} \
+        --use_llm_system_prompt ${use_llm_system_prompt} \
+        --cfg ${cfg} \
+        --more_smooth ${more_smooth} \
+        --text_encoder_ckpt ${text_encoder_ckpt} \
+        --outdir ${out_dir}/images \
+        --skip_last_scales ${skip_last_scales} \
+        2>&1 | tee ${out_dir}/eval_dpg-bench.log
+    
+    # --- calculate metrics ---
+    source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
+    conda activate modelscope
+
+    IMAGE_ROOT_PATH=${out_dir}/images
+    RESOLUTION=1024
+    PIC_NUM=${PIC_NUM:-4}
+    PROCESSES=${PROCESSES:-${gpu_num}}   # default GPU number
+    PORT=${PORT:-${master_port}}
+
+    export MODELSCOPE_CACHE="./pretrained_models/.modelscope_cache"
+    # mkdir -p $MODELSCOPE_CACHE
+
+    accelerate launch --num_machines 1 --num_processes $PROCESSES --multi_gpu --mixed_precision "fp16" --main_process_port $PORT \
+        evaluation/dpg_bench/compute_dpg_bench.py \
+        --image-root-path $IMAGE_ROOT_PATH \
+        --resolution $RESOLUTION \
+        --pic-num $PIC_NUM \
+        --vqa-model mplug 2>&1 | tee ${out_dir}/matrics_dpg-bench.log
+
+    conda deactivate
+}
+
+latency_profile() {
+    # --- run inference ---
+    # single GPU
+    python tools/latency_profile_hart.py \
+        --model_type ${model_type} \
+        --model_path ${hart_model_path} \
+        --text_encoder_ckpt ${text_encoder_ckpt} \
+        --use_ema ${use_ema} \
+        --max_token_length ${max_token_length} \
+        --use_llm_system_prompt ${use_llm_system_prompt} \
+        --cfg ${cfg} \
+        --more_smooth ${more_smooth} \
+        --batch_size ${batch_size} \
+        2>&1 | tee ${out_dir}/infer_profile_batch-${batch_size}.log
+}
+
+# set arguments for inference
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+gpu_num=4               # mutil GPUs (also support 1 GPU)
+master_port=29501
+skip_last_scales=0
+
+model_type=fastvar_hart
+model_exp=${model_type}
+
+hart_model_path=pretrained_models/hart/hart-0.7b-1024px/llm
+text_encoder_ckpt=pretrained_models/hart/Qwen2-VL-1.5B-Instruct
+use_ema=true
+cfg=4.5
+max_token_length=300
+use_llm_system_prompt=true
+more_smooth=true
+gen_eval_gts=work_dir/evaluation/gen_eval/hart/gen_eval_cfg4.5_rewrite_prompt1_round2_real_rewrite
+
+sub_fix=cfg${cfg}
+
+
+# ------ Performance ------
+out_dir_root=work_dir/infer_profile/${model_exp}
+out_dir=${out_dir_root}/latency-profile_${sub_fix}
+mkdir -p ${out_dir}
+
+batch_size=1
+latency_profile
+
+# batch_size=2
+# latency_profile
+
+# batch_size=4
+# latency_profile
+
+# batch_size=8
+# latency_profile
+
+# sleep 10
+
+
+# ------ GenEval ------
+out_dir_root=work_dir/evaluation/gen_eval/${model_exp}
+rewrite_prompt=1    # default: 1, load prompt_rewrite_cache.json, from https://github.com/user-attachments/files/18260941/prompt_rewrite_cache.json
+out_dir=${out_dir_root}/gen_eval_${sub_fix}_rewrite_prompt${rewrite_prompt}_round2_real_rewrite
+mkdir -p ${out_dir}
+
+test_gen_eval
+sleep 10
+
+
+# ------ DPG-Bench ------
+out_dir_root=work_dir/evaluation/dpg-bench/${model_exp}
+out_dir=${out_dir_root}/dpg-bench_${sub_fix}
+mkdir -p ${out_dir}
+
+test_dpg_bench
+sleep 10
+
+
+# ------ HPS v2.1 ------
+out_dir_root=work_dir/evaluation/hpsv2/${model_exp}
+out_dir=${out_dir_root}/hpsv21_${sub_fix}
+mkdir -p ${out_dir}
+
+infer_eval_hpsv21
+sleep 10
+
+
+# ------ ImageReward ------
+out_dir_root=work_dir/evaluation/image_reward/${model_exp}
+out_dir=${out_dir_root}/image_reward_${sub_fix}
+mkdir -p ${out_dir}
+
+infer_eval_image_reward
+sleep 10

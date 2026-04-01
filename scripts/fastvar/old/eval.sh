@@ -33,7 +33,7 @@ infer_eval_image_reward() {
 
     # --- step 2, compute image reward ---
     source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
-    conda activate torch260                         # Requires Flash-Attention version >=2.7.1,<=2.8.0
+    conda activate modelscope                         # Requires Flash-Attention version >=2.7.1,<=2.8.0
 
     python evaluation/image_reward/cal_imagereward.py \
         --meta_file ${out_dir}/metadata.jsonl 2>&1 | tee ${out_dir}/cal_image_reward.log
