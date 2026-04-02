@@ -129,7 +129,9 @@ def main(args):
             peak_nvsmi_gpu_mem = post_nvsmi_gpu
             # ------------------------------------------------
             
-            # warmup
+            ###################
+            #* warmup
+            ###################
             print(f"\nStarting GPU warm-up for {args.warmup_iter} iterations...")
             for _ in tqdm(range(args.warmup_iter)):
                 prompts = random.sample(default_prompts, args.batch_size)
@@ -164,7 +166,9 @@ def main(args):
             torch.cuda.synchronize(device=device)
             print("GPU warm-up finished.")
             
-            # latency profile
+            ###################
+            #* latency profile
+            ###################
             print(f"\nStarting inference speed test for {args.profile_iter} iterations...")
             timings = []
             sstart_time = time.time()

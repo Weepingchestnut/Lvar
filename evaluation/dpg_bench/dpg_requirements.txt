@@ -22,7 +22,8 @@ urllib3>=1.26
 accelerate
 cloudpickle
 decord>=0.6.0
-diffusers>=0.25.0
+# diffusers>=0.25.0
+diffusers==0.30
 ftfy>=6.0.3
 # 0.12.1 has issue of No such file or directory: 'fairseq/version.txt'
 # 0.12.2 not support py311
@@ -47,9 +48,12 @@ safetensors
 soundfile
 taming-transformers-rom1504
 timm
-tokenizers
+# 0.13.3 is for ImageReward
+tokenizers==0.13.3
 torchvision
-transformers>=4.27.1
+# transformers>=4.27.1
+# --> for ImageReward
+transformers==4.27.4
 # triton==2.0.0.dev20221120
 unicodedata2
 zhconv

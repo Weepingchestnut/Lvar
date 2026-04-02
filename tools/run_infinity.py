@@ -5,6 +5,11 @@ import os
 
 import imageio
 from timm import create_model
+
+from models.infinitystar.self_correction import SelfCorrection
+from models.schedules import get_encode_decode_func
+from tools.prompt_rewriter import _init_prompt_rewriter
+from utils.load import load_video_visual_tokenizer
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import os.path as osp
 
@@ -72,20 +77,26 @@ def encode_prompt(text_tokenizer, text_encoder, prompt: Union[str, List[str]], e
 def encode_video_prompt(t5_path, text_tokenizer, text_encoder, prompt, enable_positive_prompt=False, low_vram_mode=False):
     if enable_positive_prompt:
         pass
-    print(f'prompt={prompt}')
-    captions = [prompt]
+    
+    if isinstance(prompt, str):
+        print(f'\nprompt={prompt}')
+        captions = [prompt]
+    else:
+        print(f'\nprompt={prompt}')
+        captions = prompt
+    
     if 'flan-t5' in t5_path:
         tokens = text_tokenizer(text=captions, max_length=512, padding='max_length', truncation=True, return_tensors='pt')
-        input_ids = tokens.input_ids.cuda(non_blocking=True)
-        mask = tokens.attention_mask.cuda(non_blocking=True)
-        text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
-        lens: List[int] = mask.sum(dim=-1).tolist()
+        input_ids = tokens.input_ids.cuda(non_blocking=True)    # [1, 512]
+        mask = tokens.attention_mask.cuda(non_blocking=True)    # [1, 512]
+        text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()     # [1, 512, dims(2048)]
+        lens: List[int] = mask.sum(dim=-1).tolist()             # [text_len], e.g. [121]
         cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
         Ltext = max(lens)    
         kv_compact = []
         for len_i, feat_i in zip(lens, text_features.unbind(0)):
             kv_compact.append(feat_i[:len_i])
-        kv_compact = torch.cat(kv_compact, dim=0)
+        kv_compact = torch.cat(kv_compact, dim=0)               # [text_len, dims]
         text_cond_tuple = (kv_compact, lens, cu_seqlens_k, Ltext)
     else:
         text_features = text_encoder(captions, 'cuda')
@@ -763,6 +774,25 @@ def load_video_transformer(vae, args):
         infinity_test.rng = torch.Generator(device=device)
     
     return infinity_test
+
+
+class InferencePipe:
+    def __init__(self, args, device='cuda'):
+        # load text encoder
+        self.text_tokenizer, self.text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt)
+        # load vae
+        self.vae = load_video_visual_tokenizer(args)
+        self.vae = self.vae.float().to(device)
+        # load infinity
+        self.infinity = load_video_transformer(self.vae, args)
+        self.self_correction = SelfCorrection(self.vae, args)
+        
+        self._models = [self.text_tokenizer, self.text_encoder, self.vae, self.infinity, self.self_correction]
+
+        self.video_encode, self.video_decode, self.get_visual_rope_embeds, self.get_scale_pack_info = get_encode_decode_func(args.dynamic_scale_schedule)
+
+        if args.enable_rewriter:
+            self.gpt_model, self.system_prompt = _init_prompt_rewriter()
 
 
 def add_common_arguments(parser):

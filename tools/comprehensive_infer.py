@@ -182,8 +182,11 @@ if __name__ == '__main__':
     if args.out_dir:
         out_dir = args.out_dir
     else:
-        out_dir = osp.join('output', osp.basename(osp.dirname(args.model_path)), osp.splitext(osp.basename(args.model_path))[0], 
-                           f'coco30k_infer' if args.coco30k_prompts else 'comprehensive_infer')
+        out_dir = osp.join(
+            'output', osp.basename(osp.dirname(args.model_path)), 
+            osp.splitext(osp.basename(args.model_path))[0], 
+            f'coco30k_infer' if args.coco30k_prompts else 'comprehensive_infer'
+        )
     print(f'save to {out_dir}')
 
     # load text encoder
@@ -208,7 +211,7 @@ if __name__ == '__main__':
             prompt = process_short_text(prompt)
             prompt_id = get_prompt_id(prompt)
             save_file = osp.join(out_dir, 'pred', f'{prompt_id}.jpg')
-            save_file = osp.join(out_dir, 'pred', f'{i}.jpg')
+            # save_file = osp.join(out_dir, 'pred', f'{i}.jpg')
             if osp.exists(save_file):
                 continue
 

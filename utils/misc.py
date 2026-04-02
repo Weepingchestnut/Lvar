@@ -20,7 +20,7 @@ from utils import arg_util
 os_system = functools.partial(subprocess.call, shell=True)
 
 
-def time_str(fmt='[%m-%d %H:%M:%S]'):
+def time_str(fmt='%Y-%m-%d_%H:%M:%S'):
     return datetime.datetime.now(tz=pytz.timezone('Asia/Shanghai')).strftime(fmt)
 
 

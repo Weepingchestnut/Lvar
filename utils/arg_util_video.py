@@ -7,7 +7,7 @@ import random
 import sys
 import time
 from collections import OrderedDict
-from typing import Union
+from typing import List, Union
 
 import numpy as np
 import torch
@@ -383,3 +383,67 @@ def init_dist_and_get_args():
     elif isinstance(args.noise_apply_strength, float):
         args.noise_apply_strength = [args.noise_apply_strength]
     return args
+
+
+class InferArgs(Args):
+    
+    model_type: str = 'infinitystar_qwen8b'
+    resolution: str = '720p'
+    pn: str = '0.90M'  # Pixel numbers, '0.90M' 720p, '0.40M' 480p
+    fps: int = 16
+    generation_duration: int = 5
+    video_frames: int = generation_duration * fps + 1
+    
+    model_path: str = 'pretrained_models/infinitystar/infinitystar_8b_720p_weights'
+    checkpoint_type: str = 'torch_shard'   # omnistore
+    vae_path: str = 'pretrained_models/infinitystar/infinitystar_videovae.pth'
+    text_encoder_ckpt: str = 'pretrained_models/infinitystar/text_encoder/flan-t5-xl-official/'
+    videovae: int = 10
+    text_channels: int = 2048
+    
+    dynamic_scale_schedule: str = 'infinity_elegant_clip20frames_v2'
+    bf16: int = 1   # choices=[0,1]
+    use_apg: int = 1    # choices=[0,1]
+    use_cfg: int = 0
+    cfg: float = 34
+    tau_image: float = 1
+    tau_video: float = 0.4
+    apg_norm_threshold: float = 0.05
+    image_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]'
+    video_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 1, 1]'
+    # 使用 Tap 的 List 支持，这样终端可以直接输入 --image_scale_repetition 3 3 3 ...
+    # image_scale_repetition: List[int] = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+    append_enlarge2captain: int = 1
+    append_duration2caption: int = 1
+    use_two_stage_lfq: int = 1
+    detail_scale_min_tokens: int = 750
+    semantic_scales: int = 12
+    max_repeat_times: int = 10000
+    
+    # For optimal performance, enabling the prompt rewriter is recommended.
+    # To utilize the GPT model, ensure the following environment variables are set:
+    # export OPEN_API_KEY="YOUR_API_KEY"
+    # export GLOBAL_AZURE_ENDPOINT="YOUR_ENDPOINT"
+    # *--> use official rewrite VBench_rewrited_prompt.json
+    enable_rewriter: int = 0
+    
+    # -------- VBench Setting --------
+    prompt_json: str = 'evaluation/vbench/VBench_rewrited_prompt_fixed_seed.json'
+    output_root: str = 'work_dir/evaluation/vbench/infinitystar_480p_81frames'
+    start_index: int = 0
+    end_index: int = -1
+    num_samples_per_prompt: int = 5
+    seed: int = 41
+    # only test the specified dimension, if empty list [], test all dimensions
+    target_dimensions: List[str] = [
+        # 'human_action',
+        # 'scene',
+        # 'multiple_objects',
+        # 'appearance_style',
+    ]
+
+    # -------- Latency Profile Setting --------
+    infer_batch_size: int = 1
+    warmup_iter: int = 2
+    profile_iter: int = 30
+    profile_output_root: str = f'work_dir/infer_profile/infinitystar_{resolution}/latency-profile_fps{fps}_{generation_duration}s_enlarge2captain{append_enlarge2captain}'

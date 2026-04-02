@@ -136,7 +136,24 @@ if __name__ == "__main__":
             ssim.update(batch[0], batch[1])
     # fid_score = fid.compute_fid(args.input_root0, args.input_root1)
 
+    # ------ PSNR data-level ------
+    total_se = 0.0
+    total_pixels = 0
+
+    with torch.inference_mode():
+        for batch in progress_bar:
+            pred = batch[0].to("cuda").float() / 255.0
+            gt = batch[1].to("cuda").float() / 255.0
+
+            diff = pred - gt
+            total_se += (diff ** 2).sum().item()
+            total_pixels += diff.numel()
+    mse_dataset = total_se / total_pixels
+    psnr_dataset = 10 * np.log10(1.0 / mse_dataset) if mse_dataset > 0 else float("inf")
+    # -----------------------------
+
     print("\nPSNR:", psnr.compute().item())
+    print("Dataset-level PSNR:", psnr_dataset)
     print("SSIM:", ssim.compute().item())
     print("LPIPS:", lpips.compute().item())
     # print("FID:", fid_score)

@@ -167,7 +167,11 @@ def main(args):
         # prompts = random.sample(default_prompts, args.batch_size)
 
         with torch.inference_mode():
-            with torch.autocast("cuda", enabled=True, dtype=torch.float16, cache_enabled=True):
+            with torch.autocast(
+                "cuda", enabled=True, 
+                dtype=torch.float16, 
+                cache_enabled=True
+            ):
 
                 infer_func = (
                     ema_model.autoregressive_infer_cfg
