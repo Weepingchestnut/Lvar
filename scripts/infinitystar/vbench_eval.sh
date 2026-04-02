@@ -44,17 +44,35 @@ vbench_score() {
     conda deactivate
 }
 
+latency_profile() {
+    # --- run inference ---
+    # single GPU
+    python tools/latency_profile_infistar.py \
+        --pn ${pn} \
+        --fps ${fps} \
+        --generation_duration ${generation_duration} \
+        --model_path ${model_path} \
+        --image_scale_repetition "${image_scale_repetition}" \
+        --video_scale_repetition "${video_scale_repetition}" \
+        --append_enlarge2captain ${append_enlarge2captain} \
+        --detail_scale_min_tokens ${detail_scale_min_tokens} \
+        --semantic_scales ${semantic_scales} \
+        --profile_output_root ${out_dir} \
+        --infer_batch_size ${batch_size} \
+        2>&1 | tee ${out_dir}/infer_profile_batch-${batch_size}.log
+}
+
 
 # set arguments for inference
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-gpu_num=4
+export CUDA_VISIBLE_DEVICES=0,1
+gpu_num=2
 master_port=29501
 
 model_type=infinitystar
 resolution=720p
 fps=16
 generation_duration=5
-append_enlarge2captain=0    # use f'{prompt}, Close-up on big objects, emphasize scale and detail'
+append_enlarge2captain=1    # use f'{prompt}, Close-up on big objects, emphasize scale and detail'
 
 model_exp=${model_type}_${resolution}       # TODO: change to different exps
 sub_fix=fps${fps}_${generation_duration}s_enlarge2captain${append_enlarge2captain}
@@ -105,6 +123,15 @@ else
     exit 1
 fi
 
+# ------ Performance ------
+out_dir_root=work_dir/infer_profile/${model_exp}
+out_dir=${out_dir_root}/latency-profile_${sub_fix}
+mkdir -p ${out_dir}
+
+batch_size=1
+latency_profile
+
+# ------ vbench ------
 out_dir_root=work_dir/evaluation/vbench
 out_dir=${out_dir_root}/${model_exp}/${sub_fix}
 mkdir -p ${out_dir}

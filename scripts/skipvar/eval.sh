@@ -2,10 +2,7 @@
 
 infer_eval_image_reward() {
     # --- step 1, infer images ---
-    # single GPU
-    # python evaluation/image_reward/infer4eval.py \
-    # mutil GPUs
-    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/image_reward/infer4eval_ddp.py \
+    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/image_reward/infer4reward_ddp.py \
         --cfg ${cfg} \
         --tau ${tau} \
         --pn ${pn} \
@@ -25,11 +22,12 @@ infer_eval_image_reward() {
         --text_channels ${text_channels} \
         --apply_spatial_patchify ${apply_spatial_patchify} \
         --cfg_insertion_layer ${cfg_insertion_layer} \
-        --outdir ${out_dir} 2>&1 | tee ${out_dir}/eval_image-reward.log
+        --outdir ${out_dir} \
+        2>&1 | tee ${out_dir}/eval_image-reward.log
 
     # --- step 2, compute image reward ---
     source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
-    conda activate torch260                         # Requires Flash-Attention version >=2.7.1,<=2.8.0
+    conda activate modelscope                       # Requires Flash-Attention version >=2.7.1,<=2.8.0
 
     python evaluation/image_reward/cal_imagereward.py \
         --meta_file ${out_dir}/metadata.jsonl 2>&1 | tee ${out_dir}/cal_image_reward.log
@@ -38,7 +36,7 @@ infer_eval_image_reward() {
 }
 
 infer_eval_hpsv21() {
-    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/hpsv2/eval_hpsv2_ddp.py \
+    torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/hpsv2/infer4hpsv2_ddp.py \
         --cfg ${cfg} \
         --tau ${tau} \
         --pn ${pn} \
@@ -58,7 +56,8 @@ infer_eval_hpsv21() {
         --text_channels ${text_channels} \
         --apply_spatial_patchify ${apply_spatial_patchify} \
         --cfg_insertion_layer ${cfg_insertion_layer} \
-        --outdir ${out_dir}/images 2>&1 | tee ${out_dir}/eval_hpsv2.log
+        --outdir ${out_dir}/images \
+        2>&1 | tee ${out_dir}/eval_hpsv2.log
 }
 
 test_gen_eval() {
@@ -84,15 +83,15 @@ test_gen_eval() {
         --apply_spatial_patchify ${apply_spatial_patchify} \
         --cfg_insertion_layer ${cfg_insertion_layer} \
         --outdir ${out_dir}/images \
-        --rewrite_prompt ${rewrite_prompt} 2>&1 | tee ${out_dir}/eval_gen-eval.log
+        --rewrite_prompt ${rewrite_prompt} \
+        2>&1 | tee ${out_dir}/eval_gen-eval.log
 
     # --- detect objects ---
     # export CUDA_VISIBLE_DEVICES=1
     source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
     conda activate modelscope
 
-    # export CUDA_VISIBLE_DEVICES=0
-    export CUDA_LAUNCH_BLOCKING=1
+    # export CUDA_LAUNCH_BLOCKING=1
     python evaluation/gen_eval/evaluate_images.py ${out_dir}/images \
         --outfile ${out_dir}/results/det.jsonl \
         --model-config evaluation/gen_eval/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py \
@@ -102,8 +101,7 @@ test_gen_eval() {
     python evaluation/gen_eval/summary_scores.py ${out_dir}/results/det.jsonl > ${out_dir}/results/res.txt
     cat ${out_dir}/results/res.txt
 
-    # unset CUDA_VISIBLE_DEVICES
-    unset CUDA_LAUNCH_BLOCKING
+    # unset CUDA_LAUNCH_BLOCKING
     conda deactivate
 
     # --- low-level matrics ---
@@ -116,9 +114,6 @@ test_gen_eval() {
 
 test_dpg_bench() {
     # --- run inference ---
-    # single GPU
-    # python evaluation/dpg_bench/infer4dpg.py \
-    # mutil GPUs
     torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/dpg_bench/infer4dpg_ddp.py \
         --cfg ${cfg} \
         --tau ${tau} \
@@ -139,7 +134,8 @@ test_dpg_bench() {
         --text_channels ${text_channels} \
         --apply_spatial_patchify ${apply_spatial_patchify} \
         --cfg_insertion_layer ${cfg_insertion_layer} \
-        --outdir ${out_dir}/images 2>&1 | tee ${out_dir}/eval_dpg-bench.log
+        --outdir ${out_dir}/images \
+        2>&1 | tee ${out_dir}/eval_dpg-bench.log
     
     # --- calculate metrics ---
     source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
@@ -167,7 +163,6 @@ test_dpg_bench() {
 latency_profile() {
     # --- run inference ---
     # single GPU
-    # export CUDA_VISIBLE_DEVICES=0
     python tools/latency_profile_infinity.py \
         --cfg ${cfg} \
         --tau ${tau} \
@@ -189,20 +184,18 @@ latency_profile() {
         --apply_spatial_patchify ${apply_spatial_patchify} \
         --cfg_insertion_layer ${cfg_insertion_layer} \
         --batch_size ${batch_size} \
-        2>&1 | tee ${out_dir}/infer_profile.log
+        2>&1 | tee ${out_dir}/infer_profile_batch-${batch_size}.log
 }
 
 # set arguments for inference
 export CUDA_VISIBLE_DEVICES=0,1
 gpu_num=2
-master_port=29503
+master_port=29501
 
-# model_type=skipvar_infinity_8b
 model_type=skipvar_infinity_2b
-# model_type=$1
-timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
+# model_type=skipvar_infinity_8b
 
-model_exp=${model_type}_${timestamp}
+model_exp=${model_type}
 
 if [ "$model_type" == "skipvar_infinity_2b" ]; then
     checkpoint_type='torch'
@@ -213,7 +206,6 @@ if [ "$model_type" == "skipvar_infinity_2b" ]; then
     cfg=4
     tau=1
     gen_eval_gts=work_dir/evaluation/gen_eval/infinity_2b_skip-0/gen_eval_cfg4_tau1_cfg_insertion_layer0_rewrite_prompt1_round2_real_rewrite
-    # gen_eval_gts=work_dir/evaluation/gen_eval/infinity_2b_skip-0_CUDA/gen_eval_cfg4_tau1_cfg_insertion_layer0_rewrite_prompt1_round2_real_rewrite
 elif [ "$model_type" == "skipvar_infinity_8b" ]; then
     checkpoint_type='torch_shard'
     infinity_model_path=pretrained_models/infinity/Infinity/infinity_8b_weights
@@ -223,7 +215,6 @@ elif [ "$model_type" == "skipvar_infinity_8b" ]; then
     cfg=4
     tau=1
     gen_eval_gts=work_dir/evaluation/gen_eval/infinity_8b_skip-0/gen_eval_cfg4_tau1_cfg_insertion_layer0_rewrite_prompt1_round2_real_rewrite
-    # gen_eval_gts=work_dir/evaluation/gen_eval/infinity_8b_skip-0_CUDA/gen_eval_cfg4_tau1_cfg_insertion_layer0_rewrite_prompt1_round2_real_rewrite
 else
     echo "Unknown model_type '$model_type'"
     echo "Support model_type: 'skipvar_infinity_2b', 'skipvar_infinity_8b'"
@@ -246,7 +237,7 @@ out_dir_root=work_dir/infer_profile/${model_exp}
 out_dir=${out_dir_root}/latency-profile_${sub_fix}
 mkdir -p ${out_dir}
 
-batch_size=2
+batch_size=1
 latency_profile
 sleep 10
 
@@ -257,33 +248,32 @@ rewrite_prompt=1    # default: 1, load prompt_rewrite_cache.json, from https://g
 out_dir=${out_dir_root}/gen_eval_${sub_fix}_rewrite_prompt${rewrite_prompt}_round2_real_rewrite
 mkdir -p ${out_dir}
 
-# export CUDA_VISIBLE_DEVICES=0,1
 test_gen_eval
 sleep 10
 
 
-# # ------ DPG-Bench ------
-# out_dir_root=work_dir/evaluation/dpg-bench/${model_exp}
-# out_dir=${out_dir_root}/dpg-bench_${sub_fix}
-# mkdir -p ${out_dir}
+# ------ DPG-Bench ------
+out_dir_root=work_dir/evaluation/dpg-bench/${model_exp}
+out_dir=${out_dir_root}/dpg-bench_${sub_fix}
+mkdir -p ${out_dir}
 
-# test_dpg_bench
-# sleep 10
-
-
-# # ------ HPS v2.1 ------
-# out_dir_root=work_dir/evaluation/hpsv2/${model_exp}
-# out_dir=${out_dir_root}/hpsv21_${sub_fix}
-# mkdir -p ${out_dir}
-
-# infer_eval_hpsv21
-# sleep 10
+test_dpg_bench
+sleep 10
 
 
-# # ------ ImageReward ------
-# out_dir_root=work_dir/evaluation/image_reward/${model_exp}
-# out_dir=${out_dir_root}/image_reward_${sub_fix}
-# mkdir -p ${out_dir}
+# ------ HPS v2.1 ------
+out_dir_root=work_dir/evaluation/hpsv2/${model_exp}
+out_dir=${out_dir_root}/hpsv21_${sub_fix}
+mkdir -p ${out_dir}
 
-# infer_eval_image_reward
-# sleep 10
+infer_eval_hpsv21
+sleep 10
+
+
+# ------ ImageReward ------
+out_dir_root=work_dir/evaluation/image_reward/${model_exp}
+out_dir=${out_dir_root}/image_reward_${sub_fix}
+mkdir -p ${out_dir}
+
+infer_eval_image_reward
+sleep 10

@@ -2,9 +2,6 @@
 
 infer_eval_image_reward() {
     # --- step 1, infer images ---
-    # single GPU
-    # python evaluation/image_reward/infer4eval.py \
-    # mutil GPUs
     torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/image_reward/infer4eval_ddp.py \
         --cfg ${cfg} \
         --tau ${tau} \
@@ -29,7 +26,7 @@ infer_eval_image_reward() {
 
     # --- step 2, compute image reward ---
     source ~/anaconda3/etc/profile.d/conda.sh       # Make sure your anaconda3 is in your home path
-    conda activate torch260                         # Requires Flash-Attention version >=2.7.1,<=2.8.0
+    conda activate modelscope                       # Requires Flash-Attention version >=2.7.1,<=2.8.0
 
     python evaluation/image_reward/cal_imagereward.py \
         --meta_file ${out_dir}/metadata.jsonl 2>&1 | tee ${out_dir}/cal_image_reward.log
@@ -100,7 +97,7 @@ test_gen_eval() {
     python evaluation/gen_eval/summary_scores.py ${out_dir}/results/det.jsonl > ${out_dir}/results/res.txt
     cat ${out_dir}/results/res.txt
 
-    unset CUDA_LAUNCH_BLOCKING
+    # unset CUDA_LAUNCH_BLOCKING
     conda deactivate
 
     # --- low-level matrics ---
@@ -113,9 +110,6 @@ test_gen_eval() {
 
 test_dpg_bench() {
     # --- run inference ---
-    # single GPU
-    # python evaluation/dpg_bench/infer4dpg.py \
-    # mutil GPUs
     torchrun --nproc_per_node=${gpu_num} --master-port ${master_port} evaluation/dpg_bench/infer4dpg_ddp.py \
         --cfg ${cfg} \
         --tau ${tau} \
@@ -164,7 +158,6 @@ test_dpg_bench() {
 latency_profile() {
     # --- run inference ---
     # single GPU
-    # export CUDA_VISIBLE_DEVICES=0
     python tools/latency_profile_infinity.py \
         --cfg ${cfg} \
         --tau ${tau} \
@@ -196,10 +189,8 @@ master_port=29502
 
 # model_type=scalekv_infinity_8b
 model_type=scalekv_infinity_2b
-# model_type=$1
-timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
 
-model_exp=${model_type}_${timestamp}
+model_exp=${model_type}
 
 if [ "$model_type" == "scalekv_infinity_2b" ]; then
     checkpoint_type='torch'
@@ -211,7 +202,6 @@ if [ "$model_type" == "scalekv_infinity_2b" ]; then
     tau=1
     throughput_batch=4
     gen_eval_gts=work_dir/evaluation/gen_eval/infinity_2b_skip-0/gen_eval_cfg4_tau1_cfg_insertion_layer0_rewrite_prompt1_round2_real_rewrite
-    # gen_eval_gts=work_dir/evaluation/gen_eval/infinity_2b_skip-0_CUDA/gen_eval_cfg4_tau1_cfg_insertion_layer0_rewrite_prompt1_round2_real_rewrite
 elif [ "$model_type" == "scalekv_infinity_8b" ]; then
     checkpoint_type='torch_shard'
     infinity_model_path=pretrained_models/infinity/Infinity/infinity_8b_weights
@@ -222,7 +212,6 @@ elif [ "$model_type" == "scalekv_infinity_8b" ]; then
     tau=1
     throughput_batch=1
     gen_eval_gts=work_dir/evaluation/gen_eval/infinity_8b_skip-0/gen_eval_cfg4_tau1_cfg_insertion_layer0_rewrite_prompt1_round2_real_rewrite
-    # gen_eval_gts=work_dir/evaluation/gen_eval/infinity_8b_skip-0_CUDA/gen_eval_cfg4_tau1_cfg_insertion_layer0_rewrite_prompt1_round2_real_rewrite
 else
     echo "Unknown model_type '$model_type'"
     echo "Support model_type: 'scalekv_infinity_2b', 'scalekv_infinity_8b'"
@@ -256,9 +245,6 @@ latency_profile
 
 batch_size=8
 latency_profile
-
-# batch_size=${throughput_batch}
-# latency_profile
 sleep 10
 
 
