@@ -23,11 +23,9 @@ pip install image-reward pytorch_lightning
 pip install openai==1.34.0
 pip install git+https://github.com/openai/CLIP.git ftfy
 # pip install git+https://kkgithub.com/openai/CLIP.git ftfy
-MAX_JOBS=16 pip install flash-attn==2.7.1.post4 --no-build-isolation
-
-# pip install -U timm diffusers
+pip install diffusers==0.30.0 huggingface_hub==0.23.2
+MAX_JOBS=8 pip install flash-attn==2.7.1.post4 --no-build-isolation
 # pip install httpx==0.20.0
-# pip install diffusers==0.16.0 or diffusers==0.30.0
 
 wget https://github.com/THUDM/ImageReward/blob/main/benchmark/benchmark-prompts.json
 ```

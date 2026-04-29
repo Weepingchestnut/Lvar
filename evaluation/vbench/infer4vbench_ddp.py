@@ -4,6 +4,7 @@ import json
 import os
 import os.path as osp
 import random
+import shutil
 import sys
 import time
 from typing import List
@@ -90,7 +91,7 @@ def perform_inference(pipe, data, args):
         )
         if len(generated_image.shape) == 3:
             generated_image = generated_image.unsqueeze(0)
-        print(generated_image.shape)
+        # print(generated_image.shape)
         generated_image_list.append(generated_image)
             
     generated_image = torch.cat(generated_image_list, 2)
@@ -113,6 +114,61 @@ def load_vbench_prompts(prompt_json_path):
     #   "dimension": ["subject_consistency", "aesthetic_quality", ...]
     # }
     return data
+
+
+def get_video_artifact_paths(video_save_path):
+    video_stem, _ = osp.splitext(video_save_path)
+    return {
+        "video": video_save_path,
+        "png_dir": video_stem,
+        "npy": f"{video_stem}.npy",
+    }
+
+
+def has_complete_saved_outputs(video_save_path, args):
+    artifact_paths = get_video_artifact_paths(video_save_path)
+    if not osp.isfile(artifact_paths["video"]):
+        return False
+
+    if args.save_raw_npy_frames and not osp.isfile(artifact_paths["npy"]):
+        return False
+
+    if args.save_raw_png_frames:
+        png_dir = artifact_paths["png_dir"]
+        if not osp.isdir(png_dir):
+            return False
+        png_count = len([name for name in os.listdir(png_dir) if name.lower().endswith(".png")])
+        expected_png_count = max(args.video_frames, 1)
+        if png_count < expected_png_count:
+            return False
+
+    return True
+
+
+def create_symlink_or_copy(src_path, dst_path):
+    src_path = osp.abspath(src_path)
+    dst_dir = osp.dirname(dst_path)
+    os.makedirs(dst_dir, exist_ok=True)
+    relative_src_path = osp.relpath(src_path, start=dst_dir)
+
+    if osp.lexists(dst_path):
+        if osp.islink(dst_path):
+            current_link_target = os.readlink(dst_path)
+            current_resolved_path = osp.abspath(osp.join(dst_dir, current_link_target))
+            if current_link_target == relative_src_path and current_resolved_path == src_path and osp.exists(current_resolved_path):
+                return
+            os.unlink(dst_path)
+        else:
+            return
+    try:
+        os.symlink(relative_src_path, dst_path)
+    except FileExistsError:
+        print(f'FileExistsError: {src_path=} {dst_path=}')
+    except OSError:
+        if osp.isdir(src_path):
+            shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src_path, dst_path)
 
 
 def main():
@@ -227,9 +283,10 @@ def main():
             base_name = f'{prompt_en}-{sample_idx}.mp4'
             physical_base_name = f'{prompt_en}-{prompt_hash}-{sample_idx}.mp4'
             save_path = osp.join(videos_root, physical_base_name)
+            artifact_paths = get_video_artifact_paths(save_path)
             
-            if osp.exists(save_path):
-                print(f"[Rank {rank}] Skipping existing: {physical_base_name}")
+            if has_complete_saved_outputs(save_path, args):
+                print(f"[Rank {rank}] Skipping existing complete outputs: {physical_base_name}")
                 local_num_skip_videos += 1
                 pass
             else:
@@ -241,7 +298,13 @@ def main():
                     if local_num_videos > local_warmup_videos:
                         local_total_latency += output_dict['elapsed_time']
                     
-                    save_video(video_np, fps=args.fps, save_filepath=save_path)
+                    save_video(
+                        video_np,
+                        fps=args.fps,
+                        save_filepath=save_path,
+                        save_raw_png_frames=bool(args.save_raw_png_frames),
+                        save_raw_npy_frames=bool(args.save_raw_npy_frames),
+                    )
                     # print(f"[Rank {rank}] Video genernation done: {save_path=}\n")
                 
                 except Exception as e:
@@ -254,22 +317,17 @@ def main():
                 dim_dir = osp.join(videos_by_dim_root, d)
                 os.makedirs(dim_dir, exist_ok=True)
                 dim_video_path = osp.join(dim_dir, base_name)
+                dim_stem, _ = osp.splitext(dim_video_path)
+                base_stem, _ = osp.splitext(base_name)
                 
                 # [核心优化] 引入随机睡眠，错开 4 个进程的时间，极大降低碰撞概率
                 # time.sleep(random.uniform(0.01, 0.05))
                 
-                if not osp.exists(dim_video_path):
-                    try:
-                        # print(f'[Rank {rank}] {save_path=} {dim_video_path=}')
-                        os.symlink(osp.abspath(save_path), dim_video_path)
-                        # print(f'[Rank {rank}] Create symlink ')
-                    except FileExistsError:
-                        print(f'[Rank {rank}] FileExistsError: {save_path=} {dim_video_path=}')
-                        pass
-                    except OSError:
-                        # fall back to copy when no permission
-                        import shutil
-                        shutil.copy2(save_path, dim_video_path)
+                create_symlink_or_copy(save_path, dim_video_path)
+                if args.save_raw_png_frames:
+                    create_symlink_or_copy(artifact_paths["png_dir"], dim_stem)
+                if args.save_raw_npy_frames:
+                    create_symlink_or_copy(artifact_paths["npy"], osp.join(dim_dir, f'{base_stem}.npy'))
     
     print(f"[Rank {rank}] Finished tasks. Waiting for others...")
     tdist.barrier(device_ids=[local_rank])
