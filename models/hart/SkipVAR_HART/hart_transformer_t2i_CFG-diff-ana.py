@@ -7,6 +7,7 @@ import numpy as np
 import scipy.stats as stats
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 
 from models.diffusion.diffloss import DiffLoss
@@ -394,6 +395,9 @@ class HARTForT2I(PreTrainedModel):
 
         for b in self.blocks:
             b.attn.kv_caching(True)
+        
+        mse_list = []  # 用于保存每个 scale 的 MSE 值
+
         for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment (1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64)
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
@@ -414,6 +418,13 @@ class HARTForT2I(PreTrainedModel):
                     si=si,
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,)
+            
+            mse_val = F.mse_loss(x[0].float(), x[1].float(), reduction='mean').item()
+            print(f'{si=}: {mse_val=}')
+            mse_list.append(mse_val)
+            # if si == 12:
+            #     np.save('HART-pencil-mse_values_si0-12.npy', np.array(mse_list))
+
             logits_BlV = self.get_logits(x, cond_BD)
             if si == self.num_stages_minus_1:
                 last_layer_cond = x
@@ -496,6 +507,11 @@ class HARTForT2I(PreTrainedModel):
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
                 )
+            
+            mse_val = F.mse_loss(x[0].float(), x[1].float(), reduction='mean').item()
+            print(f'{si=}: {mse_val=}')
+            mse_list.append(mse_val)
+            
             logits_BlV = self.get_logits(x, cond_BD)
             last_layer_cond = x
             t = cfg * ratio
@@ -545,6 +561,9 @@ class HARTForT2I(PreTrainedModel):
         f_hat += h_BChw_final
 
         ################ last stage maskgit ################
+
+        if si == 13:
+            np.save('HART-woman-mse_values_si0-13.npy', np.array(mse_list))
 
         for b in self.blocks:
             b.attn.kv_caching(False)

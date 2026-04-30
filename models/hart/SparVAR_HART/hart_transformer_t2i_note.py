@@ -328,17 +328,17 @@ class HARTForT2I(PreTrainedModel):
     @torch.no_grad()
     def autoregressive_infer_cfg(
         self,
-        B: int,
-        label_B: Optional[Union[int, torch.LongTensor]],
+        B: int,                                                 # 1
+        label_B: Optional[Union[int, torch.LongTensor]],        # [1, 300, 1536]
         g_seed: Optional[int] = None,
-        cfg=1.5,
-        top_k=0,
-        top_p=0.0,
-        more_smooth=False,
-        context_position_ids: torch.Tensor = None,
-        context_mask: torch.Tensor = None,
-        final_stage=0,
-        num_maskgit_iters=1,
+        cfg=1.5,                                                # 4.5
+        top_k=0,                                                # 0
+        top_p=0.0,                                              # 0.0
+        more_smooth=False,                                      # True
+        context_position_ids: torch.Tensor = None,              # [2, 300]
+        context_mask: torch.Tensor = None,                      # [2, 300]
+        final_stage=0,                                          # 0
+        num_maskgit_iters=1,                                    # 1
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -360,7 +360,7 @@ class HARTForT2I(PreTrainedModel):
             rng = self.rng
         assert label_B is not None
         assert label_B.shape[1] == self.context_token
-
+        # build cfg 2 batch text input
         sos = cond_BD = self.context_embed(     # [2*bs, 300, 1536]
             self.context_norm(
                 torch.cat((label_B, torch.full_like(label_B, fill_value=0.0)), dim=0)))
@@ -368,10 +368,10 @@ class HARTForT2I(PreTrainedModel):
         context_position_ids = torch.cat(
             (context_position_ids, torch.full_like(context_position_ids, fill_value=0)), dim=0,)
 
-        b = context_mask.shape[0]
+        b = context_mask.shape[0]   # 2
         context_mask = torch.cat(
             (context_mask, torch.full_like(context_mask, fill_value=0)))
-        context_mask[b:, 0] = 1
+        context_mask[b:, 0] = 1     # 给无条件分支保留一个最小有效 token，避免整段 context 全无效导致数值/shape 问题
 
         if self.pos_1LC is not None:
             lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
@@ -390,19 +390,19 @@ class HARTForT2I(PreTrainedModel):
             )
 
         cur_L = 0
-        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])   # [bs, 32, 64, 64]
+        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])   # [bs, Cvae(32), 64, 64]
 
         for b in self.blocks:
             b.attn.kv_caching(True)
-        for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment (1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64)
-            ratio = si / self.num_stages_minus_1
+        for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment (1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64(w/o))
+            ratio = si / self.num_stages_minus_1        # 主要用来调节 CFG 强度和 gumbel 温度
             # last_L = cur_L
             if si > 0:
-                cur_L += pn * pn
+                cur_L += pn * pn                # 后续 stage，每一步会多出一个 pn × pn 的视觉 token block
             else:
-                cur_L += self.context_token
+                cur_L += self.context_token     # si == 0 时，当前输入只是文本前缀，所以加 context_token，cur_L=300
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD)       # NOTE: cond_BD w/o position info
             x = next_token_map
             AdaLNSelfAttn.forward
             for b in self.blocks:
@@ -415,19 +415,19 @@ class HARTForT2I(PreTrainedModel):
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,)
             logits_BlV = self.get_logits(x, cond_BD)
-            if si == self.num_stages_minus_1:
-                last_layer_cond = x
+            # if si == self.num_stages_minus_1:   #! 为最后 residual diffusion 准备条件，residual diffusion MLP 需要条件于：1. AR transformer 的最后层 hidden state; 2. 最后一步离散 token
+            #     last_layer_cond = x             #! 实际不触发，后面 final-stage MaskGIT 里也会重新更新 last_layer_cond
 
-            t = cfg * ratio
-            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+            t = cfg * ratio     # guidance 随着 ratio 增大而增强: 前期LR scale，cfg弱一些；后期HR scale，CFG强一些
+            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]      # (1+t)*conditional - t*unconditional
             # Haotian: Added for text-conditioned generation
             if si == 0:
-                logits_BlV = logits_BlV[:, [-1], :]
+                logits_BlV = logits_BlV[:, [-1], :]     # 根据text输出第一个位置1x1的视觉token
 
-            idx_Bl = sample_with_top_k_top_p_(
+            idx_Bl = sample_with_top_k_top_p_(          # 采样离散 token
                 logits_BlV,
                 rng=rng,
-                top_k=(600 if si < 7 else 300),
+                top_k=(600 if si < 7 else 300),         # 经验性策略：前面 scale：top_k=600；后面 stage：top_k=300，越到后面越保守，避免高频细节太飘
                 top_p=top_p,
                 num_samples=1,
             )[:, :, 0]
@@ -439,14 +439,16 @@ class HARTForT2I(PreTrainedModel):
                     logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
                 ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
 
-            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-
+            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)      # reshape current scale 2D token map
+            
+            # 累加到 f_hat，并准备下一scale的输入
             f_hat, next_token_map = self.vae_quant_proxy[
                 0
             ].get_next_autoregressive_input(
                 si, len(self.patch_nums), f_hat, h_BChw, patch_nums=self.patch_nums
             )
 
+            # 将下一scale输入投影到 Transformer hidden space
             next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
             next_token_map = (
                 self.word_embed(next_token_map)
@@ -458,14 +460,15 @@ class HARTForT2I(PreTrainedModel):
 
         ################ last stage maskgit ################
         si = len(self.patch_nums) - 1
-        mask = torch.ones(B, self.last_level_pns).cuda()
-        tokens = torch.zeros(B, self.last_level_pns, self.Cvae).cuda()
-        orders = self.sample_orders(B)
+        mask = torch.ones(B, self.last_level_pns).cuda()                    # 哪些位置还没生成
+        tokens = torch.zeros(B, self.last_level_pns, self.Cvae).cuda()      # 最后一级离散 token 的 embedding 容器
+        orders = self.sample_orders(B)                                      # 随机生成顺序
 
         num_iter = num_maskgit_iters
         indices = list(range(num_iter))
         # generate latents with maskgit
         for step in indices:
+            #* 计算当前 step 还要 mask 多少位置
             # mask_ratio = 1 - (step + 1) / num_iter
             mask_ratio = np.cos(math.pi / 2.0 * (step + 1) / num_iter)
             mask_len = torch.Tensor([np.floor(self.last_level_pns * mask_ratio)]).cuda()
@@ -476,14 +479,20 @@ class HARTForT2I(PreTrainedModel):
             )
             # get masking for next iteration and locations to be predicted in this iteration
             mask_next = mask_by_order(mask_len[0], orders, B, self.last_level_pns)
+
+            #* 算出本 step 真正要预测的位置 
             if step >= num_iter - 1:
                 mask_to_pred = mask[:B].bool()
             else:
                 mask_to_pred = torch.logical_xor(mask[:B].bool(), mask_next.bool())
+            
+            # 为 CFG 构造当前 step 输入 
+            #       只取当前step要预测的位置对应的 token 输入，不需要把最后一级整个网格都跑一遍
             mask = mask_next
             cur_mask = torch.cat([mask_to_pred, mask_to_pred], dim=0)
             cur_mask = cur_mask.nonzero(as_tuple=True)
             x = next_token_map[cur_mask].reshape(2 * B, -1, self.C)
+
             for b in self.blocks:
                 # Haotian: si used for position embed
                 # note: m_maskgit makes sure that PEs are correct.
@@ -491,16 +500,20 @@ class HARTForT2I(PreTrainedModel):
                     x=x,
                     cond_BD=cond_BD_or_gss,
                     attn_bias=None,
-                    si=len(self.patch_nums) - 1,
-                    m_maskgit=cur_mask,
+                    si=len(self.patch_nums) - 1,        #! not same
+                    m_maskgit=cur_mask,                 #! not same
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
                 )
+            
+            # 当前step离散 token logits + CFG
             logits_BlV = self.get_logits(x, cond_BD)
-            last_layer_cond = x
+            last_layer_cond = x     # 把 last_layer_cond = x 保存下来，供 residual diffusion 使用
             t = cfg * ratio
             logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
-            si = len(self.patch_nums) - 1
+
+            si = len(self.patch_nums) - 1       #? repeat?
+            # 当前 step 离散token采样
             idx_Bl = sample_with_top_k_top_p_(
                 logits_BlV,
                 rng=rng,
@@ -515,6 +528,8 @@ class HARTForT2I(PreTrainedModel):
                 h_BChw = gumbel_softmax_with_rng(
                     logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
                 ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+            
+            #* -------- residual diffusion：预测 residual token --------
             if final_stage == 0:
                 # sample with diffusion model
                 last_stage_discrete_cond = self.vae_quant_proxy[0].embedding(idx_Bl)

@@ -1,7 +1,10 @@
 import functools
 import math
+import os
+import pprint
 from typing import Tuple, Union
 
+import chipmunk     # chipmunk FA3 attn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,23 +43,128 @@ except ImportError:
     pass
 try:
     from flash_attn import flash_attn_func  # qkv: BLHc, ret: BLHcq
+    # from flash_attn_interface import flash_attn_func; print('#'*10 + ' use FA3 ' + '#'*10)
 except ImportError:
     pass
-try:
-    from torch.nn.functional import (
-        scaled_dot_product_attention as slow_attn,  # q, k, v: BHLc
-    )
-except ImportError:
+# try:
+#     from torch.nn.functional import (
+#         scaled_dot_product_attention as slow_attn,  # q, k, v: BHLc
+#     )
+# except ImportError:
+#     pass
 
-    def slow_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
-        attn = query.mul(scale) @ key.transpose(-2, -1)  # BHLc @ BHcL => BHLL
+    # def slow_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
+    #     attn = query.mul(scale) @ key.transpose(-2, -1)  # BHLc @ BHcL => BHLL
+    #     if attn_mask is not None:
+    #         attn.add_(attn_mask)
+    #     return (
+    #         F.dropout(attn.softmax(dim=-1), p=dropout_p, inplace=True)
+    #         if dropout_p > 0
+    #         else attn.softmax(dim=-1)
+    #     ) @ value
+
+# Global flag and storage for our experiment
+_ATTN_CAPTURE_ENABLED = True
+CAPTURED_ATTN_DATA = {
+    'attention_maps': {}, # (scale_idx, layer_idx) -> (H, Lq_self, Lk_self)
+    'current_scale': -1,
+    'layer_idx': -1,
+}
+
+# Efficient implementation equivalent to the following:
+def slow_attn(
+        query, key, value, attn_mask=None, dropout_p=0.0,
+        is_causal=False, scale=None, enable_gqa=False,
+        need_weights=False,
+    ) -> torch.Tensor:
+    
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias = attn_mask + attn_bias
+
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+
+    if need_weights:
+        return attn_weight @ value, attn_weight
+    else:
+        return attn_weight @ value
+
+
+# --- NEW MEMORY-EFFICIENT ATTENTION FUNCTION ---
+def slow_attn_head_by_head_for_analysis(
+        query, key, value, attn_mask=None, dropout_p=0.0,
+        is_causal=False, scale=None
+    ):
+    """
+    Computes attention head-by-head to save GPU memory during analysis.
+    Query/Key/Value are expected to have shape (Batch, Heads, SeqLen, HeadDim).
+    """
+    B, H, Lq, C_head = query.shape
+    Lk = key.shape[2]
+    
+    output_heads = []
+    captured_head_maps = []
+
+    for h in range(H):
+        # Slice for the current head
+        q_head = query[:, h, :, :] # (B, Lq, C_head)
+        k_head = key[:, h, :, :]   # (B, Lk, C_head)
+        v_head = value[:, h, :, :] # (B, Lk, C_head)
+
+        # Single-head attention calculation
+        attn_weight_head = torch.matmul(q_head, k_head.transpose(-2, -1)) * scale
+        
         if attn_mask is not None:
-            attn.add_(attn_mask)
-        return (
-            F.dropout(attn.softmax(dim=-1), p=dropout_p, inplace=True)
-            if dropout_p > 0
-            else attn.softmax(dim=-1)
-        ) @ value
+            attn_weight_head += attn_mask
+            
+        attn_weight_head = torch.softmax(attn_weight_head, dim=-1)
+        # 用float32计算softmax再转回原类型，避免FP16溢出
+        # attn_weight_head = F.softmax(attn_weight_head, dim=-1, dtype=torch.float32).to(q_head.dtype)
+        
+        # --- Capture the weights for this head ---
+        # We immediately move it to CPU to free up VRAM
+        if _ATTN_CAPTURE_ENABLED:
+            # We are interested in the conditional part (first sample in batch)
+            captured_head_maps.append(attn_weight_head[0].detach().cpu())
+
+        if dropout_p > 0.0:
+            attn_weight_head = F.dropout(attn_weight_head, p=dropout_p)
+            
+        output_head = torch.matmul(attn_weight_head, v_head) # (B, Lq, C_head)
+        output_heads.append(output_head)
+
+        # Explicitly free memory (optional, but good practice)
+        del q_head, k_head, v_head, attn_weight_head, output_head
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
+
+    # Concatenate all head outputs
+    final_output = torch.stack(output_heads, dim=1) # (B, H, Lq, C_head)
+    
+    # Also stack the captured maps if any
+    final_captured_map = None
+    if captured_head_maps:
+        final_captured_map = torch.stack(captured_head_maps, dim=0) # (H, Lq, Lk)
+
+    return final_output, final_captured_map
 
 
 class LlamaRMSNormFused(nn.Module):
@@ -778,13 +886,16 @@ class LlamaAttention(nn.Module):
         x,
         attn_bias,
         si=-1,
+        layer_idx=-1,
         context_position_ids=None,
         context_mask=None,
         m_maskgit=None,
     ):
+        global _ATTN_CAPTURE_ENABLED, CAPTURED_ATTN_DATA
+
         B, L, C = x.shape
         # [B, L, 2]
-        if self.context_token == 0:     # for T2I, context_token == 300
+        if self.context_token == 0:     # context_token == 300
             position_ids = get_position_ids(
                 B, self.patch_nums, x.device, si=si, m_maskgit=m_maskgit
             )
@@ -821,9 +932,11 @@ class LlamaAttention(nn.Module):
         main_type = qkv.dtype       # torch.float16
         # qkv: BL3Hc
 
-        using_flash = (
-            self.using_flash and attn_bias is None and qkv.dtype != torch.float32
-        )
+        # TODO
+        # using_flash = (
+        #     self.using_flash and attn_bias is None and qkv.dtype != torch.float32
+        # )
+        using_flash = False
         if using_flash or self.using_xform:
             q, k, v = qkv.unbind(dim=2)
             dim_cat = 1  # q or k or v: BLHc
@@ -833,7 +946,7 @@ class LlamaAttention(nn.Module):
             dim_cat = 2  # q or k or v: BHLc
             dim_unsqueeze = 1
 
-        if self.attn_l2_norm:       # False
+        if self.attn_l2_norm:       # always False
             scale_mul = self.scale_mul_1H11.clamp_max(self.max_scale_mul).exp()
             if using_flash or self.using_xform:
                 scale_mul = scale_mul.transpose(1, 2)  # 1H11 to 11H1
@@ -919,7 +1032,7 @@ class LlamaAttention(nn.Module):
             else:
                 k = self.cached_k = torch.cat((self.cached_k, k), dim=dim_cat)
                 v = self.cached_v = torch.cat((self.cached_v, v), dim=dim_cat)
-        # print(f'[scale-{si}_layer-{layer_ind}] self-attn caching: q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}')
+        print(f'\n[scale-{si}_layer-{layer_idx}] self-attn caching: q shape: {q.shape}({q.dtype=}), k shape: {k.shape}({k.dtype=}), v shape: {v.shape}({v.dtype=})')
         # print(f'[scale-{si}] self-attn caching: q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}')
 
         dropout_p = self.attn_drop if self.training else 0.0
@@ -945,18 +1058,52 @@ class LlamaAttention(nn.Module):
                 scale=self.scale,
             ).view(B, L, C)
         else:
-            oup = (
-                slow_attn(
-                    query=q,
-                    key=k,
-                    value=v,
-                    scale=self.scale,
-                    attn_mask=attn_bias,
-                    dropout_p=dropout_p,
-                )
-                .transpose(1, 2)
-                .reshape(B, L, C)
-            )
+            # --- naive attn ---
+            # oup = (
+            #     slow_attn(
+            #         query=q,
+            #         key=k,
+            #         value=v,
+            #         scale=self.scale,
+            #         attn_mask=attn_bias,
+            #         dropout_p=dropout_p,
+            #     )
+            #     .transpose(1, 2)
+            #     .reshape(B, L, C)
+            # )
+
+            # Call the new head-by-head function
+            output, attn_score_all_heads = slow_attn_head_by_head_for_analysis(
+                q, k, v, attn_mask=attn_bias, scale=self.scale
+            )       # output: (B, H, Lq, head_dim), weights_all_heads: (H, Lq, Lk)
+            print(f'{torch.isnan(output).any()=}')
+            
+            if _ATTN_CAPTURE_ENABLED:
+                print("CAPTURED_ATTN_DATA:")
+                pprint.pprint(CAPTURED_ATTN_DATA)
+                print(f"  [Debug] Layer {self.layer_idx_for_hook}, Scale {CAPTURED_ATTN_DATA['current_scale']}: output: {output.shape}, attn_score_all_heads: {attn_score_all_heads.shape}")
+            
+            scale_idx = CAPTURED_ATTN_DATA['current_scale']
+
+            if attn_score_all_heads is not None:
+
+                # 1. Construct the directory path
+                base_dir = CAPTURED_ATTN_DATA['output_dir']
+                layer_dir = os.path.join(base_dir, f'layer_{self.layer_idx_for_hook:02d}')
+                os.makedirs(layer_dir, exist_ok=True)
+
+                # 2. Save each head's map as a separate file.
+                # weights_all_heads is (H, Lq, Lk). It's already on CPU.
+
+                # lq, lk = weights_all_heads.shape[1], weights_all_heads.shape[2]   #* only keep the self-attention part
+                # self_attn_map_all_heads = weights_all_heads[:, :, lk-lq:]
+                self_attn_map_all_heads = attn_score_all_heads                         #* keep all the attention part
+
+                for head_idx in range(self_attn_map_all_heads.shape[0]):
+                    file_path = os.path.join(layer_dir, f"scale_{scale_idx:02d}_head_{head_idx:02d}.pt")
+                    torch.save(self_attn_map_all_heads[head_idx], file_path)
+            
+            oup = output.transpose(1, 2).reshape(B, L, C)
 
         return self.proj_drop(self.proj(oup))
 
@@ -1222,12 +1369,13 @@ class AdaLNSelfAttn(nn.Module):
         cond_BD,
         attn_bias,
         si=-1,
+        layer_idx=-1,
         context_position_ids=None,
         context_mask=None,
         m_maskgit=None,
     ):  # C: embed_dim, D: cond_dim
         # We achieve multi-token conditioning through LLM attention mask.
-        if not self.disable_aln:    #! always False
+        if not self.disable_aln:    # always False
             # if len(cond_BD.shape) == 3 and cond_BD.shape[1] > 1:
             #     cond_BD = cond_BD.max(1, keepdims=True).values
             condition = context_pooling(
@@ -1272,10 +1420,11 @@ class AdaLNSelfAttn(nn.Module):
                         context_position_ids=context_position_ids,
                         context_mask=context_mask,
                         si=si,
+                        layer_idx=layer_idx,
                         m_maskgit=m_maskgit,
                     )
                 )
-                if self.use_cross_attn:
+                if self.use_cross_attn:     # always False
                     # xattn_mask = get_xattn_mask(context_mask)
                     x[:, cond_BD.size(1) :] += self.cross_attn(
                         x[:, cond_BD.size(1) :],

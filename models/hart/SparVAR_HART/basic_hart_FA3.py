@@ -2,6 +2,7 @@ import functools
 import math
 from typing import Tuple, Union
 
+import chipmunk     # chipmunk FA3 attn
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,7 +40,8 @@ try:
 except ImportError:
     pass
 try:
-    from flash_attn import flash_attn_func  # qkv: BLHc, ret: BLHcq
+    # from flash_attn import flash_attn_func  # qkv: BLHc, ret: BLHcq
+    from flash_attn_interface import flash_attn_func; print('#'*10 + ' use FA3 ' + '#'*10)
 except ImportError:
     pass
 try:
@@ -784,7 +786,7 @@ class LlamaAttention(nn.Module):
     ):
         B, L, C = x.shape
         # [B, L, 2]
-        if self.context_token == 0:     # for T2I, context_token == 300
+        if self.context_token == 0:     # context_token == 300
             position_ids = get_position_ids(
                 B, self.patch_nums, x.device, si=si, m_maskgit=m_maskgit
             )
@@ -821,9 +823,11 @@ class LlamaAttention(nn.Module):
         main_type = qkv.dtype       # torch.float16
         # qkv: BL3Hc
 
+        # TODO
         using_flash = (
             self.using_flash and attn_bias is None and qkv.dtype != torch.float32
         )
+        # using_flash = False
         if using_flash or self.using_xform:
             q, k, v = qkv.unbind(dim=2)
             dim_cat = 1  # q or k or v: BLHc
@@ -924,11 +928,19 @@ class LlamaAttention(nn.Module):
 
         dropout_p = self.attn_drop if self.training else 0.0
         if using_flash:
+            # --- FA2 ---
+            # oup = flash_attn_func(
+            #     q.to(dtype=main_type),
+            #     k.to(dtype=main_type),
+            #     v.to(dtype=main_type),
+            #     dropout_p=dropout_p,
+            #     softmax_scale=self.scale,
+            # ).view(B, L, C)
+            # --- FA3 for H100 ---
             oup = flash_attn_func(
                 q.to(dtype=main_type),
                 k.to(dtype=main_type),
                 v.to(dtype=main_type),
-                dropout_p=dropout_p,
                 softmax_scale=self.scale,
             ).view(B, L, C)
         elif self.using_xform:
@@ -945,18 +957,24 @@ class LlamaAttention(nn.Module):
                 scale=self.scale,
             ).view(B, L, C)
         else:
-            oup = (
-                slow_attn(
-                    query=q,
-                    key=k,
-                    value=v,
-                    scale=self.scale,
-                    attn_mask=attn_bias,
-                    dropout_p=dropout_p,
-                )
-                .transpose(1, 2)
-                .reshape(B, L, C)
-            )
+            # --- naive attn ---
+            # oup = (
+            #     slow_attn(
+            #         query=q,
+            #         key=k,
+            #         value=v,
+            #         scale=self.scale,
+            #         attn_mask=attn_bias,
+            #         dropout_p=dropout_p,
+            #     )
+            #     .transpose(1, 2)
+            #     .reshape(B, L, C)
+            # )
+            
+            # --- CUDA attn ---
+            # o, _ = torch.ops.chipmunk.dense_attn(q.to(main_type), k.to(main_type), v.to(main_type))
+            o, _ = torch.ops.chipmunk.dense_attn(q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16))
+            oup = o.transpose(1, 2).reshape(B, L, C); print(f'{oup.dtype=}')
 
         return self.proj_drop(self.proj(oup))
 
@@ -1227,7 +1245,7 @@ class AdaLNSelfAttn(nn.Module):
         m_maskgit=None,
     ):  # C: embed_dim, D: cond_dim
         # We achieve multi-token conditioning through LLM attention mask.
-        if not self.disable_aln:    #! always False
+        if not self.disable_aln:    # always False
             # if len(cond_BD.shape) == 3 and cond_BD.shape[1] > 1:
             #     cond_BD = cond_BD.max(1, keepdims=True).values
             condition = context_pooling(

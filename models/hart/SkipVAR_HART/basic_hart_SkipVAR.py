@@ -770,6 +770,28 @@ class LlamaAttention(nn.Module):
 
     def kv_caching(self, enable: bool):
         self.caching, self.cached_k, self.cached_v = enable, None, None
+    
+    def forward_cond(
+        self,
+        x,
+        attn_bias,
+        si=-1,
+        context_position_ids=None,
+        context_mask=None,
+        m_maskgit=None,
+    ):
+        if self.cached_k is not None and self.cached_k.shape[0] != x.shape[0]:
+            self.cached_k = self.cached_k[:x.shape[0]]
+            self.cached_v = self.cached_v[:x.shape[0]]
+        
+        return self.forward(
+            x=x,
+            attn_bias=attn_bias,
+            si=si,
+            context_position_ids=context_position_ids,
+            context_mask=context_mask,
+            m_maskgit=m_maskgit,
+        )
 
     # NOTE: attn_bias is None during inference because kv cache is enabled
     # @get_local('attn')
@@ -1214,6 +1236,89 @@ class AdaLNSelfAttn(nn.Module):
             m_maskgit=mask,
             context_position_ids=context_position_ids,
             context_mask=context_mask,)
+    
+    def forward_cond(
+        self,
+        x,
+        cond_BD,
+        attn_bias,
+        si=-1,
+        context_position_ids=None,
+        context_mask=None,
+        m_maskgit=None,
+    ):
+        # condition = context_pooling(
+        #     cond_BD, context_mask=context_mask, mode=self.sep_aln_pooling_mode
+        # ).unsqueeze(1)
+
+        # gamma1, gamma2, scale1, scale2, shift1, shift2 = (
+        #     self.ada_lin(condition).view(-1, 1, 6, self.C).unbind(2)
+        # )
+
+        # x = x + self.drop_path(
+        #     self.attn.forward_cond(
+        #         self.ln_wo_grad(x).mul(scale1.add(1)).add_(shift1),
+        #         attn_bias=attn_bias,
+        #         context_position_ids=context_position_ids,
+        #         context_mask=context_mask,
+        #         si=si,
+        #         m_maskgit=m_maskgit,
+        #     ).mul_(gamma1)
+        # )
+        # x = x + self.drop_path(
+        #     self.ffn(self.ln_wo_grad(x).mul(scale2.add(1)).add_(shift2)).mul(gamma2)
+        # )
+        # return x
+        if not self.shared_aln:
+            x = x + self.drop_path(
+                self.attn.forward_cond(
+                    self.ln_wo_grad(x),
+                    attn_bias=attn_bias,
+                    context_position_ids=context_position_ids,
+                    context_mask=context_mask,
+                    si=si,
+                    m_maskgit=m_maskgit,
+                )
+            )
+            if self.use_cross_attn:
+                # xattn_mask = get_xattn_mask(context_mask)
+                x[:, cond_BD.size(1) :] += self.cross_attn(
+                    x[:, cond_BD.size(1) :],
+                    cond_BD,
+                    None
+                )
+            x = x + self.drop_path(self.ffn(self.ln_wo_grad(x)))
+        else:
+            # cond_BD: [batch, 1, embed_dim]
+            condition = context_pooling(cond_BD, context_mask, mode="avg")
+            # [batch, 6, embed_dim]
+            adaln_modulator = self.scale_shift_table[None] + condition.unsqueeze(1)
+            gamma1, gamma2, scale1, scale2, shift1, shift2 = adaln_modulator.chunk(
+                6, dim=1
+            )
+            x = x + self.drop_path(
+                self.attn(
+                    self.ln_wo_grad(x).mul(scale1.add(1)).add_(shift1),
+                    attn_bias=attn_bias,
+                    context_position_ids=context_position_ids,
+                    context_mask=context_mask,
+                    si=si,
+                    m_maskgit=m_maskgit,
+                ).mul_(gamma1)
+            )
+            if self.use_cross_attn:
+                # xattn_mask = get_xattn_mask(context_mask)
+                x[:, cond_BD.size(1) :] += self.cross_attn(
+                    x[:, cond_BD.size(1) :],
+                    cond_BD,
+                    None
+                )
+            x = x + self.drop_path(
+                self.ffn(
+                    self.ln_wo_grad(x).mul(scale2.add(1)).add_(shift2)
+                ).mul(gamma2)
+            )
+        return x
     
     # NOTE: attn_bias is None during inference because kv cache is enabled
     def forward(

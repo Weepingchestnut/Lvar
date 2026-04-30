@@ -7,6 +7,7 @@ import numpy as np
 import scipy.stats as stats
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 
 from models.diffusion.diffloss import DiffLoss
@@ -303,6 +304,111 @@ class HARTForT2I(PreTrainedModel):
             sampler=config.sampler,
         )
         self.diffusion_batch_mul = config.diffusion_batch_mul
+
+        # ------ add SkipVAR ------
+        import joblib
+
+        self.decision_models_folder='pretrained_models/skipvar/'+'decision_model_ssim_84/'
+        self.skip_model = joblib.load(os.path.join(self.decision_models_folder+"skip_model_Logistic_Regression.pkl"))
+        self.skip_scaler = joblib.load(os.path.join(self.decision_models_folder+"skip_model_scaler.pkl"))
+        self.uncond_model = joblib.load(os.path.join(self.decision_models_folder+"uncond_model_Logistic_Regression.pkl"))
+        self.uncond_scaler = joblib.load(os.path.join(self.decision_models_folder+"uncond_model_scaler.pkl"))
+
+        # si: i-th segment (1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64(w/o))
+        self.skipvar_decision_stage = 9
+        self.skipvar_freq_ratio = 0.4
+        self.f_hat_downscale = 5        # (7x7), note infinity is (8x8)
+
+        print(f'\n[SkipVAR_HART] decision models: {self.decision_models_folder}')
+        print(f'               decision scale: {self.skipvar_decision_stage}')
+
+    # =============
+    # SkipVAR func
+    # =============
+    def extract_high_freq_sobel(self, image: torch.Tensor) -> torch.Tensor:
+        sobel_x = torch.tensor(
+            [[[[1, 0, -1],
+            [2, 0, -2],
+            [1, 0, -1]]]],
+            dtype=torch.float32,
+            device=image.device,
+        )
+        sobel_y = sobel_x.permute(0, 1, 3, 2)
+        gray = image.mean(dim=1, keepdim=True).float()
+        grad_x = F.conv2d(gray, sobel_x, padding=1)
+        grad_y = F.conv2d(gray, sobel_y, padding=1)
+
+        return torch.sqrt(grad_x ** 2 + grad_y ** 2)
+    
+    def extract_high_freq_ratio_fft_circle(
+        self, img: torch.Tensor, freq_ratio: float = 0.4
+    ) -> torch.Tensor:
+        gray = img.mean(dim=1, keepdim=True).float()
+
+        fft = torch.fft.fft2(gray)
+        fft_shift = torch.fft.fftshift(fft)
+        amplitude = torch.abs(fft_shift)
+
+        B, C, H, W = amplitude.shape
+        cy, cx = H // 2, W // 2
+        radius = int(freq_ratio * min(H, W) / 2)
+
+        y = torch.arange(H, device=img.device).view(1, H, 1).expand(1, H, W)
+        x = torch.arange(W, device=img.device).view(1, 1, W).expand(1, H, W)
+        dist = ((y - cy) ** 2 + (x - cx) ** 2).sqrt()
+
+        mask = (dist > radius).float().unsqueeze(0).expand(B, 1, H, W)
+        high_freq_energy = (amplitude * mask).sum(dim=[2, 3])
+        total_energy = amplitude.sum(dim=[2, 3])
+        
+        return high_freq_energy / (total_energy + 1e-6)
+    
+    @torch.no_grad()
+    def decode_preview_from_fhat(self, f_hat: torch.Tensor, out_size: int) -> torch.Tensor:
+        if out_size is not None:
+            f_hat = F.interpolate(f_hat, size=(out_size, out_size), mode="bilinear", align_corners=False)
+        img = self.vae_proxy[0].fhat_to_img(f_hat).add(1).mul(0.5)
+        return img
+    
+    def skipvar_decide(self, old_img: torch.Tensor, new_img: torch.Tensor):
+        old_hf = self.extract_high_freq_sobel(old_img)
+        new_hf = self.extract_high_freq_sobel(new_img)
+        diff_hf = F.l1_loss(new_hf, old_hf)
+
+        new_ratio = self.extract_high_freq_ratio_fft_circle(new_img, self.skipvar_freq_ratio)
+        sample_input = [[diff_hf.item(), new_ratio.mean().item()]]
+
+        flags = {
+            "skip0": False,
+            "skip1": False,
+            "skip2": False,
+            "skip3": False,
+            "uncond1": False,
+            "uncond2": False,
+            "uncond3": False,
+            "base": False,
+        }
+
+        skip_value_map = {0: "skip0", 1: "skip1", 2: "skip2", 3: "skip3"}
+        cond_value_map = {0: "base", 1: "uncond1", 2: "uncond2", 3: "uncond3"}
+
+        # Step 1: Step Skipping Prediction
+        skip_label = self.skip_scaler.transform(sample_input)
+        skip_pred = self.skip_model.predict(skip_label)[0]
+        flags[skip_value_map[skip_pred]] = True
+
+        if skip_pred == 0:
+            # Step 2: Uncondition Branch Replacement Prediciton
+            uncond_label = self.uncond_scaler.transform(sample_input)
+            uncond_pred = self.uncond_model.predict(uncond_label)[0]
+            flags[cond_value_map[uncond_pred]] = True
+
+        return flags, {
+            "hf_diff": diff_hf.item(),
+            "hf_ratio": new_ratio.mean().item(),
+            "skip_pred": int(skip_pred),
+        }
+    # =============
     
     def get_logits(
         self,
@@ -394,7 +500,48 @@ class HARTForT2I(PreTrainedModel):
 
         for b in self.blocks:
             b.attn.kv_caching(True)
-        for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment (1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64)
+        
+        # ------ SkipVAR ------
+        flags = {
+            "skip0": False,
+            "skip1": False,
+            "skip2": False,
+            "skip3": False,
+            "uncond1": False,
+            "uncond2": False,
+            "uncond3": False,
+            "base": False,
+        }
+        skipvar_meta = {}
+        old_f_hat = None
+        cond_only = False
+
+        cond_BD_full = cond_BD
+        context_position_ids_full = context_position_ids
+        context_mask_full = context_mask
+
+        cond_BD_cond = cond_BD[:B]
+        context_position_ids_cond = context_position_ids[:B]
+        context_mask_cond = context_mask[:B]
+        # ---------------------
+        layer_idx = 0
+        for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment (1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64(w/o))
+            # ------ SkipVAR ------
+            remaining_ar = (len(self.patch_nums) - 1) - si   # 离散AR剩余scale数，不含final maskgit
+            if flags["skip3"] and remaining_ar <= 3:
+                # print('---> skip 3 scales --> 2 scales')
+                # break
+                flags["skip3"] = False
+                flags["skip2"] = True
+                continue
+            if flags["skip2"] and remaining_ar <= 2:
+                # print('---> skip 2 scales')
+                break
+            if flags["skip1"] and remaining_ar <= 1:
+                # print('---> skip 1 scales')
+                break
+            # ---------------------
+
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
             if si > 0:
@@ -404,22 +551,65 @@ class HARTForT2I(PreTrainedModel):
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
-            AdaLNSelfAttn.forward
-            for b in self.blocks:
-                # Haotian: si used for position embed
-                x = b(
-                    x=x,
-                    cond_BD=cond_BD_or_gss,
-                    attn_bias=None,
-                    si=si,
-                    context_position_ids=context_position_ids,
-                    context_mask=context_mask,)
-            logits_BlV = self.get_logits(x, cond_BD)
-            if si == self.num_stages_minus_1:
-                last_layer_cond = x
 
-            t = cfg * ratio
-            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+            # ------ SkipVAR ------
+            # if not cond_only:
+            #     ar_remaining = (len(self.patch_nums) - 1) - si
+            #     if (flags["uncond3"] and ar_remaining <= 3) or \
+            #     (flags["uncond2"] and ar_remaining <= 2) or \
+            #     (flags["uncond1"] and ar_remaining <= 1):
+            #         cond_only = True
+            #         print(f'    [scale-{si}]: {cond_only=}')
+
+
+            ar_remaining = (len(self.patch_nums) - 1) - si
+            if layer_idx == 0 and ((flags["uncond3"] and ar_remaining <= 3)
+                                   or (flags["uncond2"] and ar_remaining <= 2)
+                                   or (flags["uncond1"] and ar_remaining <= 1)):
+                cond_only = True
+                # print(f'    [scale-{si}]: {cond_only=}')
+            # ---------------------
+
+            AdaLNSelfAttn.forward
+            # for b in self.blocks:
+            #     # Haotian: si used for position embed
+            #     x = b(
+            #         x=x,
+            #         cond_BD=cond_BD_or_gss,
+            #         attn_bias=None,
+            #         si=si,
+            #         context_position_ids=context_position_ids,
+            #         context_mask=context_mask,)
+            # logits_BlV = self.get_logits(x, cond_BD)
+            # ------> SkipVAR
+            for b in self.blocks:
+                if cond_only:
+                    x = b.forward_cond(
+                        x=x[:B],                    #* remove uncond batch
+                        cond_BD=cond_BD_cond,
+                        attn_bias=None,
+                        si=si,
+                        context_position_ids=context_position_ids_cond,
+                        context_mask=context_mask_cond,
+                    )
+                else:
+                    x = b(
+                        x=x,
+                        cond_BD=cond_BD_full,
+                        attn_bias=None,
+                        si=si,
+                        context_position_ids=context_position_ids_full,
+                        context_mask=context_mask_full,
+                    )
+                layer_idx += 1
+            if cond_only:
+                logits_BlV = self.get_logits(x, cond_BD_cond)
+            else:
+                logits_BlV = self.get_logits(x, cond_BD_full)
+                t = cfg * ratio
+                logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+            # ----------------------
+            
             # Haotian: Added for text-conditioned generation
             if si == 0:
                 logits_BlV = logits_BlV[:, [-1], :]
@@ -447,20 +637,45 @@ class HARTForT2I(PreTrainedModel):
                 si, len(self.patch_nums), f_hat, h_BChw, patch_nums=self.patch_nums
             )
 
+            # ------ SkipVAR ------
+            if si == self.skipvar_decision_stage:
+                new_preview = self.decode_preview_from_fhat(
+                    f_hat, 
+                    out_size=self.patch_nums[self.f_hat_downscale]     # 5
+                )
+                if old_f_hat is not None:
+                    old_preview = self.decode_preview_from_fhat(
+                        old_f_hat, 
+                        out_size=self.patch_nums[self.f_hat_downscale]
+                    )
+                    flags, skipvar_meta = self.skipvar_decide(old_preview, new_preview)
+                    # print(f'{flags=}')
+                # old_f_hat = f_hat.clone()
+            elif si == self.skipvar_decision_stage - 1:
+                old_f_hat = f_hat.clone()
+            # ---------------------
+
             next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
             next_token_map = (
                 self.word_embed(next_token_map)
                 + lvl_pos[:, cur_L : cur_L + self.patch_nums[si + 1] ** 2]
             )
-            next_token_map = next_token_map.repeat(
-                2, 1, 1
-            )  # double the batch sizes due to CFG
+            # next_token_map = next_token_map.repeat(
+            #     2, 1, 1
+            # )  # double the batch sizes due to CFG
+            # *------> SkipVAR
+            if cond_only:
+                # 保持 B
+                pass
+            else:
+                next_token_map = next_token_map.repeat(2, 1, 1)
+            # ---------------------
 
         ################ last stage maskgit ################
         si = len(self.patch_nums) - 1
-        mask = torch.ones(B, self.last_level_pns).cuda()
-        tokens = torch.zeros(B, self.last_level_pns, self.Cvae).cuda()
-        orders = self.sample_orders(B)
+        mask = torch.ones(B, self.last_level_pns).cuda()                        # [1, 4096]
+        tokens = torch.zeros(B, self.last_level_pns, self.Cvae).cuda()          # [1, 4096, 32]
+        orders = self.sample_orders(B)                                          # [1, 4096]
 
         num_iter = num_maskgit_iters
         indices = list(range(num_iter))
@@ -481,64 +696,159 @@ class HARTForT2I(PreTrainedModel):
             else:
                 mask_to_pred = torch.logical_xor(mask[:B].bool(), mask_next.bool())
             mask = mask_next
-            cur_mask = torch.cat([mask_to_pred, mask_to_pred], dim=0)
-            cur_mask = cur_mask.nonzero(as_tuple=True)
-            x = next_token_map[cur_mask].reshape(2 * B, -1, self.C)
-            for b in self.blocks:
-                # Haotian: si used for position embed
-                # note: m_maskgit makes sure that PEs are correct.
-                x = b(
-                    x=x,
-                    cond_BD=cond_BD_or_gss,
-                    attn_bias=None,
-                    si=len(self.patch_nums) - 1,
-                    m_maskgit=cur_mask,
-                    context_position_ids=context_position_ids,
-                    context_mask=context_mask,
+
+            # ============================================================
+            #* cond_only branch: only keep conditional branch, batch = B
+            # ============================================================
+            if cond_only:
+                # mask_to_pred: [B, last_level_pns]
+                # cur_mask is a tuple usable for advanced indexing
+                cur_mask = mask_to_pred.nonzero(as_tuple=True)
+
+                next_token_map = f_hat.view(B, self.Cvae, -1).transpose(1, 2)
+                next_token_map = (
+                    self.word_embed(next_token_map)
+                    + lvl_pos[:, cur_L : cur_L + self.patch_nums[si] ** 2]
                 )
-            logits_BlV = self.get_logits(x, cond_BD)
-            last_layer_cond = x
-            t = cfg * ratio
-            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
-            si = len(self.patch_nums) - 1
-            idx_Bl = sample_with_top_k_top_p_(
-                logits_BlV,
-                rng=rng,
-                top_k=(600 if si < 7 else 300),
-                top_p=top_p,
-                num_samples=1,
-            )[:, :, 0]
-            if not more_smooth:  # this is the default case
-                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
-            else:  # not used when evaluating FID/IS/Precision/Recall
-                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)  # refer to mask-git
-                h_BChw = gumbel_softmax_with_rng(
-                    logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
-                ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-            if final_stage == 0:
-                # sample with diffusion model
-                last_stage_discrete_cond = self.vae_quant_proxy[0].embedding(idx_Bl)
-                last_stage_discrete_cond = self.word_embed(last_stage_discrete_cond)
-                last_stage_discrete_cond = torch.cat(
-                    [last_stage_discrete_cond, last_stage_discrete_cond], dim=0
-                )
-                last_stage_cond = self.decoder_norm(
-                    last_layer_cond + last_stage_discrete_cond
-                )
-                bs, cur_seq_len, _ = last_stage_cond.shape
-                ##### begin baseline sampling #####
-                last_stage_cond = last_stage_cond.reshape(bs * cur_seq_len, -1)
-                h_BChw_diff = self.diffloss.sample(
-                    z=last_stage_cond, temperature=1.0, cfg=t
-                )
-                ##### end baseline sampling #####
-                h_BChw_diff = h_BChw_diff.reshape(bs, cur_seq_len, -1)
-                # [B, L, Cvae]
-                h_BChw_diff, _ = h_BChw_diff.chunk(2, dim=0)
-                # update feature map
-                tokens[mask_to_pred] = (h_BChw + h_BChw_diff).reshape(-1, self.Cvae)
+                # next_token_map must already be B x L x C under cond_only mode
+                x = next_token_map[cur_mask].reshape(B, -1, self.C)
+
+                for block in self.blocks:
+                    x = block.forward_cond(
+                        x=x,
+                        cond_BD=cond_BD_cond,
+                        attn_bias=None,
+                        si=si,
+                        m_maskgit=cur_mask,
+                        context_position_ids=context_position_ids_cond,
+                        context_mask=context_mask_cond,
+                    )
+
+                logits_BlV = self.get_logits(x, cond_BD_cond)
+
+                # save transformer hidden states for diffusion head
+                last_layer_cond = x
+
+                idx_Bl = sample_with_top_k_top_p_(
+                    logits_BlV,
+                    rng=rng,
+                    top_k=(600 if si < 7 else 300),
+                    top_p=top_p,
+                    num_samples=1,
+                )[:, :, 0]
+
+                if not more_smooth:
+                    h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # [B, cur_seq_len, Cvae]
+                else:
+                    gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                    h_BChw = gumbel_softmax_with_rng(
+                        logits_BlV.mul(1 + ratio),
+                        tau=gum_t,
+                        hard=False,
+                        dim=-1,
+                        rng=rng,
+                    ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+
+                if final_stage == 0:
+                    # diffusion head conditioned on transformer hidden states + discrete token embeddings
+                    last_stage_discrete_cond = self.vae_quant_proxy[0].embedding(idx_Bl)
+                    last_stage_discrete_cond = self.word_embed(last_stage_discrete_cond)
+                    last_stage_cond = self.decoder_norm(last_layer_cond + last_stage_discrete_cond)
+
+                    bs, cur_seq_len, _ = last_stage_cond.shape
+                    last_stage_cond = last_stage_cond.reshape(bs * cur_seq_len, -1)
+
+                    # no CFG here because we only keep cond branch
+                    h_BChw_diff = self.diffloss.sample(
+                        z=last_stage_cond,
+                        temperature=1.0,
+                        cfg=0.0,
+                    )
+
+                    h_BChw_diff = h_BChw_diff.reshape(bs, cur_seq_len, -1)
+
+                    # update final continuous tokens
+                    tokens[mask_to_pred] = (h_BChw + h_BChw_diff).reshape(-1, self.Cvae)
+                else:
+                    tokens[mask_to_pred] = h_BChw.reshape(-1, self.Cvae)
+            
+            # ===================================================================
+            #* normal CFG branch: keep both conditional/unconditional, batch = 2B
+            # ===================================================================
             else:
-                tokens[mask_to_pred] = h_BChw.reshape(-1, self.Cvae)
+                cur_mask = torch.cat([mask_to_pred, mask_to_pred], dim=0)
+                cur_mask = cur_mask.nonzero(as_tuple=True)
+
+                next_token_map = f_hat.view(B, self.Cvae, -1).transpose(1, 2)
+                next_token_map = (
+                    self.word_embed(next_token_map)
+                    + lvl_pos[:, cur_L : cur_L + self.patch_nums[si] ** 2]
+                )
+                next_token_map = next_token_map.repeat(2, 1, 1)
+
+                x = next_token_map[cur_mask].reshape(2 * B, -1, self.C)
+                for b in self.blocks:
+                    # Haotian: si used for position embed
+                    # note: m_maskgit makes sure that PEs are correct.
+                    x = b(
+                        x=x,
+                        cond_BD=cond_BD_or_gss,
+                        attn_bias=None,
+                        si=len(self.patch_nums) - 1,
+                        m_maskgit=cur_mask,
+                        context_position_ids=context_position_ids,
+                        context_mask=context_mask,
+                    )
+                logits_BlV = self.get_logits(x, cond_BD)
+
+                # save transformer hidden states for diffusion head
+                last_layer_cond = x
+
+                t = cfg * ratio
+                logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+                
+                si = len(self.patch_nums) - 1
+                idx_Bl = sample_with_top_k_top_p_(
+                    logits_BlV,
+                    rng=rng,
+                    top_k=(600 if si < 7 else 300),
+                    top_p=top_p,
+                    num_samples=1,
+                )[:, :, 0]
+
+                if not more_smooth:  # this is the default case
+                    h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
+                else:  # not used when evaluating FID/IS/Precision/Recall
+                    gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)  # refer to mask-git
+                    h_BChw = gumbel_softmax_with_rng(
+                        logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
+                    ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+                if final_stage == 0:
+                    # sample with diffusion model
+                    #       diffusion head conditioned on transformer hidden states + discrete token embeddings
+                    last_stage_discrete_cond = self.vae_quant_proxy[0].embedding(idx_Bl)
+                    last_stage_discrete_cond = self.word_embed(last_stage_discrete_cond)
+                    last_stage_discrete_cond = torch.cat(
+                        [last_stage_discrete_cond, last_stage_discrete_cond], dim=0
+                    )
+                    last_stage_cond = self.decoder_norm(
+                        last_layer_cond + last_stage_discrete_cond
+                    )
+                    bs, cur_seq_len, _ = last_stage_cond.shape
+                    ##### begin baseline sampling #####
+                    last_stage_cond = last_stage_cond.reshape(bs * cur_seq_len, -1)
+                    h_BChw_diff = self.diffloss.sample(
+                        z=last_stage_cond, temperature=1.0, cfg=t
+                    )
+                    ##### end baseline sampling #####
+                    h_BChw_diff = h_BChw_diff.reshape(bs, cur_seq_len, -1)
+                    # [B, L, Cvae]
+                    h_BChw_diff, _ = h_BChw_diff.chunk(2, dim=0)
+                    # update feature map
+                    tokens[mask_to_pred] = (h_BChw + h_BChw_diff).reshape(-1, self.Cvae)
+                else:
+                    tokens[mask_to_pred] = h_BChw.reshape(-1, self.Cvae)
+        
         h_BChw_final = tokens.transpose(1, 2).reshape(
             B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1]
         )

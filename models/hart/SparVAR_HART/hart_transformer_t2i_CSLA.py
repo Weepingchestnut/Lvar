@@ -11,7 +11,7 @@ from transformers import AutoConfig, AutoModel, PreTrainedModel
 
 from models.diffusion.diffloss import DiffLoss
 from models.hart.basic_hart import (AdaLNBeforeHead, AdaLNSelfAttn,
-                                    LlamaRMSNormFused, TimestepEmbedder)
+                                    LlamaRMSNormFused, SparseFlexAttn, TimestepEmbedder)
 from models.hart.configuration import HARTForT2IConfig
 from models.hart.hart_autoencoder import HARTAutoEncoder
 from models.hart.hart_autoencoder_with_disc import HARTAutoEncoderWithDisc
@@ -303,6 +303,62 @@ class HARTForT2I(PreTrainedModel):
             sampler=config.sampler,
         )
         self.diffusion_batch_mul = config.diffusion_batch_mul
+
+        attn_sink_scales = 5
+        kernel_schedule = [
+            -1, -1, -1, -1, -1,     # attn sink: scale 0(300), 1(2x2=4), 2(3x3=9), 3(4x4=16), 4(5x5=25) --> total len = 354
+            -1, -1, -1,
+            1, 1, 1, 
+            3, 5, 7
+        ]
+        assert len(kernel_schedule) == 14, f'kernel_schedule mismatch 14 scales'
+
+        print(f'[w/ Block-wise Local Sparse Attention]')
+        print(f"Attn sink scale: Keep the first {attn_sink_scales} scales KV cache")
+        self.attn_sink_scale: int = attn_sink_scales
+
+        scale_schedule = [
+            (0, 0),     # 300 text token len
+            (2, 2), (3, 3), (4, 4), (5, 5), (7, 7), (9, 9), (12, 12),
+            (16, 16), (21, 21), (27, 27), (36, 36), (48, 48), (64, 64)
+        ]
+
+        spattn_fn_11 = SparseFlexAttn(
+            scale_schedule=scale_schedule,
+            kernel_schedule=kernel_schedule,
+            q_scale_idx=11,
+            attn_sink_scale=attn_sink_scales,
+            # block_size=block_size,
+            num_heads=num_heads,
+        )
+        spattn_fn_12 = SparseFlexAttn(
+            scale_schedule=scale_schedule,
+            kernel_schedule=kernel_schedule,
+            q_scale_idx=12,
+            attn_sink_scale=attn_sink_scales,
+            # block_size=block_size,
+            num_heads=num_heads,
+        )
+        spattn_fn_13 = SparseFlexAttn(
+            scale_schedule=scale_schedule,
+            kernel_schedule=kernel_schedule,
+            q_scale_idx=13,
+            attn_sink_scale=attn_sink_scales,
+            # block_size=block_size,
+            num_heads=num_heads,
+        )
+        self.spattn_compile_list = [
+            None, None, None, None, None, None, None, None, None, None, None,
+            spattn_fn_11,   # 36x36
+            spattn_fn_12,   # 48x48
+            spattn_fn_13,   # 64x64
+        ]
+
+        for i in range(len(self.spattn_compile_list)):
+            if self.spattn_compile_list[i] is not None:
+                print(f'Scale-{i} use sparse-attn, local window size is {kernel_schedule[i]}')
+        print(f'Local window schedule: {kernel_schedule}')
+
     
     def get_logits(
         self,
@@ -413,7 +469,9 @@ class HARTForT2I(PreTrainedModel):
                     attn_bias=None,
                     si=si,
                     context_position_ids=context_position_ids,
-                    context_mask=context_mask,)
+                    context_mask=context_mask,
+                    spattn_fn=self.spattn_compile_list[si]
+                )
             logits_BlV = self.get_logits(x, cond_BD)
             if si == self.num_stages_minus_1:
                 last_layer_cond = x
@@ -495,6 +553,7 @@ class HARTForT2I(PreTrainedModel):
                     m_maskgit=cur_mask,
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
+                    spattn_fn=self.spattn_compile_list[si]
                 )
             logits_BlV = self.get_logits(x, cond_BD)
             last_layer_cond = x

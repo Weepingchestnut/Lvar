@@ -1,3 +1,4 @@
+import json
 import math
 import os
 from functools import partial
@@ -11,7 +12,8 @@ from transformers import AutoConfig, AutoModel, PreTrainedModel
 
 from models.diffusion.diffloss import DiffLoss
 from models.hart.basic_hart import (AdaLNBeforeHead, AdaLNSelfAttn,
-                                    LlamaRMSNormFused, TimestepEmbedder)
+                                    LlamaRMSNormFused, TimestepEmbedder,
+                                    _ATTN_CAPTURE_ENABLED, CAPTURED_ATTN_DATA)
 from models.hart.configuration import HARTForT2IConfig
 from models.hart.hart_autoencoder import HARTAutoEncoder
 from models.hart.hart_autoencoder_with_disc import HARTAutoEncoderWithDisc
@@ -339,6 +341,10 @@ class HARTForT2I(PreTrainedModel):
         context_mask: torch.Tensor = None,
         final_stage=0,
         num_maskgit_iters=1,
+        # --- attn map ana ---
+        _run_attn_capture=True,
+        _capture_prompt_str="", # ADDED: To pass the prompt for saving
+        _capture_save_dir=""    # ADDED: To pass the save directory for saving
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -351,6 +357,25 @@ class HARTForT2I(PreTrainedModel):
         :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
         :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
         """
+
+        global _ATTN_CAPTURE_ENABLED
+        original_caching_states = {} # To restore caching states later
+
+        if _run_attn_capture:
+            print("\n--- ATTENTION CAPTURE MODE ACTIVATED ---")
+            # print("--- KV Caching will be temporarily DISABLED for memory reasons. ---")
+
+            _ATTN_CAPTURE_ENABLED = True
+            # Assign layer indices to SA modules for easy identification
+            for i, block in enumerate(self.blocks):
+                block.attn.layer_idx_for_hook = i
+                # original_caching_states[i] = block.sa.caching
+                # block.sa.kv_caching(False)          # disable caching
+
+            output_dir = _capture_save_dir
+            os.makedirs(output_dir, exist_ok=True)
+            CAPTURED_ATTN_DATA['output_dir'] = output_dir
+
         # num_maskgit_iters = 1
         # final_stage = 2
         if g_seed is None:
@@ -395,6 +420,8 @@ class HARTForT2I(PreTrainedModel):
         for b in self.blocks:
             b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment (1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 27, 36, 48, 64)
+            if _run_attn_capture:
+                CAPTURED_ATTN_DATA['current_scale'] = si
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
             if si > 0:
@@ -405,16 +432,23 @@ class HARTForT2I(PreTrainedModel):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
             AdaLNSelfAttn.forward
+            layer_idx = 0
             for b in self.blocks:
                 # Haotian: si used for position embed
+                if _run_attn_capture:
+                    CAPTURED_ATTN_DATA['layer_idx'] = layer_idx
                 x = b(
                     x=x,
                     cond_BD=cond_BD_or_gss,
                     attn_bias=None,
                     si=si,
+                    layer_idx=layer_idx,
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,)
-            logits_BlV = self.get_logits(x, cond_BD)
+                layer_idx += 1
+            # logits_BlV = self.get_logits(x, cond_BD)
+            # --> for attn map visual, need fp32 --> fp16
+            logits_BlV = self.get_logits(x, cond_BD).to(torch.float16)
             if si == self.num_stages_minus_1:
                 last_layer_cond = x
 
@@ -458,7 +492,7 @@ class HARTForT2I(PreTrainedModel):
 
         ################ last stage maskgit ################
         si = len(self.patch_nums) - 1
-        mask = torch.ones(B, self.last_level_pns).cuda()
+        mask = torch.ones(B, self.last_level_pns).cuda()        # [bs, 4096]
         tokens = torch.zeros(B, self.last_level_pns, self.Cvae).cuda()
         orders = self.sample_orders(B)
 
@@ -484,19 +518,27 @@ class HARTForT2I(PreTrainedModel):
             cur_mask = torch.cat([mask_to_pred, mask_to_pred], dim=0)
             cur_mask = cur_mask.nonzero(as_tuple=True)
             x = next_token_map[cur_mask].reshape(2 * B, -1, self.C)
+            if _run_attn_capture:
+                CAPTURED_ATTN_DATA['current_scale'] = si
+            layer_idx = 0
             for b in self.blocks:
                 # Haotian: si used for position embed
                 # note: m_maskgit makes sure that PEs are correct.
+                if _run_attn_capture:
+                    CAPTURED_ATTN_DATA['layer_idx'] = layer_idx
                 x = b(
                     x=x,
                     cond_BD=cond_BD_or_gss,
                     attn_bias=None,
                     si=len(self.patch_nums) - 1,
+                    layer_idx=layer_idx,
                     m_maskgit=cur_mask,
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
                 )
-            logits_BlV = self.get_logits(x, cond_BD)
+                layer_idx += 1
+            # logits_BlV = self.get_logits(x, cond_BD)
+            logits_BlV = self.get_logits(x, cond_BD).to(torch.float16)
             last_layer_cond = x
             t = cfg * ratio
             logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
@@ -518,7 +560,8 @@ class HARTForT2I(PreTrainedModel):
             if final_stage == 0:
                 # sample with diffusion model
                 last_stage_discrete_cond = self.vae_quant_proxy[0].embedding(idx_Bl)
-                last_stage_discrete_cond = self.word_embed(last_stage_discrete_cond)
+                # last_stage_discrete_cond = self.word_embed(last_stage_discrete_cond)
+                last_stage_discrete_cond = self.word_embed(last_stage_discrete_cond.to(torch.float32))
                 last_stage_discrete_cond = torch.cat(
                     [last_stage_discrete_cond, last_stage_discrete_cond], dim=0
                 )
@@ -548,8 +591,27 @@ class HARTForT2I(PreTrainedModel):
 
         for b in self.blocks:
             b.attn.kv_caching(False)
+        
+        if _run_attn_capture:
+            print("--- ATTENTION CAPTURE MODE DEACTIVATED ---")
+            _ATTN_CAPTURE_ENABLED = False
+
+            metadata = {
+                # 'scale_schedule': scale_schedule,
+                'num_heads': self.num_heads,
+                'num_layers': self.depth,
+                'prompt': _capture_prompt_str,
+                'data_dir': CAPTURED_ATTN_DATA['output_dir']
+            }
+            metadata_path = os.path.join(CAPTURED_ATTN_DATA['output_dir'], "metadata.json")
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=4)
+            print(f"Attention capture complete. Data saved in: {CAPTURED_ATTN_DATA['output_dir']}")
+            print(f"Metadata saved to: {metadata_path}")
+
         return (
-            self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
+            # self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
+            self.vae_proxy[0].fhat_to_img(f_hat.to(torch.float16)).add_(1).mul_(0.5)
         )  # de-normalize, from [-1, 1] to [0, 1]
 
     def sample_orders(self, bsz):
