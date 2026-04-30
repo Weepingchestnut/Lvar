@@ -171,6 +171,18 @@ def create_symlink_or_copy(src_path, dst_path):
             shutil.copy2(src_path, dst_path)
 
 
+def remove_stale_raw_links_from_video_dim_dir(dim_video_path):
+    dim_video_stem, _ = osp.splitext(dim_video_path)
+    stale_paths = [dim_video_stem, f"{dim_video_stem}.npy"]
+    for stale_path in stale_paths:
+        if not osp.lexists(stale_path):
+            continue
+        if osp.islink(stale_path):
+            os.unlink(stale_path)
+        else:
+            print(f"[Warning] Stale raw artifact is not a symlink, keep it unchanged: {stale_path}")
+
+
 def main():
     args = InferArgs().parse_args()
     
@@ -223,11 +235,15 @@ def main():
 
     videos_root = osp.join(args.output_root, "videos")
     videos_by_dim_root = osp.join(args.output_root, "videos_by_dimension")
+    frames_by_dim_root = osp.join(args.output_root, "frames_by_dimension")
     os.makedirs(videos_root, exist_ok=True)
     os.makedirs(videos_by_dim_root, exist_ok=True)
+    os.makedirs(frames_by_dim_root, exist_ok=True)
     if rank == 0:
         print(f"Saving raw videos to: {videos_root}")
         print(f"Saving dimension-organized videos to: {videos_by_dim_root}")
+        if args.save_raw_png_frames or args.save_raw_npy_frames:
+            print(f"Saving dimension-organized raw frames to: {frames_by_dim_root}")
     
     local_total_latency = 0.0
     local_num_videos = 0
@@ -317,17 +333,21 @@ def main():
                 dim_dir = osp.join(videos_by_dim_root, d)
                 os.makedirs(dim_dir, exist_ok=True)
                 dim_video_path = osp.join(dim_dir, base_name)
-                dim_stem, _ = osp.splitext(dim_video_path)
-                base_stem, _ = osp.splitext(base_name)
                 
                 # [核心优化] 引入随机睡眠，错开 4 个进程的时间，极大降低碰撞概率
                 # time.sleep(random.uniform(0.01, 0.05))
                 
                 create_symlink_or_copy(save_path, dim_video_path)
+                remove_stale_raw_links_from_video_dim_dir(dim_video_path)
+                if args.save_raw_png_frames or args.save_raw_npy_frames:
+                    frames_dim_dir = osp.join(frames_by_dim_root, d)
+                    os.makedirs(frames_dim_dir, exist_ok=True)
                 if args.save_raw_png_frames:
-                    create_symlink_or_copy(artifact_paths["png_dir"], dim_stem)
+                    dim_frame_dir, _ = osp.splitext(osp.join(frames_dim_dir, base_name))
+                    create_symlink_or_copy(artifact_paths["png_dir"], dim_frame_dir)
                 if args.save_raw_npy_frames:
-                    create_symlink_or_copy(artifact_paths["npy"], osp.join(dim_dir, f'{base_stem}.npy'))
+                    base_stem, _ = osp.splitext(base_name)
+                    create_symlink_or_copy(artifact_paths["npy"], osp.join(frames_dim_dir, f'{base_stem}.npy'))
     
     print(f"[Rank {rank}] Finished tasks. Waiting for others...")
     tdist.barrier(device_ids=[local_rank])
