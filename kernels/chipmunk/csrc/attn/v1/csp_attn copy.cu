@@ -1,7 +1,6 @@
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include <cuda_pipeline.h>
-#include <cmath>
 #include "../common/all.cuh"
 
 using namespace kittens;
@@ -40,8 +39,6 @@ template<int D, int NUM_WORKERS> struct attn_fwd_layout {
         int *indices, *indices_counts;
         int3 q_stride, k_stride, v_stride;
         int3 indices_stride;
-        int hr;
-        float scale_log2;
     };
     struct input_block    { kv_tile k, v; };
     // struct scratch_block  { qo_tile q[NUM_WORKERS]; int indices[INPUT_PIPE_STAGES][KV_TILE_ROWS]; semaphore indices_bar[INPUT_PIPE_STAGES]; };
@@ -68,11 +65,10 @@ template<int D, int O_SCALE> struct attn_fwd_template {
     static constexpr int PRODUCER_BARRIER_ARRIVALS = 128;
 
     __device__ static inline int get_indices_count(const layout::qo_global &Q, int batch, int head, int seq, int *indices_counts) {
-        // get_indices_count can be called for OOB task blocks when the LCF
-        // launcher rounds up work; return zero instead of touching counts.
-        if (batch >= Q.batch) {
-            return 0;
-        }
+        // we index into the indices_counts array for the current batch and head. todo: fix indices offsets for multiple batches and heads!
+        // batch can be 1 over the maximally allowed because get_indices_count can be called for OOB threadblocks in the grid
+        // we force-reset it to 0 as a hack to avoid cuda illegal memory access errors
+        batch = 0;
         int H = Q.depth; 
         int N_groups = (Q.rows +  (layout::qo_tile::rows * NUM_CONSUMER_WARPGROUPS) - 1) / (layout::qo_tile::rows * NUM_CONSUMER_WARPGROUPS); // the total number of indices groups per head
         int offset = (batch * H * N_groups) + (head * N_groups) + (seq);
@@ -82,7 +78,7 @@ template<int D, int O_SCALE> struct attn_fwd_template {
     __device__ static inline void common_setup(common_setup_args<layout> args) {
         int task_id = gridDim.x*args.task_iter + blockIdx.x;
         int seq_q = (args.globals.Q.rows + NUM_WORKERS*layout::qo_tile::rows - 1)/(NUM_WORKERS*layout::qo_tile::rows);
-        args.common.batch = task_id / (seq_q*args.globals.Q.depth); task_id -= args.common.batch * seq_q * args.globals.Q.depth;
+        args.common.batch = task_id / (seq_q*args.globals.K.depth); task_id -= args.common.batch * seq_q * args.globals.K.depth;
         args.common.head  = task_id / seq_q;                        task_id -= args.common.head  * seq_q;
         args.common.seq   = task_id;
         int num_iters = get_indices_count(args.globals.Q, args.common.batch, args.common.head, args.common.seq, args.globals.indices_counts);
@@ -239,7 +235,7 @@ template<int D, int O_SCALE> struct attn_fwd_template {
             }
 
             // (2) Load K and V.
-            load_async_gather<2, CACHE_SWIZZLE_OFFSETS>(args.input.k, args.input.v, args.globals.K, args.globals.V, args.globals.k_stride, args.globals.v_stride, {args.common.batch, args.common.head / args.globals.hr}, args.iter, args.state.swizzle_offsets, &(args.scratch.indices[0]));
+            load_async_gather<2, CACHE_SWIZZLE_OFFSETS>(args.input.k, args.input.v, args.globals.K, args.globals.V, args.globals.k_stride, args.globals.v_stride, {args.common.batch, args.common.head}, args.iter, args.state.swizzle_offsets, &(args.scratch.indices[0]));
 
             // (3) Kick off indices load for next stage.
             if (((args.iter + 1) & (INDICES_LOAD_INTERVAL - 1)) == 0 && args.iter + 1 < args.num_iters) {
@@ -268,16 +264,18 @@ template<int D, int O_SCALE> struct attn_fwd_template {
             warpgroup::sync(warpgroup::groupid());
         }
         __device__ static inline void compute(consumer_compute_args<layout> args) {
+            // constexpr float TEMPERATURE_SCALE = (D == 128) ? 0.08838834764f*1.44269504089f : 0.125f*1.44269504089f;
+            constexpr float TEMPERATURE_SCALE = 1.44269504089f;  // log2(e)
             // A = Q @ K.T
             warpgroup::mm_ABt(args.state.att_block, args.scratch.q[warpgroup::groupid()], args.input.k);
-            copy(args.state.max_vec_last_scaled, args.state.max_vec);
+            mul(args.state.max_vec_last_scaled, args.state.max_vec, TEMPERATURE_SCALE);
             // copy(args.state.max_vec_last_scaled, args.state.max_vec_scaled);
             warpgroup::mma_async_wait();
             // softmax
-            mul(args.state.att_block, args.state.att_block, args.globals.scale_log2);
             right_fill(args.state.att_block, args.state.att_block, args.globals.K.rows - args.iter*layout::kv_tile::rows, base_types::constants<float>::neg_infty());
             row_max(args.state.max_vec, args.state.att_block, args.state.max_vec); // accumulate onto the max_vec
-            copy(args.state.max_vec_scaled, args.state.max_vec);
+            mul(args.state.max_vec_scaled, args.state.max_vec, TEMPERATURE_SCALE);
+            mul(args.state.att_block, args.state.att_block, TEMPERATURE_SCALE);
             // row_max(args.state.max_vec_scaled, args.state.att_block, args.state.max_vec_scaled); // accumulate onto the max_vec_scaled
             sub_row(args.state.att_block, args.state.att_block, args.state.max_vec_scaled);
             exp2(args.state.att_block, args.state.att_block);
@@ -317,7 +315,7 @@ template<int D, int O_SCALE> struct attn_fwd_template {
 #include <iostream>
 
 namespace chipmunk {
-void csp_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor indices, at::Tensor indices_counts, int64_t o_scale, c10::optional<double> scale)
+void csp_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor indices, at::Tensor indices_counts, int64_t o_scale)
 {
     using ker_template = attn_fwd_template<128, 1>;
 
@@ -358,12 +356,15 @@ void csp_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor
     TORCH_CHECK(v.size(3) == head_dim, "V head dimension - idx 3 - must match for all non-vector inputs");
     TORCH_CHECK(o.size(3) == head_dim, "O head dimension - idx 3 - must match for all non-vector inputs");
 
-    TORCH_CHECK(indices.size(3) > 0, "Indices sparse dimension - idx 3 - must be positive");
+    // TORCH_CHECK(indices.size(3) == seq_len, "Indices sequence length dimension - idx 3 - must match for all inputs");
     // cp.async.bulk.tensor requires 16-byte alignment of gmem operand - indices must be a multiple of 4
-    TORCH_CHECK(indices.stride(2) * sizeof(int) % 16 == 0, "Indices stride must divide by 16 bytes (4 int32s) evenly. Either make indices non-contiguous or use a sequence length that's a multiple of 4.");
+    // TORCH_CHECK(indices.stride(2) * sizeof(int) % 16 == 0, "Indices stride must divide by 16 bytes (4 int32s) evenly. Either make indices non-contiguous or use a sequence length that's a multiple of 4.");
+    // const int L = indices.size(3);
+    TORCH_CHECK(indices.size(3) >= kseq_len, "Indices last dim (idx 3) must be >= kv_len for cross-attention.");
+    TORCH_CHECK(indices.stride(2) * static_cast<int>(sizeof(int)) % 16 == 0, "Indices stride(2) must be a multiple of 16 bytes (4 int32s). Consider padding the last dim to multiples of 4.");
 
-    TORCH_CHECK(qo_heads >= kv_heads, "QO heads must be greater than or equal to KV heads");
-    TORCH_CHECK(qo_heads % kv_heads == 0, "QO heads must be divisible by KV heads");
+
+    TORCH_CHECK(qo_heads == kv_heads, "QO heads must be equal to KV heads");
     TORCH_CHECK(q.size(1) == qo_heads, "QO head dimension - idx 1 - must match for all inputs");
     TORCH_CHECK(k.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
     TORCH_CHECK(v.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs"); 
@@ -389,9 +390,6 @@ void csp_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor
     if (head_dim != 128) {
         throw std::runtime_error("Head dimension must be 128");
     }
-    const float scale_value = scale.has_value() ? static_cast<float>(*scale) : 1.0f / std::sqrt(static_cast<float>(head_dim));
-    TORCH_CHECK(std::isfinite(scale_value), "Attention scale must be finite");
-    const float scale_log2 = scale_value * 1.44269504089f;
 
     ker_template::layout::qo_global Qg(d_q, static_cast<unsigned int>(batch), static_cast<unsigned int>(qo_heads), static_cast<unsigned int>(seq_len), nullptr);
     ker_template::layout::kv_global Kg(d_k, static_cast<unsigned int>(batch), static_cast<unsigned int>(kv_heads), static_cast<unsigned int>(kseq_len), nullptr);
@@ -408,9 +406,7 @@ void csp_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor
         {q.stride(0), q.stride(1), q.stride(2)},
         {k.stride(0), k.stride(1), k.stride(2)},
         {v.stride(0), v.stride(1), v.stride(2)},
-        {indices.stride(0), indices.stride(1), indices.stride(2)},
-        static_cast<int>(hr),
-        scale_log2
+        {indices.stride(0), indices.stride(1), indices.stride(2)}
     };
 
     auto mem_size = kittens::MAX_SHARED_MEMORY - 2000;

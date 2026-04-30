@@ -19,15 +19,39 @@ def pad_qkvo_tensor(tensor, pad_to):
 
 
 def dense_attn(q, k, v, scale=None):
-    """support non-casual cross-attention"""
+    """support cross-attention"""
     
     if GLOBAL_CONFIG['attn']['provider'] == 'triton':
-        o, lse = sattn_triton.dense_attn(q, k, v, scale=scale)
+        pad_to = get_kernel_config_attn()['bm']
+        # ------ no padding ------ efficient
+        o, lse = sattn_triton.dense_attn(
+            q, k, v,
+            scale=scale
+        )
+        # ------ padding ------
+        # o, lse = sattn_triton.dense_attn(
+        #     q, 
+        #     # k, v,
+        #     pad_qkvo_tensor(k, pad_to), pad_qkvo_tensor(v, pad_to),
+        #     kv_true_len=k.shape[-2],
+        #     scale=scale
+        # )
+        # ------ flag-attn version ------
+        # o = flash_attention(
+        #     q, 
+        #     # pad_qkvo_tensor(k, pad_to), pad_qkvo_tensor(v, pad_to),     # !padding will make img inconsistent
+        #     k, v,
+        #     causal=False, sm_scale=scale
+        # )
+        
         assert type(lse) == tuple, "LSE must be a tuple"
         assert lse[0].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "LSE shape mismatch"
         assert lse[1].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "LSE shape mismatch"
+        # if q.shape[-2] >= 1600:
+        #     print(f'M: head-0 query-0 {lse[0][0][0][0]}, head-0 query-1 {lse[0][0][0][1]}, head-0 query-10 {lse[0][0][0][10]}, head-0 query-100 {lse[0][0][0][100]}')
+        #     print(f'L: head-0 query-0 {lse[1][0][0][0]}, head-0 query-1 {lse[1][0][0][1]}, head-0 query-10 {lse[1][0][0][10]}, head-0 query-100 {lse[1][0][0][100]}')
     else:
-        o, lse = torch.ops.chipmunk.dense_attn(q, k, v, scale=scale)
+        o, lse = torch.ops.chipmunk.dense_attn(q, k, v)
         assert lse.shape == (q.shape[0], q.shape[1], q.shape[2], 1), "LSE shape mismatch"
     
     assert o.shape == q.shape, "Output shape mismatch"
@@ -35,10 +59,9 @@ def dense_attn(q, k, v, scale=None):
     return o, lse
 
 
-# --------------------------
+# ------------
 # for speedup
-#       cs in CUDA impl has bugs
-# --------------------------
+# ------------
 def dense_colsum_attn_s(q, k, v, scale=None):
     """
     Compute variable length attention in ThunderKittens.
@@ -49,23 +72,45 @@ def dense_colsum_attn_s(q, k, v, scale=None):
 
     if provider == 'cuda':
         # CUDA implementation
+        # assert p.shape == (q.shape[0], q.shape[1], q.shape[2], 1), "P shape mismatch - p: {}, q: {}".format(p.shape, q.shape)
         # --- 2 kernel 2 pass get colsum ---
         o, lse = torch.ops.chipmunk.dense_attn(q, k, v, scale)     # lse [bs, heads, q_len, 1]
-        _, cs, l = torch.ops.chipmunk.dense_colsum_attn(q, k, v, lse, scale)    # cs: [bs, num_heads, ceil(Nq/bm), Nkv]
+        # print("lse.stride():", tuple(lse.stride()))
+        # p = lse.squeeze(-1).contiguous().unsqueeze(-1)
+        # print("p.stride():", tuple(p.stride()))
+
+        # if p.stride(1) % 4 != 0:
+        #     B, Hq, Q, one = p.shape
+        #     Q_pad = ((Q + 3) // 4) * 4
+        #     p_aligned = torch.empty_strided(
+        #         (B, Hq, Q, 1), (Hq*Q_pad, Q_pad, 1, 1),
+        #         dtype=p.dtype, device=p.device
+        #     )
+        #     # 只拷贝有效区
+        #     p_aligned[:, :, :Q, :] = p
+        #     p = p_aligned
+
+        _, cs, l = torch.ops.chipmunk.dense_colsum_attn(q, k, v, lse)
         assert l.shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[0].shape, q.shape)
 
     else:
         # Triton implementation
-        # --- 1 kernel 2 pass get colsum ---
-        o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, scale=scale)
+        if q.shape[-2] % pad_to == 0 and k.shape[-2] % pad_to == 0 and v.shape[-2] % pad_to == 0:
+            o, cs, l = sattn_triton.dense_colsum_attn(q, k, v)
+        else:
+            # o, cs, l = sattn_triton.dense_colsum_attn(q, pad_qkvo_tensor(k, pad_to), pad_qkvo_tensor(v, pad_to))
+            # cs = cs[..., :k.shape[2]]       # todo: is it True? | cs [2, num_heads, q_blocks, kv_len]
+            # --- 1 kernel 2 pass get colsum ---
+            o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, scale=scale)
 
         assert l[0].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[0].shape, q.shape)
         assert l[1].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[1].shape, q.shape)
 
     assert o.shape == q.shape, "Output shape mismatch - o: {}, q: {}".format(o.shape, q.shape)
-    # assert cs.shape == (q.shape[0], q.shape[1], (q.shape[-2] + pad_to - 1) // pad_to, k.shape[2]), "CS shape mismatch - cs: {}, q: {}".format(cs.shape, q.shape)
+    assert cs.shape == (q.shape[0], q.shape[1], (q.shape[-2] + pad_to - 1) // pad_to, k.shape[2]), "CS shape mismatch - cs: {}, q: {}".format(cs.shape, q.shape)
     
     return o, cs
+    # return o, cs, l
 
 
 # -----------------------
@@ -81,21 +126,54 @@ def dense_colsum_attn_q(q, k, v, scale=None):
 
     if provider == 'cuda':
         # CUDA implementation
+        # assert p.shape == (q.shape[0], q.shape[1], q.shape[2], 1), "P shape mismatch - p: {}, q: {}".format(p.shape, q.shape)
         # --- 2 kernel 2 pass get colsum ---
         o, _ = torch.ops.chipmunk.dense_attn(q, k, v, scale=scale)
         _, cs, _ = sattn_triton.dense_colsum_attn(q, k, v, scale=scale)     # Using Triton correctly cs
     else:
         # Triton implementation
-        # --- 1 kernel 2 pass get colsum ---
-        o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, scale=scale)
+        if q.shape[-2] % pad_to == 0 and k.shape[-2] % pad_to == 0 and v.shape[-2] % pad_to == 0:
+            o, cs, l = sattn_triton.dense_colsum_attn(q, k, v)
+        else:
+            # o, cs, l = sattn_triton.dense_colsum_attn(q, pad_qkvo_tensor(k, pad_to), pad_qkvo_tensor(v, pad_to))
+            # cs = cs[..., :k.shape[2]]       # todo: is it True? | cs [2, num_heads, q_blocks, kv_len]
+            # --- 1 kernel 2 pass get colsum ---
+            o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, scale=scale)
 
         assert l[0].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[0].shape, q.shape)
         assert l[1].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[1].shape, q.shape)
 
     assert o.shape == q.shape, "Output shape mismatch - o: {}, q: {}".format(o.shape, q.shape)
-    # assert cs.shape == (q.shape[0], q.shape[1], (q.shape[-2] + pad_to - 1) // pad_to, k.shape[2]), "CS shape mismatch - cs: {}, q: {}".format(cs.shape, q.shape)
+    assert cs.shape == (q.shape[0], q.shape[1], (q.shape[-2] + pad_to - 1) // pad_to, k.shape[2]), "CS shape mismatch - cs: {}, q: {}".format(cs.shape, q.shape)
     
     return o, cs
+
+
+# ------ only Triton ------
+# def dense_colsum_attn(q, k, v, scale=None):
+#     """
+#     Compute variable length attention in ThunderKittens.
+#     """
+
+#     provider = GLOBAL_CONFIG['attn']['provider']
+#     pad_to = get_kernel_config_attn()['bm']
+
+#     # Triton implementation
+#     if q.shape[-2] % pad_to == 0 and k.shape[-2] % pad_to == 0 and v.shape[-2] % pad_to == 0:
+#         o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, scale=scale)
+#     else:
+#         # o, cs, l = sattn_triton.dense_colsum_attn(q, pad_qkvo_tensor(k, pad_to), pad_qkvo_tensor(v, pad_to))
+#         # cs = cs[..., :k.shape[2]]       # todo: is it True? | cs [2, num_heads, q_blocks, kv_len]
+#         # --- 1 kernel 2 pass get colsum ---
+#         o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, scale=scale)
+
+#     assert l[0].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[0].shape, q.shape)
+#     assert l[1].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[1].shape, q.shape)
+
+#     assert o.shape == q.shape, "Output shape mismatch - o: {}, q: {}".format(o.shape, q.shape)
+#     assert cs.shape == (q.shape[0], q.shape[1], (q.shape[-2] + pad_to - 1) // pad_to, k.shape[2]), "CS shape mismatch - cs: {}, q: {}".format(cs.shape, q.shape)
+    
+#     return o, cs, l
 
 
 @torch.no_grad()
@@ -202,6 +280,8 @@ def csp_attn(q, k, v, scale, indices, indices_counts, o, o_scale):
         pad_to = get_kernel_config_attn()['bm']
         o_delta, _ = sattn_triton.csp_attn(
             q, k, v,
+            # pad_qkvo_tensor(k, pad_to), 
+            # pad_qkvo_tensor(v, pad_to), 
             indices, indices_counts,
             scale=scale,
         )

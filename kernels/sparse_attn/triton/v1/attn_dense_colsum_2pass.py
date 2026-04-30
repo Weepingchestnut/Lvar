@@ -36,53 +36,47 @@ def keep(conf):
         return False
     return True
 
-
 @triton.jit
 def _full_attn_fwd_inner(acc, l_i, m_i, q,  #
-                    prev_maxes_final_ptrs, #
-                    prev_normalization_final_ptrs, #
                     blocksums_ptrs,
-                    softmax_stride_b, softmax_stride_h, softmax_stride_n, #
                     blocksums_stride_b, blocksums_stride_h, blocksums_stride_m, blocksums_stride_n,
                     stride_vk, stride_kn,
                     K_block_ptr, V_block_ptr,  #
-                    start_m, qk_scale, seqlen,  #
-                    H_Q, #
+                    start_m, qk_scale, 
+                    q_len, kv_len, #
+                    H, #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
-                    N_CTX_Q: tl.constexpr, N_CTX_KV: tl.constexpr, fp8_v: tl.constexpr,
-                    should_mask_q: tl.constexpr,
+                    N_CTX: tl.constexpr, fp8_v: tl.constexpr,
                     should_mask_kv: tl.constexpr,
                     ):
     off_hb = tl.program_id(1)
-    off_b = off_hb // H_Q
-    off_h = off_hb % H_Q
-    softmax_data_offset = off_b.to(tl.int64) * softmax_stride_b + off_h.to(tl.int64) * softmax_stride_h + (start_m * BLOCK_M + tl.arange(0, BLOCK_M)) * softmax_stride_n
+    off_b = off_hb // H
+    off_h = off_hb % H
+
     # blocksums_ptrs += off_b.to(tl.int64) * blocksums_stride_b + off_h.to(tl.int64) * blocksums_stride_h + start_m * blocksums_stride_m + tl.arange(0, BLOCK_N) * blocksums_stride_n
-    # Three 64-row programs form one bm=192 query group; columns remain KV positions.
-    bsp = blocksums_ptrs + off_b.to(tl.int64) * blocksums_stride_b + off_h.to(tl.int64) * blocksums_stride_h + (start_m // 3) * blocksums_stride_m + tl.arange(0, BLOCK_N) * blocksums_stride_n
-    
-    # previous m and l values
-    prev_maxes_final = tl.load(prev_maxes_final_ptrs + softmax_data_offset, mask=(offs_m < N_CTX_Q), other=-1.0e6)
-    prev_normalization_final = tl.load(prev_normalization_final_ptrs + softmax_data_offset, mask=(offs_m < N_CTX_Q), other=1.0e6)
+    bsp = (
+        blocksums_ptrs 
+        + off_b.to(tl.int64) * blocksums_stride_b 
+        + off_h.to(tl.int64) * blocksums_stride_h 
+        + (start_m // 3) * blocksums_stride_m 
+        + tl.arange(0, BLOCK_N) * blocksums_stride_n
+    )
 
     # blocksums = tl.zeros([BLOCK_M], dtype=tl.float32)
-    for start_n in range(0, N_CTX_KV, BLOCK_N):
+    for start_n in range(0, kv_len, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
-        if should_mask_kv:
-            k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-        else:
-            k = tl.load(K_block_ptr)
+        k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         # q_dot_k = tl.dot(q, k)
         q_dot_k = tl.dot(q, k)
-        if should_mask_kv:
-            q_dot_k = tl.where(start_n + offs_n[None, :] < N_CTX_KV, q_dot_k, -1.0e6)
         # q_dot_k = tl.where(start_n + offs_n[None, :] < 4592, q_dot_k, -1.0e6)
         qk = q_dot_k
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
         # qk = qk * qk_scale - m_ij[:, None]
         qk = qk * qk_scale - m_ij[:, None]
+        if should_mask_kv:
+            qk = tl.where(start_n + offs_n[None, :] < kv_len, qk, -1.0e6)
         p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
         # -- update m_i and l_i
@@ -91,67 +85,47 @@ def _full_attn_fwd_inner(acc, l_i, m_i, q,  #
         # -- update output accumulator --
         acc = acc * alpha[:, None]
         # update acc
-        if should_mask_kv:
-            v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
-        else:
-            v = tl.load(V_block_ptr)
+        v = tl.load(V_block_ptr, boundary_check=(1, 0), padding_option="zero")
         # v = tl.where(start_n + offs_n[:, None] < 4592, v, 0).to(tl.bfloat16)
         p = p.to(tl.bfloat16)
         acc = tl.dot(p, v, acc)
         m_i = m_ij
 
-        # ---------------- PREVIOUS PHASE OF SOFTMAX -------------------
-        qk_prev = q_dot_k * qk_scale - prev_maxes_final[:, None]
-        p_prev = tl.math.exp2(qk_prev)
-        p_prev = (p_prev / prev_normalization_final[:, None])
-        if should_mask_q:
-            p_prev = tl.where(offs_m[:, None] < N_CTX_Q, p_prev, 0)
-        if should_mask_kv:
-            p_prev = tl.where(start_n + offs_n[None, :] < N_CTX_KV, p_prev, 0)
-        blocksums = tl.sum(p_prev, 0)
-        tl.atomic_add(bsp, blocksums, mask=(start_n + offs_n) < N_CTX_KV, sem='relaxed')
-
         # ----------------- UPDATE POINTERS -----------------
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-        bsp += BLOCK_N * blocksums_stride_n
     
     return acc, l_i, m_i
 
 
-# blocksums_ptrs is updated via atomic_add. Triton autotune benchmarks several
-# configs on the same output tensor, so it must reset this accumulator between
-# trials or the measured run will leave colsum multiplied by the tuning repeats.
-@triton.autotune(list(filter(keep, configs)), key=["N_CTX_Q", "N_CTX_KV", "HEAD_DIM"], reset_to_zero=["blocksums_ptrs"])
+@triton.autotune(list(filter(keep, configs)), key=["N_CTX_Q", "HEAD_DIM"])
 @triton.jit
-def _full_attn_fwd(Q, K, V, sm_scale, M, L, Out, seqlen,  #
-              prev_maxes_ptr, #
-              prev_normalization_final_ptrs, #
+def _full_attn_fwd(Q, K, V, sm_scale, M, L, Out, 
+                   q_len, kv_len, #
               blocksums_ptrs, #
-              softmax_stride_b, softmax_stride_h, softmax_stride_n, #
               blocksums_stride_b, blocksums_stride_h, blocksums_stride_m, blocksums_stride_n, #
               stride_qz, stride_qh, stride_qm, stride_qk,  #
               stride_kz, stride_kh, stride_kn, stride_kk,  #
               stride_vz, stride_vh, stride_vk, stride_vn,  #
               stride_oz, stride_oh, stride_om, stride_on,  #
-              Z, H_Q, H_KV, N_CTX_Q, N_CTX_KV,  #
+              Z, H, 
+              N_CTX_Q: tl.constexpr,  #
+              N_CTX_KV: tl.constexpr,
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
               STAGE: tl.constexpr,  #
-              should_mask_q: tl.constexpr,
               should_mask_kv: tl.constexpr,
               ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
-    off_z = off_hz // H_Q
-    off_h = off_hz % H_Q
-    # GQA mapping: each KV head serves H_Q / H_KV consecutive Q heads.
-    off_h_kv = off_h // (H_Q // H_KV)
+    off_z = off_hz // H
+    off_h = off_hz % H
+
     qo_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
-    k_offset = off_z.to(tl.int64) * stride_kz + off_h_kv.to(tl.int64) * stride_kh
-    v_offset = off_z.to(tl.int64) * stride_vz + off_h_kv.to(tl.int64) * stride_vh
+    k_offset = off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    v_offset = off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
     offs_headsize = tl.arange(0, HEAD_DIM)
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -164,6 +138,7 @@ def _full_attn_fwd(Q, K, V, sm_scale, M, L, Out, seqlen,  #
         + offs_headsize[None, :] * stride_qk
     )
     v_order: tl.constexpr = (0, 1) if V.dtype.element_ty == tl.float8e5 else (1, 0)
+
     V_block_ptr = tl.make_block_ptr(
         base=V + v_offset,
         shape=(N_CTX_KV, HEAD_DIM),
@@ -180,6 +155,7 @@ def _full_attn_fwd(Q, K, V, sm_scale, M, L, Out, seqlen,  #
         block_shape=(HEAD_DIM, BLOCK_N),
         order=(0, 1),
     )
+
     offs_o = (start_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]) * stride_om + tl.arange(0, HEAD_DIM)[None, :] * stride_on
     O_ptrs = Out + qo_offset + offs_o
 
@@ -200,47 +176,78 @@ def _full_attn_fwd(Q, K, V, sm_scale, M, L, Out, seqlen,  #
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     acc, l_i, m_i = _full_attn_fwd_inner(
         acc, l_i, m_i, q, 
-        prev_maxes_ptr,  
-        prev_normalization_final_ptrs, 
         blocksums_ptrs,
-        softmax_stride_b, softmax_stride_h, softmax_stride_n,
         blocksums_stride_b, blocksums_stride_h, blocksums_stride_m, blocksums_stride_n,
         stride_vk, stride_kn,
         K_block_ptr, V_block_ptr,  #
-        start_m, qk_scale, seqlen,  #
-        H_Q, #
+        start_m, qk_scale, 
+        q_len, kv_len, #
+        H, #
         BLOCK_M, HEAD_DIM, BLOCK_N,  #
-        4 - STAGE, offs_m, offs_n, N_CTX_Q, N_CTX_KV, V.dtype.element_ty == tl.float8e5, should_mask_q, should_mask_kv  #
+        4 - STAGE, offs_m, offs_n, N_CTX_Q, V.dtype.element_ty == tl.float8e5, should_mask_kv  #
     )
     # epilogue
     # m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX_Q + offs_m
     l_ptrs = L + off_hz * N_CTX_Q + offs_m
-    tl.store(m_ptrs, m_i, mask=offs_m < N_CTX_Q)
-    tl.store(l_ptrs, l_i, mask=offs_m < N_CTX_Q)
+    tl.store(m_ptrs, m_i, mask=offs_m < q_len)
+    tl.store(l_ptrs, l_i, mask=offs_m < q_len)
     tl.store(O_ptrs, acc.to(Out.type.element_ty), mask=qo_mask)
+
+    # ---- 第二阶段：精确列和（不依赖 prev_lse）----
+    # 重新构造 K/V block ptr（只用 K；V 不再需要）
+    V_block_ptr = tl.make_block_ptr(
+        base=V + v_offset, shape=(N_CTX_KV, HEAD_DIM), strides=(stride_vk, stride_vn),
+        offsets=(0, 0), block_shape=(BLOCK_N, HEAD_DIM), order=v_order,
+    )
+    K_block_ptr = tl.make_block_ptr(
+        base=K + k_offset, shape=(HEAD_DIM, N_CTX_KV), strides=(stride_kk, stride_kn),
+        offsets=(0, 0), block_shape=(HEAD_DIM, BLOCK_N), order=(0, 1),
+    )
+    # blocksums 写指针（与第一阶段相同的布局）
+    bsp = (blocksums_ptrs
+        + off_z.to(tl.int64) * blocksums_stride_b
+        + off_h.to(tl.int64) * blocksums_stride_h
+        + (start_m // 3) * blocksums_stride_m
+        + tl.arange(0, BLOCK_N) * blocksums_stride_n
+    )
+
+    # 再扫一遍列：用最终 m_i, l_i 计算 p_norm 并对列求和
+    for start_n in range(0, kv_len, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        k = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        q_dot_k = tl.dot(q, k)                             # [BLOCK_M, BLOCK_N]
+        qk = q_dot_k * qk_scale
+        qk = qk - m_i[:, None]                             # 用最终 m_i
+        if should_mask_kv:
+            qk = tl.where(start_n + offs_n[None, :] < kv_len, qk, -1.0e6)
+        p_norm = tl.math.exp2(qk) / l_i[:, None]           # 用最终 l_i 归一化
+        colsum = tl.sum(p_norm, 0)                         # [BLOCK_N]
+        tl.atomic_add(
+            bsp, colsum,
+            mask=(start_n + offs_n) < kv_len, 
+            sem='relaxed'
+        )
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+        bsp += BLOCK_N * blocksums_stride_n
 
 
 class _full_attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, prev_lse, scale=None):
-        prev_maxes, prev_normalization = prev_lse[0].squeeze(-1), prev_lse[1].squeeze(-1)
+    def forward(ctx, q, k, v, scale=None):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-        assert q.shape[0] == k.shape[0] == v.shape[0]
-        assert q.shape[1] >= k.shape[1] and q.shape[1] % k.shape[1] == 0
-        assert k.shape[1] == v.shape[1]
-        assert k.shape[2] == v.shape[2]
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
         sm_scale = 1/math.sqrt(HEAD_DIM_K) if scale is None else scale
         stage = 1
-        should_mask_q = q.shape[-2] % 64 != 0
         should_mask_kv = k.shape[-2] % 64 != 0
+        # extra_kern_args = {'BLOCK_M': 64, 'BLOCK_N': 64, 'num_stages': 3, 'num_warps': 4}
         # mb = q.shape[2] // 128 if q.shape[2] % 128 == 0 else q.shape[2] // 128 + 1
         # fuse_amt = get_kernel_config_attn()['bm'] // 64
         mb = triton.cdiv(q.shape[2], 192)
@@ -261,34 +268,32 @@ class _full_attention(torch.autograd.Function):
         
         blocksums = torch.zeros((q.shape[0], q.shape[1], mb, k.shape[2]), device=q.device, dtype=torch.float32)
         # print(f'blocksums: {blocksums.shape}')
-        seqlen = q.shape[2]
+        q_len = q.shape[2]
+        kv_len = k.shape[2]
         # seqlen = 4592
         _full_attn_fwd[grid](
-            q, k, v, sm_scale, M, L, o, seqlen,  #
-            prev_maxes, #
-            prev_normalization, #
+            q, k, v, sm_scale, M, L, o, 
+            q_len, kv_len, #
             blocksums,
-            prev_maxes.stride(0), prev_maxes.stride(1), prev_maxes.stride(2), #
             blocksums.stride(0), blocksums.stride(1), blocksums.stride(2), blocksums.stride(3), #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
-            q.shape[0], q.shape[1], k.shape[1],  #
+            q.shape[0], q.shape[1],  #
             N_CTX_Q=q.shape[2],  #
-            N_CTX_KV=k.shape[2],  #
+            N_CTX_KV=k.shape[2],
             HEAD_DIM=HEAD_DIM_K,  #
             STAGE=stage,
-            should_mask_q=should_mask_q,
             should_mask_kv=should_mask_kv,
+            # **extra_kern_args,
         )
 
         return o, blocksums, (M.unsqueeze(-1), L.unsqueeze(-1))
 
-
 # dense_colsum_attn = _full_attention.apply
-def dense_colsum_attn(q, k, v, prev_lse, scale=None):
-    return _full_attention.apply(q, k, v, prev_lse, scale)
+def dense_colsum_attn(q, k, v, scale=None):
+    return _full_attention.apply(q, k, v, scale)
 
 
 def main():

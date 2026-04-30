@@ -2,6 +2,7 @@
 
 #include "kittens.cuh"
 #include <cooperative_groups.h>
+#include <cmath>
 #include <iostream>
 #include "../common/all.cuh"
 
@@ -51,6 +52,7 @@ template<int D> struct fwd_globals {
 
     const int kN; 
     const int hr;
+    const float scale_log2;
 };
 
 template<int D, bool is_causal>
@@ -79,6 +81,9 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     int kv_blocks   = (g.kN + K::kv_height - 1) / (K::kv_height);
     int kv_head_idx = blockIdx.y / g.hr;
     int seq_idx     = blockIdx.x * CONSUMER_WARPGROUPS; 
+    int q_tiles_in_block = (g.q.rows + K::qo_height - 1) / K::qo_height - seq_idx;
+    q_tiles_in_block = q_tiles_in_block < 0 ? 0 : q_tiles_in_block;
+    q_tiles_in_block = q_tiles_in_block > CONSUMER_WARPGROUPS ? CONSUMER_WARPGROUPS : q_tiles_in_block;
 
     __shared__ kittens::semaphore qsmem_semaphore, k_smem_arrived[K::stages], v_smem_arrived[K::stages], compute_done[K::stages];
     if (threadIdx.x == 0) { 
@@ -89,9 +94,11 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             init_semaphore(compute_done[j], CONSUMER_WARPGROUPS, 0); 
         }
 
-        tma::expect_bytes(qsmem_semaphore, sizeof(q_smem));
+        // The last Q block may contain fewer than CONSUMER_WARPGROUPS tiles.
+        // Avoid issuing fully-OOB Q TMA loads for cross-attention where Nq is arbitrary.
+        tma::expect_bytes(qsmem_semaphore, q_tiles_in_block * sizeof(q_tile));
 
-        for (int wg = 0; wg < CONSUMER_WARPGROUPS; wg++) {
+        for (int wg = 0; wg < q_tiles_in_block; wg++) {
             coord<q_tile> q_tile_idx = {blockIdx.z, blockIdx.y, (seq_idx) + wg, 0};
             tma::load_async(q_smem[wg], g.q, q_tile_idx, qsmem_semaphore);
         }
@@ -151,6 +158,16 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
         else { kv_iters = kv_blocks - 1; }
 
         kittens::wait(qsmem_semaphore, 0);
+        if (warpgroupid >= q_tiles_in_block) {
+            // No Q rows map to this consumer warpgroup in the tail block. It still
+            // releases K/V stages so the producer pipeline can make forward progress.
+            for (auto kv_idx = 0; kv_idx <= kv_iters; kv_idx++) {
+                kittens::wait(k_smem_arrived[(kv_idx)%K::stages], (kv_idx/K::stages)%2);
+                kittens::wait(v_smem_arrived[(kv_idx)%K::stages], (kv_idx/K::stages)%2);
+                if(warpgroup::laneid() == 0) arrive(compute_done[(kv_idx)%K::stages], 1);
+            }
+            return;
+        }
 
         for (auto kv_idx = 0; kv_idx <= kv_iters; kv_idx++) {
         
@@ -158,11 +175,9 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             warpgroup::mm_ABt(att_block, q_smem[warpgroupid], k_smem[(kv_idx)%K::stages]);
             
             copy(max_vec_last_scaled, max_vec);
-            if constexpr (D == 64) { mul(max_vec_last_scaled, max_vec_last_scaled, 1.44269504089f*0.125f); }
-            // else                   { mul(max_vec_last_scaled, max_vec_last_scaled, 1.44269504089f*0.08838834764f); }
-            else                   { mul(max_vec_last_scaled, max_vec_last_scaled, 1.44269504089f); }
             
             warpgroup::mma_async_wait();
+            mul(att_block, att_block, g.scale_log2);
             right_fill(att_block, att_block, g.k.rows - kv_idx*K::kv_height, base_types::constants<float>::neg_infty());
 
             if constexpr (is_causal) {
@@ -184,17 +199,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             }
 
             row_max(max_vec, att_block, max_vec);
-            
-            if constexpr (D == 64) { 
-                mul(att_block, att_block,    1.44269504089f*0.125f); 
-                mul(max_vec_scaled, max_vec, 1.44269504089f*0.125f);
-            }
-            else                   { 
-                // mul(att_block, att_block,    1.44269504089f*0.08838834764f); 
-                // mul(max_vec_scaled, max_vec, 1.44269504089f*0.08838834764f);
-                mul(att_block, att_block,    1.44269504089f); 
-                mul(max_vec_scaled, max_vec, 1.44269504089f);
-            }
+            copy(max_vec_scaled, max_vec);
 
             sub_row(att_block, att_block, max_vec_scaled);
             exp2(att_block, att_block);
@@ -246,7 +251,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
 
 namespace chipmunk {
 std::vector<at::Tensor> 
-dense_attn(at::Tensor q, at::Tensor k, at::Tensor v)
+dense_attn(at::Tensor q, at::Tensor k, at::Tensor v, c10::optional<double> scale)
 {
     // CHECK_INPUT(q);
     // CHECK_INPUT(k);
@@ -316,6 +321,9 @@ dense_attn(at::Tensor q, at::Tensor k, at::Tensor v)
     if (head_dim != 128) {
         throw std::runtime_error("Head dimension must be 128");
     }
+    const float scale_value = scale.has_value() ? static_cast<float>(*scale) : 1.0f / std::sqrt(static_cast<float>(head_dim));
+    TORCH_CHECK(std::isfinite(scale_value), "Attention scale must be finite");
+    const float scale_log2 = scale_value * 1.44269504089f;
     using q_tile    =         st_bf<fwd_attend_ker_tile_dims<128>::qo_height, fwd_attend_ker_tile_dims<128>::tile_width>;
     using k_tile    =         st_bf<fwd_attend_ker_tile_dims<128>::kv_height, fwd_attend_ker_tile_dims<128>::tile_width>;
     using v_tile    =         st_bf<fwd_attend_ker_tile_dims<128>::kv_height, fwd_attend_ker_tile_dims<128>::tile_width>;
@@ -346,9 +354,8 @@ dense_attn(at::Tensor q, at::Tensor k, at::Tensor v)
 
 
     chipmunk::create_tensor_map_with_strides<l_col_vec, -1>(&lg_arg.tma_descs.tma_desc, d_l, batch, qo_heads, 1U, seq_len, l_vec.stride(0), l_vec.stride(1), l_vec.stride(3));
-    // chipmunk::create_tensor_map_with_strides<l_col_vec, -1>(&lg_arg.tma_descs.tma_desc, d_l, batch, qo_heads, 1U, seq_len, l_vec.stride(0), l_vec.stride(1), l_vec.stride(2));
 
-    globals g{qg_arg, kg_arg, vg_arg, lg_arg, og_arg, static_cast<int>(kseq_len), static_cast<int>(hr)};
+    globals g{qg_arg, kg_arg, vg_arg, lg_arg, og_arg, static_cast<int>(kseq_len), static_cast<int>(hr), scale_log2};
 
     auto mem_size = kittens::MAX_SHARED_MEMORY;
     auto threads  = NUM_WORKERS * kittens::WARP_THREADS;

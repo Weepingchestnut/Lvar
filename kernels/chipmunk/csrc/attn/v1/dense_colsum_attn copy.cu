@@ -1,6 +1,5 @@
 #include "kittens.cuh"
 #include <cooperative_groups.h>
-#include <cmath>
 #include <iostream>
 #include "../common/all.cuh"
 
@@ -61,7 +60,6 @@ template<int D> struct cs_globals {
 
     const int kN; 
     const int hr;
-    const float scale_log2;
 };
 
 __device__ static inline void store_colsum(bf16 *g_indices, bf16 *s_indices, int num_bytes_to_copy) {
@@ -108,9 +106,6 @@ void cs_attend_ker(const __grid_constant__ cs_globals<D> g) {
     int kv_head_idx = blockIdx.y / g.hr;
     int seq_idx     = blockIdx.x * CONSUMER_WARPGROUPS; 
     int seq_group   = blockIdx.x;
-    int q_tiles_in_block = (g.q.rows + K::qo_height - 1) / K::qo_height - seq_idx;
-    q_tiles_in_block = q_tiles_in_block < 0 ? 0 : q_tiles_in_block;
-    q_tiles_in_block = q_tiles_in_block > CONSUMER_WARPGROUPS ? CONSUMER_WARPGROUPS : q_tiles_in_block;
 
     __shared__ kittens::semaphore qsmem_semaphore, psmem_semaphore, k_smem_arrived[K::stages], v_smem_arrived[K::stages], compute_done[K::stages];
     if (threadIdx.x == 0) { 
@@ -122,18 +117,16 @@ void cs_attend_ker(const __grid_constant__ cs_globals<D> g) {
             init_semaphore(compute_done[j], CONSUMER_WARPGROUPS, 0); 
         }
 
-        // Cross-attention allows arbitrary Nq, so the final query block may
-        // contain fewer than CONSUMER_WARPGROUPS full Q/P tiles.
-        tma::expect_bytes(qsmem_semaphore, q_tiles_in_block * sizeof(q_tile));
+        tma::expect_bytes(qsmem_semaphore, sizeof(q_smem));
 
-        for (int wg = 0; wg < q_tiles_in_block; wg++) {
+        for (int wg = 0; wg < CONSUMER_WARPGROUPS; wg++) {
             coord<q_tile> q_tile_idx = {blockIdx.z, blockIdx.y, (seq_idx) + wg, 0};
             tma::load_async(q_smem[wg], g.q, q_tile_idx, qsmem_semaphore);
         }
 
-        tma::expect_bytes(psmem_semaphore, q_tiles_in_block * sizeof(p_col_vec));
+        tma::expect_bytes(psmem_semaphore, sizeof(p_smem));
 
-        for (int wg = 0; wg < q_tiles_in_block; wg++) {
+        for (int wg = 0; wg < CONSUMER_WARPGROUPS; wg++) {
             coord<p_col_vec> p_tile_idx = {blockIdx.z, blockIdx.y, 0, (seq_idx) + wg};
             tma::load_async(p_smem[wg], g.p, p_tile_idx, psmem_semaphore);
         }
@@ -212,17 +205,6 @@ void cs_attend_ker(const __grid_constant__ cs_globals<D> g) {
 
         kittens::wait(qsmem_semaphore, 0);
         kittens::wait(psmem_semaphore, 0);
-        if (warpgroupid >= q_tiles_in_block) {
-            for (auto kv_idx = 0; kv_idx <= kv_iters; kv_idx++) {
-                kittens::wait(k_smem_arrived[(kv_idx)%K::stages], (kv_idx/K::stages)%2);
-                kittens::wait(v_smem_arrived[(kv_idx)%K::stages], (kv_idx/K::stages)%2);
-                if(warpgroup::laneid() == 0) arrive(compute_done[(kv_idx)%K::stages], 1);
-            }
-            if (FUSE_REDUCE) {
-                group<12>::sync(14);
-            }
-            return;
-        }
         warpgroup::load(prev_norm_vec, p_smem[warpgroupid]);
 
         for (auto kv_idx = 0; kv_idx <= kv_iters; kv_idx++) {
@@ -234,9 +216,11 @@ void cs_attend_ker(const __grid_constant__ cs_globals<D> g) {
             }
             
             copy(max_vec_last_scaled, max_vec);
+            if constexpr (D == 64) { mul(max_vec_last_scaled, max_vec_last_scaled, 1.44269504089f*0.125f); }
+            // else                   { mul(max_vec_last_scaled, max_vec_last_scaled, 1.44269504089f*0.08838834764f); }
+            else                   { mul(max_vec_last_scaled, max_vec_last_scaled, 1.44269504089f); }
             
             warpgroup::mma_async_wait();
-            mul(att_block, att_block, g.scale_log2);
             right_fill(att_block, att_block, g.k.rows - kv_idx*K::kv_height, base_types::constants<float>::neg_infty());
 
             if constexpr (is_causal) {
@@ -258,7 +242,17 @@ void cs_attend_ker(const __grid_constant__ cs_globals<D> g) {
             }
 
             row_max(max_vec, att_block, max_vec);
-            copy(max_vec_scaled, max_vec);
+            
+            if constexpr (D == 64) { 
+                mul(att_block, att_block,    1.44269504089f*0.125f); 
+                mul(max_vec_scaled, max_vec, 1.44269504089f*0.125f);
+            }
+            else                   { 
+                // mul(att_block, att_block,    1.44269504089f*0.08838834764f); 
+                // mul(max_vec_scaled, max_vec, 1.44269504089f*0.08838834764f);
+                mul(att_block, att_block,    1.44269504089f); 
+                mul(max_vec_scaled, max_vec, 1.44269504089f);
+            }
 
             sub_row(att_block, att_block, max_vec_scaled);
             exp2(att_block, att_block);
@@ -331,15 +325,12 @@ void cs_attend_ker(const __grid_constant__ cs_globals<D> g) {
         if (FUSE_REDUCE) {
             group<12>::sync(14);
             for (int i = 4; i >= 0; i--) {
-                int store_kv_idx = kv_iters - i;
-                if (store_kv_idx >= 0) {
-                    bf16* dst = &g.c[{blockIdx.z, blockIdx.y, seq_group, store_kv_idx * K::kv_height}];
-                    bf16* src;
-                    // store from last 4 iterations (input pipeline depth * 2)
-                    src = &c_smem[(store_kv_idx + 1) % COLSUM_STORE_INTERVAL][0];
-                    if (warpid == 0) {
-                        store_colsum(dst, src, K::kv_height * sizeof(bf16));
-                    }
+                bf16* dst = &g.c[{blockIdx.z, blockIdx.y, seq_group, (kv_iters - i) * K::kv_height}];
+                bf16* src;
+                // store from last 4 iterations (input pipeline depth * 2)
+                src = &c_smem[(kv_iters - i + 1) % COLSUM_STORE_INTERVAL][0];
+                if (warpid == 0) {
+                    store_colsum(dst, src, K::kv_height * sizeof(bf16));
                 }
             }
         }
@@ -361,7 +352,7 @@ void cs_attend_ker(const __grid_constant__ cs_globals<D> g) {
 
 namespace chipmunk {
 std::vector<at::Tensor> 
-dense_colsum_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor p, c10::optional<double> scale)
+dense_colsum_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor p)
 {
     // CHECK_INPUT(q);
     // CHECK_INPUT(k);
@@ -397,9 +388,10 @@ dense_colsum_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor p, c10::o
     TORCH_CHECK(q.size(1) == qo_heads, "QO head dimension - idx 1 - must match for all inputs");
     TORCH_CHECK(k.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");
     TORCH_CHECK(v.size(1) == kv_heads, "KV head dimension - idx 1 - must match for all inputs");  
-    TORCH_CHECK(p.size(1) == qo_heads, "P head dimension - idx 1 - must match for all inputs");
+    TORCH_CHECK(p.size(1) == kv_heads, "P head dimension - idx 1 - must match for all inputs");
 
     TORCH_CHECK(p.stride(1) % (16/sizeof(float)) == 0, "P must have a stride multiple of 4 for TMA alignment requirements.");
+    // TORCH_CHECK(p.stride(2) % (16/sizeof(float)) == 0, "P (LSE) sequence stride must be 16B-aligned (got ", p.stride(2), ").");
 
     auto hr = qo_heads / kv_heads;
     auto seq_downsample = FUSE_REDUCE ? 192 : 16;
@@ -427,6 +419,11 @@ dense_colsum_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor p, c10::o
                                         static_cast<const uint>(seq_len), 
                                         static_cast<const uint>(head_dim)}, v.options());
     
+    // at::Tensor cs = torch::empty_strided(
+    //     {static_cast<const uint>(batch), static_cast<const uint>(qo_heads), static_cast<const uint>(qg), static_cast<const uint>(seq_len)}, 
+    //     {static_cast<const uint>(qo_heads*qg*seq_len_padded), static_cast<const uint>(qg*seq_len_padded), static_cast<const uint>(seq_len_padded), static_cast<const uint>(1)}, 
+    //     v.options()
+    // );
     at::Tensor cs = torch::empty_strided(
         {static_cast<const uint>(batch), static_cast<const uint>(qo_heads), static_cast<const uint>(qg), static_cast<const uint>(kseq_len)}, 
         {static_cast<const uint>(qo_heads*qg*kseq_len_padded), static_cast<const uint>(qg*kseq_len_padded), static_cast<const uint>(kseq_len_padded), static_cast<const uint>(1)}, 
@@ -452,9 +449,6 @@ dense_colsum_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor p, c10::o
     if (head_dim != 128) {
         throw std::runtime_error("Head dimension must be 128");
     }
-    const float scale_value = scale.has_value() ? static_cast<float>(*scale) : 1.0f / std::sqrt(static_cast<float>(head_dim));
-    TORCH_CHECK(std::isfinite(scale_value), "Attention scale must be finite");
-    const float scale_log2 = scale_value * 1.44269504089f;
     
     using q_tile    =         st_bf<cs_attend_ker_tile_dims<128>::qo_height, cs_attend_ker_tile_dims<128>::tile_width>;
     using k_tile    =         st_bf<cs_attend_ker_tile_dims<128>::kv_height, cs_attend_ker_tile_dims<128>::tile_width>;
@@ -479,6 +473,7 @@ dense_colsum_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor p, c10::o
     v_global vg_arg{d_v, static_cast<unsigned int>(batch), static_cast<unsigned int>(kv_heads), static_cast<unsigned int>(kseq_len), 128U};
     p_global pg_arg{d_p, static_cast<unsigned int>(batch), static_cast<unsigned int>(qo_heads), 1U,   static_cast<unsigned int>(seq_len_padded)};
     l_global lg_arg{d_l, static_cast<unsigned int>(batch), static_cast<unsigned int>(qo_heads), 1U,   static_cast<unsigned int>(seq_len_padded)};
+    // c_global cg_arg{d_cs, static_cast<unsigned int>(batch), static_cast<unsigned int>(qo_heads), static_cast<unsigned int>(qg), static_cast<unsigned int>(seq_len_padded)};
     c_global cg_arg{d_cs, static_cast<unsigned int>(batch), static_cast<unsigned int>(qo_heads), static_cast<unsigned int>(qg), static_cast<unsigned int>(kseq_len_padded)};
     o_global og_arg{d_o, static_cast<unsigned int>(batch), static_cast<unsigned int>(qo_heads), static_cast<unsigned int>(seq_len), 128U};
 
@@ -487,10 +482,12 @@ dense_colsum_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor p, c10::o
     chipmunk::create_tensor_map_with_strides<v_tile, 2>(&vg_arg.tma_descs.tma_desc, d_v, batch, kv_heads, kseq_len, head_dim, v.stride(0), v.stride(1), v.stride(2));
 
     chipmunk::create_tensor_map_with_strides<p_col_vec, -1>(&pg_arg.tma_descs.tma_desc, d_p, batch, qo_heads, 1U, seq_len, p.stride(0), p.stride(1), p.stride(3));
+    // chipmunk::create_tensor_map_with_strides<p_col_vec, -1>(&pg_arg.tma_descs.tma_desc, d_p, batch, qo_heads, 1U, seq_len, p.stride(0), p.stride(1), p.stride(2));
     chipmunk::create_tensor_map_with_strides<l_col_vec, -1>(&lg_arg.tma_descs.tma_desc, d_l, batch, qo_heads, 1U, seq_len, l_vec.stride(0), l_vec.stride(1), l_vec.stride(3));
+    // chipmunk::create_tensor_map_with_strides<l_col_vec, -1>(&lg_arg.tma_descs.tma_desc, d_l, batch, qo_heads, 1U, seq_len, l_vec.stride(0), l_vec.stride(1), l_vec.stride(2));
 
 
-    globals g{qg_arg, kg_arg, vg_arg, pg_arg, lg_arg, og_arg, cg_arg, static_cast<int>(kseq_len), static_cast<int>(hr), scale_log2};
+    globals g{qg_arg, kg_arg, vg_arg, pg_arg, lg_arg, og_arg, cg_arg, static_cast<int>(kseq_len), static_cast<int>(hr)};
 
     auto mem_size = kittens::MAX_SHARED_MEMORY;
     auto threads  = NUM_WORKERS * kittens::WARP_THREADS;

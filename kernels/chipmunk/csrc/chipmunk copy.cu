@@ -32,9 +32,9 @@ extern void csp_mlp_mm1(at::Tensor a, at::Tensor b_colmajor, at::Tensor c, at::T
 extern void csp_mlp_mm2_and_scatter_add(at::Tensor packed, at::Tensor unpacked_colmajor, at::Tensor sp_inds, at::Tensor sp_counts, at::Tensor mma_a, at::Tensor mma_b, at::Tensor mma_c, int64_t num_sms_scatter_add, int64_t matmul_kernel);
 
 // Sparse+Dense Attention
-extern void csp_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor indices, at::Tensor indices_counts, int64_t o_scale, c10::optional<double> scale);
-extern std::vector<at::Tensor> dense_attn(at::Tensor q, at::Tensor k, at::Tensor v, c10::optional<double> scale);
-extern std::vector<at::Tensor> dense_colsum_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor p, c10::optional<double> scale);
+extern void csp_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor indices, at::Tensor indices_counts, int64_t o_scale);
+extern std::vector<at::Tensor> dense_attn(at::Tensor q, at::Tensor k, at::Tensor v);
+extern std::vector<at::Tensor> dense_colsum_attn(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor p);
 // extern std::vector<at::Tensor> dense_colsum_attn(at::Tensor q, at::Tensor k, at::Tensor v);
 
 // Indexed IO
@@ -54,9 +54,9 @@ TORCH_LIBRARY(chipmunk, m) {
     m.def("csp_mlp_mm2_and_scatter_add(Tensor packed, Tensor(unpacked_colmajor!) unpacked_colmajor, Tensor sp_inds, Tensor sp_counts, Tensor mma_a, Tensor mma_b, Tensor mma_c, int num_sms_scatter_add, int matmul_kernel) -> ()");
 
     // Sparse+Dense Attention
-    m.def("csp_attn(Tensor q, Tensor k, Tensor v, Tensor o, Tensor indices, Tensor indices_counts, int o_scale, float? scale=None) -> ()");
-    m.def("dense_attn(Tensor q, Tensor k, Tensor v, float? scale=None) -> Tensor[]");
-    m.def("dense_colsum_attn(Tensor q, Tensor k, Tensor v, Tensor p, float? scale=None) -> Tensor[]");
+    m.def("csp_attn(Tensor q, Tensor k, Tensor v, Tensor o, Tensor indices, Tensor indices_counts, int o_scale) -> ()");
+    m.def("dense_attn(Tensor q, Tensor k, Tensor v) -> Tensor[]");
+    m.def("dense_colsum_attn(Tensor q, Tensor k, Tensor v, Tensor p) -> Tensor[]");
     // m.def("dense_colsum_attn(Tensor q, Tensor k, Tensor v) -> Tensor[]");
 
     // Indexed IO
