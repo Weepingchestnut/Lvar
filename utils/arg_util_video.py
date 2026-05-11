@@ -390,11 +390,15 @@ class InferArgs(Args):
     model_type: str = 'infinitystar_qwen8b'
     resolution: str = '720p'
     pn: str = '0.90M'  # Pixel numbers, '0.90M' 720p, '0.40M' 480p
+    # resolution: str = '480p'
+    # pn: str = '0.40M'
+
     fps: int = 16
     generation_duration: int = 5
     video_frames: int = generation_duration * fps + 1
     
     model_path: str = 'pretrained_models/infinitystar/infinitystar_8b_720p_weights'
+    # model_path: str = 'pretrained_models/infinitystar/infinitystar_8b_480p_weights'
     checkpoint_type: str = 'torch_shard'   # omnistore
     vae_path: str = 'pretrained_models/infinitystar/infinitystar_videovae.pth'
     text_encoder_ckpt: str = 'pretrained_models/infinitystar/text_encoder/flan-t5-xl-official/'
@@ -409,15 +413,22 @@ class InferArgs(Args):
     tau_image: float = 1
     tau_video: float = 0.4
     apg_norm_threshold: float = 0.05
-    image_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]'
-    video_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 1, 1]'
     # 使用 Tap 的 List 支持，这样终端可以直接输入 --image_scale_repetition 3 3 3 ...
     # image_scale_repetition: List[int] = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+    # ------ 720p ------
+    image_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]'
+    video_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 1, 1]'
+    detail_scale_min_tokens: int = 750
+    semantic_scales: int = 12
+    # ------ 480p ------
+    # image_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]'
+    # video_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 1]'
+    # detail_scale_min_tokens=350
+    # semantic_scales: int = 11
+
     append_enlarge2captain: int = 1
     append_duration2caption: int = 1
     use_two_stage_lfq: int = 1
-    detail_scale_min_tokens: int = 750
-    semantic_scales: int = 12
     max_repeat_times: int = 10000
     
     # For optimal performance, enabling the prompt rewriter is recommended.
@@ -427,9 +438,13 @@ class InferArgs(Args):
     # *--> use official rewrite VBench_rewrited_prompt.json
     enable_rewriter: int = 0
     
+    # --------------------------------
     # -------- VBench Setting --------
+    # --------------------------------
     prompt_json: str = 'evaluation/vbench/VBench_rewrited_prompt_fixed_seed.json'
     output_root: str = 'work_dir/evaluation/vbench/infinitystar_480p_81frames'
+    save_raw_png_frames: int = 1
+    save_raw_npy_frames: int = 0
     start_index: int = 0
     end_index: int = -1
     num_samples_per_prompt: int = 5
@@ -442,8 +457,54 @@ class InferArgs(Args):
         # 'appearance_style',
     ]
 
+    # -----------------------------------------
     # -------- Latency Profile Setting --------
+    # -----------------------------------------
     infer_batch_size: int = 1
-    warmup_iter: int = 2
-    profile_iter: int = 30
-    profile_output_root: str = f'work_dir/infer_profile/infinitystar_{resolution}/latency-profile_fps{fps}_{generation_duration}s_enlarge2captain{append_enlarge2captain}'
+    warmup_iter: int = 2        # default: 2
+    profile_iter: int = 30       # default: 30
+    profile_output_root: str = f'work_dir/play_models/infinitystar_{resolution}/latency-profile_fps{fps}_{generation_duration}s_enlarge2captain{append_enlarge2captain}'
+
+    # ------------------------------------------
+    # -------- Attention Map Experiment --------
+    # ------------------------------------------
+    attn_map_prompt: str = "A sleek, modern airplane is captured from a side view as it soars through a clear blue sky. The sunlight reflects off its polished metal surface, emphasizing the plane's streamlined design. The airplane's wings are slightly tilted, indicating a gentle ascent. Contrails form behind its engines, adding to the sense of motion and speed. The camera pans slowly from left to right, following the airplane's graceful movement against the vast sky."
+    attn_map_negative_prompt: str = ''
+    attn_map_output_root: str = f'work_dir/analysis_results/infinitystar_{resolution}/attn_maps'
+    attn_map_vmin: float = 0.0
+    attn_map_vmax: float = 0.001
+    attn_map_query_chunk_size: int = 4096           # 128
+    attn_map_head_chunk_size: int = 4
+    attn_map_full_attention_gb: float = 8.0         # default: 4.0
+    attn_map_prompt_prefix_chars: int = 50
+    attn_map_single_min_short_inches: float = 1.3
+    attn_map_single_max_long_inches: float = 400.0
+    attn_map_incremental_stitched: int = 0          # update stitched attn map
+    attn_map_save_single_png: int = 1
+    attn_map_fast_png: int = 1
+    attn_map_resume: int = 1
+    attn_map_resume_regenerate_png: int = 1
+    attn_map_selected_steps: str = 'scale_15_repeat2,scale_16_repeat2,scale_17_repeat2,scale_18_repeat2,scale_19_repeat2,scale_20_repeat2,scale_21_repeat2,scale_22_repeat2,scale_23_repeat2,scale_24_repeat2,scale_25_repeat2,scale_26_repeat2,scale_27_repeat1,scale_28_repeat0,scale_29_repeat0'
+    attn_map_selected_layers: str = ''
+    attn_map_storage_mode: str = 'fp16_zlib'       # fp16, fp16_zlib, uint8, uint8_zlib, uint16, uint16_zlib
+    attn_map_storage_compress_level: int = 6
+    attn_map_quantize_from_step: str = 'scale_28_repeat0'
+    attn_map_verbose: int = 1                       # print qkv shape
+    attn_map_save_video: int = 1
+
+    # -------------------------------------------
+    # -------- CFG Similarity Experiment --------
+    # -------------------------------------------
+    # cfg_analysis_prompt: str = "A sleek, modern airplane is captured from a side view as it soars through a clear blue sky. The sunlight reflects off its polished metal surface, emphasizing the plane's streamlined design. The airplane's wings are slightly tilted, indicating a gentle ascent. Contrails form behind its engines, adding to the sense of motion and speed. The camera pans slowly from left to right, following the airplane's graceful movement against the vast sky."
+    cfg_analysis_prompt: str = "A woman with shoulder-length brown hair is seen talking to someone off-screen to the right. She is wearing a dark-colored top and a necklace. The background is blurred, but it appears to be an indoor setting with some indistinct objects and a window. The woman slightly moves her head while speaking."
+    cfg_analysis_output_root: str = f'work_dir/analysis_results/infinitystar_{resolution}/cfg_similarity'
+    cfg_analysis_prompt_prefix_chars: int = 50
+    cfg_analysis_eps: float = 1e-8
+    cfg_analysis_plot_dpi: int = 220
+    cfg_analysis_enable_cosine_similarity: int = 1
+    cfg_analysis_enable_delta_l2: int = 1
+    cfg_analysis_enable_delta_l2_relative: int = 1
+    cfg_analysis_enable_delta_fro_relative: int = 1
+    cfg_analysis_enable_relative_delta: int = 1
+    cfg_analysis_verbose: int = 1
+    cfg_analysis_save_video: int = 1

@@ -276,16 +276,44 @@ def gen_one_video(
     return img, pred_multi_scale_bit_labels
 
 
-def save_video(ndarray_image_list, fps=24, save_filepath='tmp.mp4'):
+def save_video(
+    ndarray_image_list,
+    fps=24,
+    save_filepath='tmp.mp4',
+    save_raw_png_frames=False,
+    save_raw_npy_frames=False,
+):
+    os.makedirs(osp.dirname(save_filepath), exist_ok=True)
+    save_stem, _ = osp.splitext(save_filepath)
+
     if len(ndarray_image_list) == 1:
-        save_filepath = save_filepath.replace('.mp4', '.jpg')
-        cv2.imwrite(save_filepath, ndarray_image_list[0])
-        print(f"Image saved as {osp.abspath(save_filepath)}")
+        image_save_filepath = save_filepath.replace('.mp4', '.jpg')
+        cv2.imwrite(image_save_filepath, ndarray_image_list[0])
+        print(f"Image saved as {osp.abspath(image_save_filepath)}")
+
+        if save_raw_npy_frames:
+            np.save(f'{save_stem}.npy', ndarray_image_list)
+            print(f"Numpy frames saved as {osp.abspath(f'{save_stem}.npy')}")
+
+        if save_raw_png_frames:
+            png_dir = save_stem
+            os.makedirs(png_dir, exist_ok=True)
+            cv2.imwrite(osp.join(png_dir, '00000.png'), ndarray_image_list[0])
+            print(f"PNG frames saved under {osp.abspath(png_dir)}")
     else:
-        h, w = ndarray_image_list[0].shape[:2]
-        os.makedirs(osp.dirname(save_filepath), exist_ok=True)
         imageio.mimsave(save_filepath, ndarray_image_list[:, :, :, ::-1], fps=fps,)
         print(f"Video saved as {osp.abspath(save_filepath)}")
+
+        if save_raw_npy_frames:
+            np.save(f'{save_stem}.npy', ndarray_image_list)
+            print(f"Numpy frames saved as {osp.abspath(f'{save_stem}.npy')}")
+
+        if save_raw_png_frames:
+            png_dir = save_stem
+            os.makedirs(png_dir, exist_ok=True)
+            for frame_idx, frame in enumerate(ndarray_image_list):
+                cv2.imwrite(osp.join(png_dir, f'{frame_idx:05d}.png'), frame)
+            print(f"PNG frames saved under {osp.abspath(png_dir)}")
 
 
 def get_prompt_id(prompt):
@@ -366,7 +394,6 @@ def load_infinity(
     args=None,
     # todo: --- exp params ---
     # freeze_kv_cache_last_n_scales: int = 4
-    attn_sink_scales: int = 5,
     skip_last_scales: int = 0,
     drop_uncond_last_scales: int = 3,
 ):
@@ -486,11 +513,8 @@ def load_infinity(
                 apply_spatial_patchify=apply_spatial_patchify,
                 inference_mode=True,
                 train_h_div_w_list=[1.0],
-                # todo: --- exp params ---
-                # freeze_kv_cache_last_n_scales=freeze_kv_cache_last_n_scales,
-                # base_cache_scales=base_cache_scales,
+                # 
                 skip_last_scales=skip_last_scales,
-                attn_sink_scales=attn_sink_scales,
                 drop_uncond_last_scales=drop_uncond_last_scales,
                 **model_kwargs,
             ).to(device=device)
@@ -701,7 +725,6 @@ def load_transformer(vae, args, load_weights=True):
         args=args,
         # todo: --- exp params ---
         # freeze_kv_cache_last_n_scales=args.freeze_kv_cache_last_n_scales
-        attn_sink_scales=args.attn_sink_scales,
         skip_last_scales=args.skip_last_scales,
         drop_uncond_last_scales=args.drop_uncond_last_scales
     )
@@ -864,7 +887,7 @@ def add_common_arguments(parser):
     # parser.add_argument('--freeze_kv_cache_last_n_scales', type=int, default=4)
     parser.add_argument('--attn_sink_scales', type=int, default=5, help='Sink the attention maps of the last few scales')
     parser.add_argument('--skip_last_scales', type=int, default=0, help='Skip the last few scales')
-    parser.add_argument('--drop_uncond_last_scales', type=int, default=0, help='Drop the unconditional branch of last few scales')
+    parser.add_argument('--drop_uncond_last_scales', type=int, default=3, help='Drop the unconditional branch of last few scales')
 
 
 if __name__ == '__main__':

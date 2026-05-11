@@ -45,7 +45,7 @@ def prepare4infer(pipe, data, args):
     scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['pt2scale_schedule'][(num_frames-1)//4+1]
     args.first_full_spatial_size_scale_index = get_first_full_spatial_size_scale_index(scale_schedule)
     args.tower_split_index = args.first_full_spatial_size_scale_index + 1
-    context_info = pipe.get_scale_pack_info(scale_schedule, args.first_full_spatial_size_scale_index, args)    
+    context_info = pipe.get_scale_pack_info(scale_schedule, args.first_full_spatial_size_scale_index, args)
     scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['pt2scale_schedule'][(num_frames-1)//4+1]
     tau = [args.tau_image] * args.tower_split_index + [args.tau_video] * (len(scale_schedule) - args.tower_split_index)
     tgt_h, tgt_w = scale_schedule[-1][1] * 16, scale_schedule[-1][2] * 16

@@ -26,7 +26,6 @@ evaluation_results*
 *.pth
 pretrained_models/
 
-
 # pkgs
 *.whl
 *.zip
@@ -37,14 +36,31 @@ models/hart/kernels/hart_backend.egg-info/
 models/hart/kernels/dist
 *.so
 
+kernels/flash_atten/triton/*.csv
+kernels/flash_atten/triton/*.png
+kernels/flash_atten/triton/*.html
+
 # dev ing...
 *.pkl
 tools/conf.py
+tools/conf_none.py
+tools/pyramid_attn_map
+
+# TODO & old version
+TODO_*
 
 models/fastvar/old_version/
 models/lpd/orders/
 models/infinity copy/
+models/hart/attn_map_vis/
+
 mytest/
 
 scripts/exp*
 scripts/spattn_exp/
+
+# AI coding
+AGENTS.md
+CLAUDE.md
+
+

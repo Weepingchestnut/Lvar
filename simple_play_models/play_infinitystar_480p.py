@@ -21,46 +21,47 @@ from models.infinitystar.self_correction import SelfCorrection
 from models.schedules import get_encode_decode_func
 from models.schedules.dynamic_resolution import (
     get_dynamic_resolution_meta, get_first_full_spatial_size_scale_index)
-from tools.run_infinity import (gen_one_video, load_tokenizer,
+from tools.run_infinity import (InferencePipe, gen_one_video, load_tokenizer,
                                 load_video_transformer, save_video, transform)
 from utils.arg_util_video import Args
 from utils.load import load_video_visual_tokenizer
+from utils.misc import time_str
 from utils.video_decoder import EncodedVideoDecord
 
 
-def _init_prompt_rewriter():
-    from tools.prompt_rewriter import OpenAIGPTModel
-    """Initialize the OpenAI GPT model."""
-    # Initialize the OpenAI GPT model
-    model_name = 'gpt-4o-2024-08-06'
-    ak = os.environ.get("OPEN_API_KEY", "")
-    if len(ak) == 0:
-        raise ValueError("Please provide your OpenAI API key in the OPEN_API_KEY environment variable.")
-    model = OpenAIGPTModel(model_name, ak, if_global=True)
-    system_prompt = (
-        "You are a large language model specialized in rewriting video descriptions. Your task is to modify the input description to make the video more realistic and beautiful. 0. Preserve ALL information, including style words and technical terms. 1. If the subject is related to person, you need to provide a detailed description focusing on basic visual characteristics of the person, such as appearance, clothing, expression, posture, etc. You need to make the person as beautiful and handsome as possible. When the subject is only one person or object, do not use they to describe him/her/it to avoid confusion with multiple subjects. 2. If the input does not include style, lighting, atmosphere, you can make reasonable associations. 3. We only generate a four-second video based on your descriptions. So do not generate descriptions that are too long, too complex or contain too many activities. 4. You can add some descriptions of camera movements with regards to the scenes and allow the scenes to have very natural and coherent movements. 6. If the input is in Chinese, translate the entire description to English. 7. Output ALL must be in English. 8. Here are some expanded descriptions that can serve as examples: 1. The video begins with a distant aerial view of a winding river cutting through a rocky landscape, with the sun casting a soft glow over the scene. As the camera moves closer, the river's flow becomes more visible, and the surrounding terrain appears more defined. The camera continues to approach, revealing a steep cliff with a person sitting on its edge. The person is positioned near the top of the cliff, overlooking the river below. The camera finally reaches a close-up view, showing the person sitting calmly on the cliff, with the river and landscape fully visible in the background. 2. In a laboratory setting, a machine with a metallic structure and a green platform is seen. A small, clear plastic bottle is positioned on the green platform. The machine has a control panel with red and green lights on the right side. A nozzle is positioned above the bottle, and it begins to dispense liquid into the bottle. The liquid is dispensed in small droplets, and the nozzle moves slightly between each droplet. The background includes other laboratory equipment and a mesh-like structure. 3. The video shows a panoramic view of a cityscape with a prominent building featuring a green dome and ornate architecture in the center. Surrounding the main building are several other structures, including a white building with balconies on the left and a taller building with multiple windows on the right. In the background, there are hills with scattered buildings and greenery. The camera remains stationary, capturing the scene from a fixed position, with no noticeable changes in the environment or the buildings throughout the frames. 4. In a dimly lit room with red and blue lighting, a person holds up a smartphone to record a video of a band performing. The band members are seated, with one holding a guitar and another playing a double bass. The smartphone screen shows the band members being recorded, with the camera capturing their movements and expressions. The background includes a lamp and some furniture, adding to the cozy atmosphere of the scene. 5. In a grassy area with scattered trees, a large tree stands prominently in the center. A lion is perched on a thick branch of this tree, looking out into the distance. The sky is overcast, adding a somber tone to the scene. 6. A man in a green sweater holding a paper turns around and speaks to a group of people seated in a theater. He then points at a man in a yellow sweater sitting in the front row. The man in the yellow sweater looks at the paper in his hand and begins to speak. The man in the green sweater lowers his head and then looks up at the man in the yellow sweater again. 7. An elderly man, wearing a beige sweater over a yellow shirt, is sitting in front of a laptop. He holds a pair of glasses in his right hand and appears to be deep in thought, resting his head on his hand. He then raises the glasses and rubs his eyes with his fingers, showing signs of fatigue. After rubbing his eyes, he places the glasses on his sweater and looks down at the laptop screen. 8. A woman and a child are sitting at a table, each holding a pencil and coloring on a piece of paper. The woman is coloring a green leafy plant, while the child is coloring a red and blue object. The table has several colored pencils, a container filled with more pencils, and a few small colorful blocks. The woman is wearing a striped shirt, and the child is focused on their drawing. 9. A person wearing teal running shoes and colorful socks is running on a wet, sandy surface. The camera captures the movement of their legs and feet as they lift off the ground and land back, creating a clear shadow on the wet sand. The shadow elongates and shifts with each step, indicating the person's motion. The background remains consistent with the wet, textured sand, and the focus is solely on the runner's feet and their shadow. 10. A man is running along the shoreline of a beach, with the ocean waves gently crashing onto the shore. The sun is setting in the background, casting a warm glow over the scene. The man is wearing a light-colored jacket and shorts, and his hair is blowing in the wind as he runs. The water splashes around his legs as he moves forward, and his reflection is visible on the wet sand. The waves create a dynamic and lively atmosphere as they roll in and out."
-    )
-    gpt_model = OpenAIGPTModel(model_name, ak, if_global=True)
-    return gpt_model, system_prompt
+# def _init_prompt_rewriter():
+#     from tools.prompt_rewriter import OpenAIGPTModel
+#     """Initialize the OpenAI GPT model."""
+#     # Initialize the OpenAI GPT model
+#     model_name = 'gpt-4o-2024-08-06'
+#     ak = os.environ.get("OPEN_API_KEY", "")
+#     if len(ak) == 0:
+#         raise ValueError("Please provide your OpenAI API key in the OPEN_API_KEY environment variable.")
+#     model = OpenAIGPTModel(model_name, ak, if_global=True)
+#     system_prompt = (
+#         "You are a large language model specialized in rewriting video descriptions. Your task is to modify the input description to make the video more realistic and beautiful. 0. Preserve ALL information, including style words and technical terms. 1. If the subject is related to person, you need to provide a detailed description focusing on basic visual characteristics of the person, such as appearance, clothing, expression, posture, etc. You need to make the person as beautiful and handsome as possible. When the subject is only one person or object, do not use they to describe him/her/it to avoid confusion with multiple subjects. 2. If the input does not include style, lighting, atmosphere, you can make reasonable associations. 3. We only generate a four-second video based on your descriptions. So do not generate descriptions that are too long, too complex or contain too many activities. 4. You can add some descriptions of camera movements with regards to the scenes and allow the scenes to have very natural and coherent movements. 6. If the input is in Chinese, translate the entire description to English. 7. Output ALL must be in English. 8. Here are some expanded descriptions that can serve as examples: 1. The video begins with a distant aerial view of a winding river cutting through a rocky landscape, with the sun casting a soft glow over the scene. As the camera moves closer, the river's flow becomes more visible, and the surrounding terrain appears more defined. The camera continues to approach, revealing a steep cliff with a person sitting on its edge. The person is positioned near the top of the cliff, overlooking the river below. The camera finally reaches a close-up view, showing the person sitting calmly on the cliff, with the river and landscape fully visible in the background. 2. In a laboratory setting, a machine with a metallic structure and a green platform is seen. A small, clear plastic bottle is positioned on the green platform. The machine has a control panel with red and green lights on the right side. A nozzle is positioned above the bottle, and it begins to dispense liquid into the bottle. The liquid is dispensed in small droplets, and the nozzle moves slightly between each droplet. The background includes other laboratory equipment and a mesh-like structure. 3. The video shows a panoramic view of a cityscape with a prominent building featuring a green dome and ornate architecture in the center. Surrounding the main building are several other structures, including a white building with balconies on the left and a taller building with multiple windows on the right. In the background, there are hills with scattered buildings and greenery. The camera remains stationary, capturing the scene from a fixed position, with no noticeable changes in the environment or the buildings throughout the frames. 4. In a dimly lit room with red and blue lighting, a person holds up a smartphone to record a video of a band performing. The band members are seated, with one holding a guitar and another playing a double bass. The smartphone screen shows the band members being recorded, with the camera capturing their movements and expressions. The background includes a lamp and some furniture, adding to the cozy atmosphere of the scene. 5. In a grassy area with scattered trees, a large tree stands prominently in the center. A lion is perched on a thick branch of this tree, looking out into the distance. The sky is overcast, adding a somber tone to the scene. 6. A man in a green sweater holding a paper turns around and speaks to a group of people seated in a theater. He then points at a man in a yellow sweater sitting in the front row. The man in the yellow sweater looks at the paper in his hand and begins to speak. The man in the green sweater lowers his head and then looks up at the man in the yellow sweater again. 7. An elderly man, wearing a beige sweater over a yellow shirt, is sitting in front of a laptop. He holds a pair of glasses in his right hand and appears to be deep in thought, resting his head on his hand. He then raises the glasses and rubs his eyes with his fingers, showing signs of fatigue. After rubbing his eyes, he places the glasses on his sweater and looks down at the laptop screen. 8. A woman and a child are sitting at a table, each holding a pencil and coloring on a piece of paper. The woman is coloring a green leafy plant, while the child is coloring a red and blue object. The table has several colored pencils, a container filled with more pencils, and a few small colorful blocks. The woman is wearing a striped shirt, and the child is focused on their drawing. 9. A person wearing teal running shoes and colorful socks is running on a wet, sandy surface. The camera captures the movement of their legs and feet as they lift off the ground and land back, creating a clear shadow on the wet sand. The shadow elongates and shifts with each step, indicating the person's motion. The background remains consistent with the wet, textured sand, and the focus is solely on the runner's feet and their shadow. 10. A man is running along the shoreline of a beach, with the ocean waves gently crashing onto the shore. The sun is setting in the background, casting a warm glow over the scene. The man is wearing a light-colored jacket and shorts, and his hair is blowing in the wind as he runs. The water splashes around his legs as he moves forward, and his reflection is visible on the wet sand. The waves create a dynamic and lively atmosphere as they roll in and out."
+#     )
+#     gpt_model = OpenAIGPTModel(model_name, ak, if_global=True)
+#     return gpt_model, system_prompt
 
 
-class InferencePipe:
-    def __init__(self, args):
-        # load text encoder
-        self.text_tokenizer, self.text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt)
-        # load vae
-        self.vae = load_video_visual_tokenizer(args)
-        self.vae = self.vae.float().to('cuda')
-        # load infinity
-        self.infinity = load_video_transformer(self.vae, args)
-        self.self_correction = SelfCorrection(self.vae, args)
+# class InferencePipe:
+#     def __init__(self, args):
+#         # load text encoder
+#         self.text_tokenizer, self.text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt)
+#         # load vae
+#         self.vae = load_video_visual_tokenizer(args)
+#         self.vae = self.vae.float().to('cuda')
+#         # load infinity
+#         self.infinity = load_video_transformer(self.vae, args)
+#         self.self_correction = SelfCorrection(self.vae, args)
         
-        self._models = [self.text_tokenizer, self.text_encoder, self.vae, self.infinity, self.self_correction]
+#         self._models = [self.text_tokenizer, self.text_encoder, self.vae, self.infinity, self.self_correction]
 
-        self.video_encode, self.video_decode, self.get_visual_rope_embeds, self.get_scale_pack_info = get_encode_decode_func(args.dynamic_scale_schedule)
+#         self.video_encode, self.video_decode, self.get_visual_rope_embeds, self.get_scale_pack_info = get_encode_decode_func(args.dynamic_scale_schedule)
 
-        if args.enable_rewriter:
-            self.gpt_model, self.system_prompt = _init_prompt_rewriter()
+#         if args.enable_rewriter:
+#             self.gpt_model, self.system_prompt = _init_prompt_rewriter()
 
 
 def perform_inference(pipe, data, args):
@@ -218,10 +219,10 @@ if __name__ == '__main__':
         print(f"Rewritten prompt: {rewritten_prompt}")
         prompt = rewritten_prompt
     data['prompt'] = prompt
-                
+    
     output_dict = perform_inference(pipe, data, args)
     save_dir = 'work_dir/infer_test/video_output'
-    gen_video_path = osp.join(os.path.join(save_dir, 'gen_videos'), f'demo.mp4')
+    gen_video_path = osp.join(os.path.join(save_dir, 'gen_videos'), f'demo_{time_str()}.mp4')
     save_video(output_dict['output'], fps=args.fps, save_filepath=gen_video_path)
             
     print(f"Video genernation done: {gen_video_path=}")

@@ -1,7 +1,7 @@
 from typing import Tuple
 import torch.nn as nn
 
-from .code.code_var import CoDe_VAR
+# from .code.code_var import CoDe_VAR
 from .vae.vqvae import VQVAE
 from .var.var_model import VAR
 

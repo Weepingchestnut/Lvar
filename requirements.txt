@@ -7,6 +7,7 @@ einops
 httpx
 huggingface_hub
 imageio
+imageio-ffmpeg
 lightning-fabric
 matplotlib
 ninja

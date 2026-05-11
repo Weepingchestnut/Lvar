@@ -18,12 +18,13 @@ Acceleration Method
 - FastVAR (ICCV'2025)
 - SparseVAR (ICCV'2025)
 - ScaleKV (NeurIPS'2025)
-- SkipVAR
+- SkipVAR (arXiv'2025)
+<!-- - SparVAR (CVPR'2026) -->
 
 
 ## ⚙️ Installation
 
-### Basic Env.
+### 1. Basic Env.
 - Some customized Kernels are written for **Hopper** GPUs, and depend on optimizations specific to CUDA Toolkit version ≥ 12.8 (recommend `12.8.1`!).
 - For PyTorch, the recommended version is `2.7.1` or later.
 
@@ -42,14 +43,16 @@ pip install -r requirements.txt
 vim ~/.bashrc
 export PYTHONPATH=$PYTHONPATH:{your-path}/Lvar
 ```
+<!-- export PYTHONPATH=$PYTHONPATH:/share/project/wangning/158/zekun/wkspace/Lvar -->
 
-### Kernel Compile
-Our SparVAR
-```bash
+### 2. Kernel Compile
 
-```
+#### 2.1 SparVAR
 
-HART
+The installation of SparVAR Cross-Scale Self-Similar Sparse Attention ($CS^4A$) is rather complicated; please refer to [Install SparVAR $CS^4A$ Kernels](./kernels/chipmunk/readme.md).
+<!-- SparVAR的跨尺度自相似稀疏注意力的安装比较复杂，请参考A [Install SparVAR $CS^4A$ Kernels](./kernels/chipmunk/readme.md) -->
+
+#### 2.2 HART
 ```bash
 cd models/hart/kernels
 bash install.sh
@@ -57,9 +60,9 @@ bash install.sh
 
 ---
 
-### Model Zoo
+## Model Zoo
 
-#### Infinity
+### Infinity weights
 
 **Download [flan-t5-xl](https://huggingface.co/google/flan-t5-xl).**
 
@@ -98,10 +101,11 @@ huggingface-cli download FoundationVision/Infinity --include="infinity_vae_d32re
 huggingface-cli download FoundationVision/Infinity --include="infinity_2b_reg.pth" --local-dir ./
 ```
 
-For more models, please refer to the `readme` of each model in the `pretrained_models/` directory.
+For more models, please refer to the `hf_down.sh` of each model in the `pretrained_models/` directory.
 
-- [LlamaGen](./pretrained_models/llamagen/readme.md)
-- 
+e.g.
+<!-- - [LlamaGen](./pretrained_models/llamagen/readme.md) -->
+- [Infinity](./pretrained_models/infinity/hf_down.sh)
 
 ## 🍭 Evaluation
 

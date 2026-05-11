@@ -1,3 +1,4 @@
+import argparse
 import math
 import time
 import traceback
@@ -11,6 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 # Import flash_attn's attention
 # from flash_attn_interface import flash_attn_func; print('#'*10 + ' use FA3 ' + '#'*10)
+# from flash_attn.cute import flash_attn_func; print('#'*10 + ' use FA4 ' + '#'*10)
 from flash_attn import flash_attn_func  # q, k, or v: BLHc, ret: BLHc
 
 from kernels.sparse_attn.sparse_attn_ops import dense_attn
@@ -34,10 +36,10 @@ class BenchConfig:
 # 你可以按需改这里
 BENCH_CONFIGS: List[BenchConfig] = [
     # NOTE: chipmunk do not support head_dim != 128
-    BenchConfig(batch=1, heads=8,  q_len=256,  kv_len=256,  head_dim=64),
-    BenchConfig(batch=1, heads=8,  q_len=256,  kv_len=1024, head_dim=64),
-    BenchConfig(batch=2, heads=16, q_len=512,  kv_len=512,  head_dim=64),
-    BenchConfig(batch=2, heads=16, q_len=512,  kv_len=2048, head_dim=64),
+    # BenchConfig(batch=1, heads=8,  q_len=256,  kv_len=256,  head_dim=64),
+    # BenchConfig(batch=1, heads=8,  q_len=256,  kv_len=1024, head_dim=64),
+    # BenchConfig(batch=2, heads=16, q_len=512,  kv_len=512,  head_dim=64),
+    # BenchConfig(batch=2, heads=16, q_len=512,  kv_len=2048, head_dim=64),
     
     BenchConfig(batch=4, heads=16, q_len=1024, kv_len=1024, head_dim=128),
     BenchConfig(batch=4, heads=16, q_len=1024, kv_len=4096, head_dim=128),
@@ -47,10 +49,14 @@ BENCH_CONFIGS: List[BenchConfig] = [
     BenchConfig(batch=1, heads=24,  q_len=4096,  kv_len=10521, head_dim=128),
     BenchConfig(batch=2, heads=24,  q_len=4096,  kv_len=10521, head_dim=128),
 
-    # BenchConfig(batch=2, heads=32,  q_len=11520,  kv_len=15244, head_dim=128),
-    # BenchConfig(batch=2, heads=32,  q_len=20640,  kv_len=24364, head_dim=128),
-    # BenchConfig(batch=2, heads=32,  q_len=31800,  kv_len=35524, head_dim=128),
-    # BenchConfig(batch=2, heads=32,  q_len=72000,  kv_len=75724, head_dim=128),
+    BenchConfig(batch=1, heads=32,  q_len=11520,  kv_len=15244, head_dim=128),
+    BenchConfig(batch=2, heads=32,  q_len=11520,  kv_len=15244, head_dim=128),
+    BenchConfig(batch=1, heads=32,  q_len=20640,  kv_len=24364, head_dim=128),
+    BenchConfig(batch=2, heads=32,  q_len=20640,  kv_len=24364, head_dim=128),
+    BenchConfig(batch=1, heads=32,  q_len=31800,  kv_len=35524, head_dim=128),
+    BenchConfig(batch=2, heads=32,  q_len=31800,  kv_len=35524, head_dim=128),
+    BenchConfig(batch=1, heads=32,  q_len=72000,  kv_len=75724, head_dim=128),
+    BenchConfig(batch=2, heads=32,  q_len=72000,  kv_len=75724, head_dim=128),
 
     # test Triton fused-attention
     # BenchConfig(batch=1, heads=24,  q_len=2048,  kv_len=2048, head_dim=128),
@@ -65,6 +71,8 @@ DEVICE = "cuda"
 WARMUP = 20
 ITERS = 100
 CHECK_ACCURACY = True
+# REFERENCE_IMPL = "fp32"
+REFERENCE_IMPL = "sdpa"
 ACCURACY_ATOL_FP16 = 2e-2
 ACCURACY_RTOL_FP16 = 2e-2
 PRINT_TENSOR_STATS = False
@@ -151,6 +159,9 @@ def rel_l2_error(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> float:
 # =========================
 # Reference
 # =========================
+REFERENCE_CHOICES = ("fp32", "flash_cuda", "sdpa")
+
+
 def ref_attention_fp32(q_bhqd: torch.Tensor, k_bhkd: torch.Tensor, v_bhkd: torch.Tensor, sm_scale: Optional[float]) -> torch.Tensor:
     """
     q: [B, H, Q, D]
@@ -167,6 +178,24 @@ def ref_attention_fp32(q_bhqd: torch.Tensor, k_bhkd: torch.Tensor, v_bhkd: torch
     probs = torch.softmax(scores, dim=-1)
     out = torch.matmul(probs, v)
     return out
+
+
+def make_reference_output(
+    reference_impl: str,
+    q_bhqd: torch.Tensor,
+    k_bhkd: torch.Tensor,
+    v_bhkd: torch.Tensor,
+    sm_scale: Optional[float],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if reference_impl == "fp32":
+        return ref_attention_fp32(q_bhqd, k_bhkd, v_bhkd, sm_scale).to(dtype)
+    if reference_impl == "flash_cuda":
+        # Avoid materializing the full [B, H, Q, KV] score tensor for long-sequence accuracy checks.
+        return run_flash_cuda(q_bhqd, k_bhkd, v_bhkd, sm_scale).to(dtype)
+    if reference_impl == "sdpa":
+        return run_sdpa(q_bhqd, k_bhkd, v_bhkd, sm_scale).to(dtype)
+    raise ValueError(f"Unsupported reference_impl={reference_impl!r}; choices={REFERENCE_CHOICES}")
 
 
 # =========================
@@ -190,11 +219,12 @@ def run_flash_cuda(q_bhqd: torch.Tensor, k_bhkd: torch.Tensor, v_bhkd: torch.Ten
     k = k_bhkd.transpose(1, 2).contiguous()
     v = v_bhkd.transpose(1, 2).contiguous()
 
-    out = flash_attn_func(
+    ret = flash_attn_func(
         q, k, v,
         softmax_scale=sm_scale,
         causal=False,
     )
+    out = ret[0] if isinstance(ret, tuple) else ret
     return out.transpose(1, 2).contiguous()
 
 
@@ -232,13 +262,22 @@ PROVIDERS: Dict[str, Callable[[torch.Tensor, torch.Tensor, torch.Tensor, Optiona
 # =========================
 # Main evaluation
 # =========================
-def check_accuracy_one(cfg: BenchConfig, sm_scale: Optional[float] = None):
+def check_accuracy_one(cfg: BenchConfig, sm_scale: Optional[float] = None, reference_impl: str = REFERENCE_IMPL):
     q, k, v = make_inputs(cfg, requires_grad=False)
 
-    ref = ref_attention_fp32(q, k, v, sm_scale).to(cfg.dtype)
+    with torch.inference_mode():
+        ref = make_reference_output(reference_impl, q, k, v, sm_scale, cfg.dtype)
 
     results = {}
     for name, fn in PROVIDERS.items():
+        if name == reference_impl:
+            results[name] = {
+                "ok": True,
+                "max_abs": 0.0,
+                "rel_l2": 0.0,
+                "note": "reference",
+            }
+            continue
 
         try:
             with torch.inference_mode():
@@ -296,11 +335,12 @@ def print_header():
     print("=" * 120)
 
 
-def print_accuracy(cfg: BenchConfig, acc_results: Dict[str, dict]):
+def print_accuracy(cfg: BenchConfig, acc_results: Dict[str, dict], reference_impl: str):
     print("\n" + "-" * 120)
     print(
         f"[Accuracy] "
-        f"B={cfg.batch:>2} H={cfg.heads:>3} Q={cfg.q_len:>5} KV={cfg.kv_len:>5} D={cfg.head_dim:>4} dtype={str(cfg.dtype).replace('torch.', '')}"
+        f"B={cfg.batch:>2} H={cfg.heads:>3} Q={cfg.q_len:>5} KV={cfg.kv_len:>5} D={cfg.head_dim:>4} "
+        f"dtype={str(cfg.dtype).replace('torch.', '')} reference={reference_impl}"
     )
     print(f"{'provider':<15} {'ok':<8} {'max_abs':<14} {'rel_l2':<14} {'note'}")
     # for name in ["sdpa", "flash_cuda", "flash_triton", "chipmunk"]:
@@ -316,6 +356,7 @@ def print_accuracy(cfg: BenchConfig, acc_results: Dict[str, dict]):
                 f"{str(item['ok']):<8} "
                 f"{item['max_abs']:<14.6e} "
                 f"{item['rel_l2']:<14.6e} "
+                f"{item.get('note', '')}"
             )
     print("-" * 120)
 
@@ -331,7 +372,24 @@ def print_perf(cfg: BenchConfig, rows: List[Tuple[str, str, str, str]]):
     print("-" * 120)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Benchmark cross-attention providers with selectable accuracy reference.")
+    parser.add_argument(
+        "--reference",
+        choices=REFERENCE_CHOICES,
+        default=REFERENCE_IMPL,
+        help="Reference implementation for accuracy checks. Use flash_cuda or sdpa for long sequences to avoid fp32 score OOM.",
+    )
+    parser.add_argument(
+        "--skip-accuracy",
+        action="store_true",
+        help="Skip accuracy checks and run forward benchmark only.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     ensure_cuda()
     set_seed(0)
     torch.set_grad_enabled(False)
@@ -346,9 +404,9 @@ def main():
         sm_scale = 1.0 / math.sqrt(cfg.head_dim)
         # sm_scale = 1.0
 
-        if CHECK_ACCURACY:
-            acc_results = check_accuracy_one(cfg, sm_scale=sm_scale)
-            print_accuracy(cfg, acc_results)
+        if CHECK_ACCURACY and not args.skip_accuracy:
+            acc_results = check_accuracy_one(cfg, sm_scale=sm_scale, reference_impl=args.reference)
+            print_accuracy(cfg, acc_results, reference_impl=args.reference)
 
         perf_rows = benchmark_one(cfg, sm_scale=sm_scale)
         print_perf(cfg, perf_rows)
