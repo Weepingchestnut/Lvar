@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preferred-source",
         choices=("auto", "npy", "png", "video"),
-        default="png",
+        default="auto",
         help="Metric input source. 'auto' prefers npy, then PNG frame directories, then encoded videos.",
     )
     parser.add_argument(
@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
         "--include-first-frame",
         type=int,
         choices=(0, 1),
-        default=0,
+        default=1,
         help="Whether to include frame 0 in metric computation. Set to 0 to evaluate only later video frames.",
     )
     return parser.parse_args()

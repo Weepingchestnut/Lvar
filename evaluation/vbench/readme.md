@@ -84,5 +84,16 @@ python3 evaluation/vbench/eval_low_level_metrics.py \
 支持：
 - 从 videos/ 统计整个 VBench benchmark 的 overall PSNR / SSIM / LPIPS
 - `--preferred-source {auto,npy,png,video}`，默认`auto`，评估时会优先读取`videos/*.npy`，其次读`frames_by_dimension/<dim>/<name>`或`videos/<physical_stem>/`下的`.png`帧目录，最后才回退`.mp4`解码
-- 
+
+
+### Bugs
+
+```
+ModuleNotFoundError: No module named 'pkg_resources'
+```
+
+```bash
+python -m pip install "setuptools<82.0.0" --force-reinstall
+python -c "import pkg_resources"
+```
 

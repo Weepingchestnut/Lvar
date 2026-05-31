@@ -1,4 +1,7 @@
 import os
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+import gc
 import os.path as osp
 import random
 import sys
@@ -13,8 +16,8 @@ from tqdm import tqdm
 
 # Make sure repo root is importable no matter where the script is launched from.
 sys.path.append(osp.dirname(osp.dirname(__file__)))
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+from torch.utils.collect_env import get_pretty_env_info
 from run_infinity import (InferencePipe, encode_video_prompt, save_video,
                           transform)
 
@@ -28,14 +31,14 @@ from utils.profile_utils import (default_video_prompts, format_memory,
 def prepare4infer(pipe, data, args):
 
     if not isinstance(data["prompt"], str):
-        prompt = data["prompt"][0]      # only support batch size = 1
+        prompt = data["prompt"][0]  # only support batch size = 1
     else:
         prompt = data["prompt"]
     prompt_prefix = prompt[:30].replace(" ", "_")
 
     # seed = data["seed"]                         # Latency profile, fix seed = args.seed
-    mapped_duration=args.generation_duration    # default: 5 seconds
-    num_frames=args.video_frames                # default: 81 frames
+    mapped_duration = args.generation_duration  # default: 5 seconds
+    num_frames = args.video_frames  # default: 81 frames
 
     # If an image_path is provided, perform image-to-video generation.
     image_path = data.get("image_path", None)
@@ -46,22 +49,24 @@ def prepare4infer(pipe, data, args):
     args.first_full_spatial_size_scale_index = get_first_full_spatial_size_scale_index(scale_schedule)
     args.tower_split_index = args.first_full_spatial_size_scale_index + 1
     context_info = pipe.get_scale_pack_info(scale_schedule, args.first_full_spatial_size_scale_index, args)
-    scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['pt2scale_schedule'][(num_frames-1)//4+1]
+    # scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['pt2scale_schedule'][(num_frames - 1) // 4 + 1]
     tau = [args.tau_image] * args.tower_split_index + [args.tau_video] * (len(scale_schedule) - args.tower_split_index)
     tgt_h, tgt_w = scale_schedule[-1][1] * 16, scale_schedule[-1][2] * 16
     gt_leak, gt_ls_Bl = -1, None
 
     if image_path is not None:
-        ref_image = [cv2.imread(image_path)[:,:,::-1]]
+        ref_image = [cv2.imread(image_path)[:, :, ::-1]]
         ref_img_T3HW = [transform(Image.fromarray(frame).convert("RGB"), tgt_h, tgt_w) for frame in ref_image]
-        ref_img_T3HW = torch.stack(ref_img_T3HW, 0) # [t,3,h,w]
-        ref_img_bcthw = ref_img_T3HW.permute(1,0,2,3).unsqueeze(0) # [c,t,h,w] -> [b,c,t,h,w]
-        _, _, gt_ls_Bl, _, _, _ = pipe.video_encode(pipe.vae, ref_img_bcthw.cuda(), vae_features=None, self_correction=pipe.self_correction, args=args, infer_mode=True, dynamic_resolution_h_w=dynamic_resolution_h_w)
-        gt_leak=len(scale_schedule)//2
-    
-    negative_prompt=''      # default: ''
+        ref_img_T3HW = torch.stack(ref_img_T3HW, 0)  # [t,3,h,w]
+        ref_img_bcthw = ref_img_T3HW.permute(1, 0, 2, 3).unsqueeze(0)  # [c,t,h,w] -> [b,c,t,h,w]
+        _, _, gt_ls_Bl, _, _, _ = pipe.video_encode(pipe.vae, ref_img_bcthw.cuda(), vae_features=None,
+                                                    self_correction=pipe.self_correction, args=args, infer_mode=True,
+                                                    dynamic_resolution_h_w=dynamic_resolution_h_w)
+        gt_leak = len(scale_schedule) // 2
+
+    negative_prompt = ''  # default: ''
     if args.append_enlarge2captain:
-        prompt = f'{prompt}, Close-up on big objects, emphasize scale and detail'       # 特写大型物体，突出尺寸与细节
+        prompt = f'{prompt}, Close-up on big objects, emphasize scale and detail'  # 特写大型物体，突出尺寸与细节
     if args.append_duration2caption:
         prompt = f'<<<t={mapped_duration}s>>>' + prompt
 
@@ -70,14 +75,17 @@ def prepare4infer(pipe, data, args):
 
 def main():
     args = InferArgs().parse_args()
-    
+
+    # Environment Information
+    print(get_pretty_env_info())
+
     if args.infer_batch_size != 1:
         raise ValueError("InfinityStar benchmark currently supports only --batch_size=1.")
     if args.use_apg + args.use_cfg != 1:
         raise ValueError("Exactly one of --use_apg or --use_cfg must be 1.")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for latency profiling.")
-    
+
     random.seed(args.seed)
     # path to save generated videos
     videos_root = osp.join(args.profile_output_root, "videos")
@@ -148,12 +156,12 @@ def main():
                 data = {
                     'seed': args.seed,
                     'prompt': prompts,
-                    'image_path': None,     # Vbench T2V
+                    'image_path': None,  # Vbench T2V
                     'duration': args.generation_duration,
                 }
                 scale_schedule, gt_leak, gt_ls_Bl, context_info, \
                     tau_list, negative_prompt, prompt, prompt_prefix = prepare4infer(pipe, data, args)
-                cfg_list=args.cfg
+                cfg_list = args.cfg
 
                 # --- text encode ---
                 if not isinstance(cfg_list, list):
@@ -161,11 +169,11 @@ def main():
                 if not isinstance(tau_list, list):
                     tau_list = [tau_list] * len(scale_schedule)
                 text_cond_tuple = encode_video_prompt(
-                    args.text_encoder_ckpt, pipe.text_tokenizer, pipe.text_encoder, prompt, 
+                    args.text_encoder_ckpt, pipe.text_tokenizer, pipe.text_encoder, prompt,
                     enable_positive_prompt=0, low_vram_mode=True)
                 if negative_prompt:
                     negative_label_B_or_BLT = encode_video_prompt(
-                        args.text_encoder_ckpt, pipe.text_tokenizer, pipe.text_encoder, 
+                        args.text_encoder_ckpt, pipe.text_tokenizer, pipe.text_encoder,
                         negative_prompt, low_vram_mode=True)
                 else:
                     negative_label_B_or_BLT = None
@@ -213,18 +221,18 @@ def main():
             # timings_w_txt_encode = []
             sstart_time = time.time()
             for _ in tqdm(range(args.profile_iter)):
-                prompts = random.sample(default_video_prompts, args.infer_batch_size)   # list['prompt1', 'prompt2']
+                prompts = random.sample(default_video_prompts, args.infer_batch_size)  # list['prompt1', 'prompt2']
                 default_video_prompts.remove(prompts[0])
 
                 data = {
                     'seed': args.seed,
                     'prompt': prompts,
-                    'image_path': None,     # Vbench T2V
+                    'image_path': None,  # Vbench T2V
                     'duration': args.generation_duration,
                 }
                 scale_schedule, gt_leak, gt_ls_Bl, context_info, \
                     tau_list, negative_prompt, prompt, prompt_prefix = prepare4infer(pipe, data, args)
-                cfg_list=args.cfg
+                cfg_list = args.cfg
 
                 # start_time_w_txt_encode = time.perf_counter()
                 # --- text encode ---
@@ -233,11 +241,11 @@ def main():
                 if not isinstance(tau_list, list):
                     tau_list = [tau_list] * len(scale_schedule)
                 text_cond_tuple = encode_video_prompt(
-                    args.text_encoder_ckpt, pipe.text_tokenizer, pipe.text_encoder, prompt, 
+                    args.text_encoder_ckpt, pipe.text_tokenizer, pipe.text_encoder, prompt,
                     enable_positive_prompt=0, low_vram_mode=True)
                 if negative_prompt:
                     negative_label_B_or_BLT = encode_video_prompt(
-                        args.text_encoder_ckpt, pipe.text_tokenizer, pipe.text_encoder, 
+                        args.text_encoder_ckpt, pipe.text_tokenizer, pipe.text_encoder,
                         negative_prompt, low_vram_mode=True)
                 else:
                     negative_label_B_or_BLT = None
@@ -268,12 +276,13 @@ def main():
                         mode='',
                         former_clip_features=None,
                         first_frame_features=None,
-                    )   # tuple([], tensor[bs(1), frames(81), H, W, 3])
-                    torch.cuda.synchronize(device=device)   # *Important*: Ensure that all CUDA operations are completed before recording the time
+                    )  # tuple([], tensor[bs(1), frames(81), H, W, 3])
+                    torch.cuda.synchronize(device=device)  # *Important*: Ensure that all CUDA operations are completed before recording the time
                     lib.cudaProfilerStop()
 
                     end_time = time.perf_counter()
-                    timings.append(end_time - start_time); print(f'%%%%%% {(end_time - start_time)/args.infer_batch_size:.2f}s %%%%%%')
+                    timings.append(end_time - start_time)
+                    print(f'%%%%%% {(end_time - start_time) / args.infer_batch_size:.2f}s %%%%%%')
                     # timings_w_txt_encode.append(end_time - start_time_w_txt_encode)
 
                     # --- Memory Analysis: Monitoring CPU and NVIDIA-SMI in a loop ---
@@ -283,14 +292,18 @@ def main():
                     # ----------------------------------------------------------------
 
                     # save video
-                    _, img_list = out; img = img_list[0]    # [frames(81), H, W, 3]
+                    _, img_list = out; img = img_list[0]  # [frames(81), H, W, 3]
                     if len(img.shape) == 3:
                         img = img.unsqueeze(0)
-                
-                video_np = img.cpu().numpy()      # [t, h, w, 3] uint8
+
+                video_np = img.cpu().numpy()  # [t, h, w, 3] uint8
                 video_save_path = osp.join(videos_root, f'{prompt_prefix}.mp4')
                 save_video(video_np, fps=args.fps, save_filepath=video_save_path)
                 # print(f'Video generation done: {video_save_path}')
+
+                # del out, img, img_list
+                # gc.collect()
+                # torch.cuda.empty_cache()
 
             ttotal_time = time.time() - sstart_time
             print("Inference speed test finished.")
@@ -326,10 +339,10 @@ def main():
             f"(Total Used: {format_memory(peak_nvsmi_gpu_mem - start_nvsmi_gpu)})"
         )
         print("-" * 60)
-    
+
     finally:
         if nvml_handle:
-            pynvml.nvmlShutdown()   # NVML clean
+            pynvml.nvmlShutdown()  # NVML clean
 
 
 if __name__ == "__main__":

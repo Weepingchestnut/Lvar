@@ -1,7 +1,10 @@
 import datetime
+import gc
 import hashlib
 import json
 import os
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import os.path as osp
 import random
 import shutil
@@ -17,15 +20,15 @@ from PIL import Image
 from tqdm import tqdm
 
 sys.path.append(osp.dirname(osp.dirname(__file__)))
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from models.infinitystar.self_correction import SelfCorrection
 from models.schedules import get_encode_decode_func
 from models.schedules.dynamic_resolution import (
     get_dynamic_resolution_meta, get_first_full_spatial_size_scale_index)
-from tools.run_infinity import (InferencePipe, gen_one_video, 
-                                save_video, transform)
+from tools.run_infinity import (InferencePipe, gen_one_video, save_video,
+                                transform)
 from utils.arg_util_video import InferArgs
+from utils.env_report_utils import print_lvar_env_report
 
 
 def perform_inference(pipe, data, args):
@@ -199,6 +202,12 @@ def main():
     rank = tdist.get_rank()
     world_size = tdist.get_world_size()
 
+    if rank == 0 and args.print_env_info:
+        print("\n=== Lvar Experiment Environment ===")
+        print_lvar_env_report()
+        print("===================================\n")
+    tdist.barrier(device_ids=[local_rank])
+
     # load models
     print(f"[Rank {rank}] Loading models on device {device}...")
     pipe = InferencePipe(args, device)
@@ -348,7 +357,10 @@ def main():
                 if args.save_raw_npy_frames:
                     base_stem, _ = osp.splitext(base_name)
                     create_symlink_or_copy(artifact_paths["npy"], osp.join(frames_dim_dir, f'{base_stem}.npy'))
-    
+
+            # gc.collect()
+            # torch.cuda.empty_cache()
+
     print(f"[Rank {rank}] Finished tasks. Waiting for others...")
     tdist.barrier(device_ids=[local_rank])
     

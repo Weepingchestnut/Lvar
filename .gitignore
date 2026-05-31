@@ -11,7 +11,7 @@ __pycache__
 # datasets
 datasets
 
-# experimental results
+# ====== experimental results ======
 checkpoints
 local_output
 logs
@@ -20,47 +20,47 @@ work_dir/
 output/
 evaluation_results*
 
-# pretrain models
+# ====== pretrain models ======
 *.pb
 *.npz
 *.pth
 pretrained_models/
 
-# pkgs
+# ====== pkgs & zips ======
 *.whl
 *.zip
+evaluation/imagenet/torch-fidelity
 
-# kernels
+# ====== kernels ======
+*.so
+# --- HART ---
 models/hart/kernels/build/
 models/hart/kernels/hart_backend.egg-info/
 models/hart/kernels/dist
-*.so
-
+models/hart/attn_map_vis/
+# --- Triton ---
 kernels/flash_atten/triton/*.csv
 kernels/flash_atten/triton/*.png
 kernels/flash_atten/triton/*.html
 
-# dev ing...
-*.pkl
-tools/conf.py
-tools/conf_none.py
-tools/pyramid_attn_map
-
+# ====== dev ing... ======
 # TODO & old version
 TODO_*
 
-models/fastvar/old_version/
-models/lpd/orders/
-models/infinity copy/
-models/hart/attn_map_vis/
+*.log
+*.pkl
+*_ours.sh
+tools/conf.py
+tools/conf_none.py
 
 mytest/
 
-scripts/exp*
-scripts/spattn_exp/
-
-# AI coding
+# ====== AI coding ======
+docs/
 AGENTS.md
 CLAUDE.md
+*_codex.md
+*_context.md
+tasks.md
 
 

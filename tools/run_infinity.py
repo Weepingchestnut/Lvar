@@ -1,37 +1,39 @@
 import argparse
 import hashlib
-import cv2
 import os
 
+import cv2
 import imageio
 from timm import create_model
 
+from models.infinitystar.infinitystar_model import InfinityStar
 from models.infinitystar.self_correction import SelfCorrection
 from models.schedules import get_encode_decode_func
 from tools.prompt_rewriter import _init_prompt_rewriter
 from utils.load import load_video_visual_tokenizer
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import os.path as osp
-
-import numpy as np
-import PIL.Image as PImage
-from PIL import Image, ImageEnhance
 import re
 import shutil
 import time
 from typing import List, Union
 
+import numpy as np
+import PIL.Image as PImage
 import torch
 import torch.nn.functional as F
+from PIL import Image, ImageEnhance
 from torch import autocast
 from torchvision.transforms.functional import to_tensor
-from transformers import AutoTokenizer, T5Config, T5EncoderModel, T5TokenizerFast
+from transformers import (AutoTokenizer, T5Config, T5EncoderModel,
+                          T5TokenizerFast)
 
-from models.infinity.infinity_model import Infinity
 from models.fastvar.fastvar_model import FastVAR_Infinity
+from models.infinity.infinity_model import Infinity
+from models.scalekv.scale_kv import enable_scale_kv
 from models.skipvar.skipvar_model import SkipVAR_Infinity
 from models.sparsevar.sparsevar_model import SparseVAR_Infinity
-from models.scalekv.scale_kv import enable_scale_kv
 from models.sparvar.sparvar_model import SparVAR_Infinity
 from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 
@@ -149,7 +151,8 @@ def gen_one_img(
 ):
     # print(f'in gen_one_img: {g_seed=}')     # None
     # for sparse attn layer count
-    from models.sparvar.sparse_attn_layer_counter import singleton as layer_counter
+    from models.sparvar.sparse_attn_layer_counter import \
+        singleton as layer_counter
 
     sstt = time.time()
     if not isinstance(cfg_list, list):
@@ -743,7 +746,7 @@ def load_video_transformer(vae, args):
     
     print(f'[Loading InfinityStar]')
     with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
-        infinity_test: Infinity = create_model(
+        infistar_test: InfinityStar = create_model(
             args.model_type,
             vae_local=vae, text_channels=args.text_channels, text_maxlen=512,
             raw_scale_schedule=None,
@@ -761,25 +764,25 @@ def load_video_transformer(vae, args):
             video_frames=args.video_frames,
             other_args=args,
         ).to(device=device)
-        print(f'[you selected Infinity with {args.model_type}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={args.bf16}')
+        print(f'[you selected InfinityStar with {args.model_type}] model size: {sum(p.numel() for p in infistar_test.parameters())/1e9:.2f}B, bf16={args.bf16}')
         if args.bf16:
-            for block in infinity_test.unregistered_blocks:
+            for block in infistar_test.unregistered_blocks:
                 block.bfloat16()
-        infinity_test.eval()
-        infinity_test.requires_grad_(False)
-        infinity_test.cuda()
+        infistar_test.eval()
+        infistar_test.requires_grad_(False)
+        infistar_test.cuda()
         torch.cuda.empty_cache()
 
         if not model_path:
-            return infinity_test
+            return infistar_test
         
-        print(f'============== [Load Infinity weights] ==============')    
+        print(f'============== [Load InfinityStar weights] ==============')
         if args.checkpoint_type == 'torch':
             state_dict = torch.load(model_path, map_location=device)
-            print(infinity_test.load_state_dict(state_dict))
+            print(infistar_test.load_state_dict(state_dict))
         elif args.checkpoint_type == 'torch_shard':
             from transformers.modeling_utils import load_sharded_checkpoint
-            print(load_sharded_checkpoint(infinity_test, model_path, strict=False))
+            print(load_sharded_checkpoint(infistar_test, model_path, strict=False))
         elif args.checkpoint_type == 'omnistore':
             from utils.save_and_load import merge_ckpt
             if args.enable_model_cache and osp.exists(args.cache_dir):
@@ -788,15 +791,15 @@ def load_video_transformer(vae, args):
                 local_model_dir = osp.abspath(model_path)
             print(f'load checkpoint from {local_model_dir}')
             state_dict = merge_ckpt(local_model_dir, osp.join(local_model_dir, 'ouput'), save=False, fsdp_save_flatten_model=args.fsdp_save_flatten_model)
-            print(infinity_test.load_state_dict(state_dict))
+            print(infistar_test.load_state_dict(state_dict))
             import pdb; pdb.set_trace()
             # # split_state_dict
             # save_directory = '/tmp/weights/infinity_interact_24k'
             # os.makedirs(save_directory, exist_ok=True)
             # split_state_dict(state_dict, save_directory)
-        infinity_test.rng = torch.Generator(device=device)
+        infistar_test.rng = torch.Generator(device=device)
     
-    return infinity_test
+    return infistar_test
 
 
 class InferencePipe:
