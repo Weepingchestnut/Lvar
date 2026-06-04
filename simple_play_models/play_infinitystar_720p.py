@@ -1,14 +1,15 @@
 import os
 import os.path as osp
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import sys
+sys.path.append(osp.dirname(osp.dirname(__file__)))
 import time
 
 import cv2
 import numpy as np
 import torch
 from PIL import Image
-sys.path.append(osp.dirname(osp.dirname(__file__)))
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from models.infinitystar.self_correction import SelfCorrection
 from models.schedules import get_encode_decode_func
@@ -38,8 +39,7 @@ def perform_inference(pipe, data, args):
     #  (20, 1, 1), (20, 2, 3), (20, 2, 4), (20, 3, 5), (20, 4, 7), (20, 4, 8), (20, 5, 9), (20, 6, 11), (20, 8, 13), (20, 9, 16), (20, 12, 21), (20, 18, 32), (20, 24, 43), (20, 30, 53), (20, 45, 80)]
     args.first_full_spatial_size_scale_index = get_first_full_spatial_size_scale_index(scale_schedule)      # 14
     args.tower_split_index = args.first_full_spatial_size_scale_index + 1       # 15
-    context_info = pipe.get_scale_pack_info(scale_schedule, args.first_full_spatial_size_scale_index, args)    
-    scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['pt2scale_schedule'][(num_frames-1)//4+1]
+    context_info = pipe.get_scale_pack_info(scale_schedule, args.first_full_spatial_size_scale_index, args)
     tau = [args.tau_image] * args.tower_split_index + [args.tau_video] * (len(scale_schedule) - args.tower_split_index)     # [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4]
     tgt_h, tgt_w = scale_schedule[-1][1] * 16, scale_schedule[-1][2] * 16       # 720x1280
     gt_leak, gt_ls_Bl = -1, None
@@ -161,7 +161,7 @@ if __name__ == '__main__':
     data['prompt'] = prompt
     
     output_dict = perform_inference(pipe, data, args)
-    save_dir = 'work_dir/infer_test/video_output'
+    save_dir = 'work_dir/play_models/InfinityStar_720p'
     gen_video_path = osp.join(os.path.join(save_dir, 'gen_videos'), f'demo_{time_str()}.mp4')
     save_video(output_dict['output'], fps=args.fps, save_filepath=gen_video_path)
             

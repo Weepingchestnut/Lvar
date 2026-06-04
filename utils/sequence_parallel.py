@@ -1,11 +1,11 @@
-# Copyright (c) 2025 FoundationVision
-# SPDX-License-Identifier: MIT
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+
 from .comm.pg_utils import ProcessGroupManager
 from .comm.comm import set_sp_comm_group, split_sequence, gather_sequence, all_to_all_comm
-# from .comm.operation import gather_forward_split_backward
+from .comm.operation import gather_forward_split_backward
+
 
 class SequenceParallelManager:
     _SP_GROUP = None

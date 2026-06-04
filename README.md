@@ -1,25 +1,42 @@
 # Lvar
 
 ## 📖 Introduction
-Learn visual autoregressive
+
+**Lvar** is a learning- and research-oriented codebase for **Visual AutoRegressive** (**VAR**) generation architectures.
+**`L`** carries a dual meaning: **Learn**, for making visual autoregressive models easier to study and understand from the ground up, and **Light/Lighting**, for integrating lightweight design, efficient inference, and system-level acceleration techniques.
+<!-- Built around a unified, modular, and extensible framework, Lvar aims to provide implementations of model architectures, training recipes, inference optimizations, caching strategies, and infrastructure components for advancing next-generation visual generation systems. -->
 
 
 ## 🔥 Supported Models
 
 ### Class-condition Generation Models
-- VAR (NeurIPS'2024 **Best Paper Award**)
+- [VAR](https://arxiv.org/abs/2404.02905) (NeurIPS'2024 **Best Paper Award**)
+
+Acceleration Methods
+
+---
 
 ### Text-to-Image Generation Models
 
 Baseline Models
-- Infinity (CVPR'2025 Oral)
+- [Infinity](https://arxiv.org/abs/2412.04431) (CVPR'2025 Oral)
+- [HART](https://arxiv.org/abs/2410.10812) (ICLR'2025)
 
-Acceleration Method
+Acceleration Methods
 - FastVAR (ICCV'2025)
 - SparseVAR (ICCV'2025)
 - ScaleKV (NeurIPS'2025)
 - SkipVAR (arXiv'2025)
 <!-- - SparVAR (CVPR'2026) -->
+
+### Video Generation Models
+
+- [InfinityStar](https://arxiv.org/abs/2511.04675) (NeurIPS'2025 Oral)
+
+### Other Visual AutoRegressive Method
+
+- BitDance (arXiv:)
+- GRN (arXiv:)
 
 
 ## ⚙️ Installation

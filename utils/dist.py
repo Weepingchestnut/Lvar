@@ -137,7 +137,7 @@ def new_local_machine_group():
 
 def barrier():
     if __initialized:
-        tdist.barrier()     # 确保所有进程在继续执行之前都到达某个点，从而实现进程间的同步
+        tdist.barrier()
 
 
 def allreduce(t: torch.Tensor, async_op=False):
@@ -243,7 +243,8 @@ def local_master_only(func):
 def for_visualize(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        if is_master():
+        # if is_master():
+        if is_visualizer():
             # with torch.no_grad():
             ret = func(*args, **kwargs)
         else:
@@ -307,7 +308,7 @@ class BackupStreamToFile(object):
             time_str = datetime.datetime.now(tz=pytz.timezone('Asia/Shanghai')).strftime('[%m-%d %H:%M:%S]')
             self.file_stream.write('\n'*7 + '='*55 + f'   RESTART {time_str}   ' + '='*55 + '\n')
         self.file_stream.flush()
-        os.system(f'ln -s {fname} /opt/tiger/run_trial/ >/dev/null 2>&1')
+        # os.system(f'ln -s {fname} /opt/tiger/run_trial/ >/dev/null 2>&1')
         self.enabled = True
     
     def write(self, message):

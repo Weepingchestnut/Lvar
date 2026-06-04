@@ -46,6 +46,24 @@ def interpolate(tensor, size, mode, quantizer, is_semantic_scale):
     return tensor
 
 def get_scale_pack_info(scale_schedule, first_full_spatial_size_scale_index, args):
+    """_summary_
+    Generate reference relationships for spatio-temporal sparse attention
+
+    It assigns three types of information to each scale id `si`:
+	    1. `si` belong to which clip
+	    2. which compressed frame intervals does it cover
+	    3. which historical clips / historical scales should it look at in the attention mechanism
+
+    This is the metadata preparation for implementing Spacetime Sparse Attention
+
+    Args:
+        scale_schedule (_type_): _description_
+        first_full_spatial_size_scale_index (_type_): _description_
+        args (_type_): _description_
+
+    Returns:
+        _type_: _description_
+    """
     meta = {}
     sid2clipid_innsid = {}
     clipid_innsid2sid = {}
@@ -53,6 +71,7 @@ def get_scale_pack_info(scale_schedule, first_full_spatial_size_scale_index, arg
     compress_frames_inner_clip = args.frames_inner_clip
     total_clips = len(scale_schedule) // scales_per_clip
     context_clips = args.context_frames // args.frames_inner_clip
+
     for si in range(len(scale_schedule)):
         clipid = si // scales_per_clip
         if clipid == 0:
@@ -496,19 +515,25 @@ def video_decode(
 def get_visual_rope_embeds(rope2d_freqs_grid, scale_schedule, sid, real_sid, device=None, args=None, scale_pack_info=None, first_full_spatial_size_scale_index=None):
     # freqs_scales: (2, max_scales, ceil(dim_div_2 / 4))
     # freqs_frames: (2, max_frames, ceil(dim_div_2 / 4))
-    rope2d_freqs_grid['freqs_scales'] = rope2d_freqs_grid['freqs_scales'].to(device)
-    rope2d_freqs_grid['freqs_frames'] = rope2d_freqs_grid['freqs_frames'].to(device)
-    rope2d_freqs_grid['freqs_height'] = rope2d_freqs_grid['freqs_height'].to(device)
-    rope2d_freqs_grid['freqs_width'] = rope2d_freqs_grid['freqs_width'].to(device)
+    rope2d_freqs_grid['freqs_scales'] = rope2d_freqs_grid['freqs_scales'].to(device)        # torch.Size([2, 91, 16])
+    rope2d_freqs_grid['freqs_frames'] = rope2d_freqs_grid['freqs_frames'].to(device)        # torch.Size([2, 21, 16])
+    rope2d_freqs_grid['freqs_height'] = rope2d_freqs_grid['freqs_height'].to(device)        # torch.Size([2, 225, 16])
+    rope2d_freqs_grid['freqs_width'] = rope2d_freqs_grid['freqs_width'].to(device)          # torch.Size([2, 225, 16])
+    
     upt, uph, upw = scale_schedule[-1]
     pt, ph, pw = scale_schedule[sid]
+    
     dim_div_2_div_4 = rope2d_freqs_grid['freqs_scales'].shape[2]
     dim_div_2 = dim_div_2_div_4 * 4
+    # scale-dim PEs
     f_scales = rope2d_freqs_grid['freqs_scales'][:, real_sid].reshape(2, 1, dim_div_2_div_4)
+    # time-dim PEs
     frame_ss, frame_ee = scale_pack_info[sid]['frame_ss'], scale_pack_info[sid]['frame_ee']
     f_frames = rope2d_freqs_grid['freqs_frames'][:, frame_ss:frame_ee]
+    # height/width-dim PEs
     f_height = rope2d_freqs_grid['freqs_height'][:, (torch.arange(ph) * (uph / ph)).round().int()]
     f_width = rope2d_freqs_grid['freqs_width'][:, (torch.arange(pw) * (upw / pw)).round().int()]
+    
     rope_embeds = torch.cat([
         f_scales[   :,     :,  None,   None,   None,   :].expand(-1, -1, pt, ph, pw, -1),
         f_frames[   :,  None,      :,  None,   None,   :].expand(-1,  1, -1, ph, pw, -1),
@@ -516,4 +541,5 @@ def get_visual_rope_embeds(rope2d_freqs_grid, scale_schedule, sid, real_sid, dev
         f_width[    :,  None,  None,   None,      :,   :].expand(-1,  1, pt, ph, -1, -1),
     ], dim=-1)  # (2, 1, pt, ph, pw, dim_div_2)
     rope_embeds = rope_embeds.reshape(2, 1, 1, 1, 1*pt*ph*pw, dim_div_2)  # (2, 1, 1, 1, 1*pt*ph*pw, dim_div_2)
+
     return rope_embeds

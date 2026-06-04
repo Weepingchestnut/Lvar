@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.helpers import DropPath, drop_path
-from tools.visual_attn import VisualAttnMap
 
 # this file only provides the 3 blocks used in VAR transformer
 __all__ = ['FFN', 'AdaLNSelfAttn', 'AdaLNBeforeHead']
@@ -39,26 +38,6 @@ except ImportError:
             if dropout_p > 0
             else attn.softmax(dim=-1)
         ) @ value
-
-# ------ for visual attention map ------
-def slow_attn_vis(query, key, value, scale: float, attn_mask=None, dropout_p=0.0,
-                  vis_attn_map: VisualAttnMap = None):
-    attn = query.mul(scale) @ key.transpose(-2, -1) # BHLc @ BHcL => BHLL
-    if attn_mask is not None: 
-        attn.add_(attn_mask)
-    
-    attn_matrix = attn.softmax(dim=-1)
-    if vis_attn_map is not None:
-        vis_attn_map.visual_attn_map(attn_matrix)
-
-    if dropout_p > 0:
-        attn = F.dropout(attn_matrix, p=dropout_p, inplace=True) @ value
-    else:
-        attn = attn_matrix @ value
-    
-    # return (F.dropout(attn.softmax(dim=-1), p=dropout_p, inplace=True) if dropout_p > 0 else attn.softmax(dim=-1)) @ value
-    return attn
-# --------------------------------------
 
 
 class SharedAdaLin(nn.Linear):

@@ -7,61 +7,47 @@ from einops import rearrange
 from torch import Tensor
 from torch.distributed import ProcessGroup
 
-if torch.__version__ >= "2.4.0":
-    _torch_custom_op_wrapper = torch.library.custom_op
-    _torch_register_fake_wrapper = torch.library.register_fake
-else:
-    def noop_custom_op_wrapper(name, fn=None, /, *, mutates_args, device_types=None, schema=None):
-        def wrap(func):
-            return func
-        if fn is None:
-            return wrap
-        return fn
-    def noop_register_fake_wrapper(op, fn=None, /, *, lib=None, _stacklevel=1):
-        def wrap(func):
-            return func
-        if fn is None:
-            return wrap
-        return fn
-    _torch_custom_op_wrapper = noop_custom_op_wrapper
-    _torch_register_fake_wrapper = noop_register_fake_wrapper
 
+class AllToAll(torch.autograd.Function):
+    """Dispatches input tensor [e, c, h] to all experts by all_to_all_single
+    operation in torch.distributed.
+    """
 
-__sp_comm_group__ = None
+    @staticmethod
+    def forward(
+        ctx: Any,
+        inputs: Tensor,
+        group: ProcessGroup,
+        overlap: bool = False,
+    ) -> Tuple[Tensor, Any]:
+        """
+        Returns:
+            outputs: Tensor
+            handle: Optional[Work], if overlap is True
+        """
+        assert ctx is not None or not overlap
 
-def set_sp_comm_group(group=None):
-    global __sp_comm_group__
-    assert __sp_comm_group__ is None and group is not None
-    __sp_comm_group__ = group
-
-def get_sp_comm_group():
-    global __sp_comm_group__
-    assert __sp_comm_group__ is not None
-    return __sp_comm_group__
-
-
-# ======================================================
-# Model
-# ======================================================
-
-
-def model_sharding(model: torch.nn.Module):
-    global_rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    for _, param in model.named_parameters():
-        padding_size = (world_size - param.numel() % world_size) % world_size
-        if padding_size > 0:
-            padding_param = torch.nn.functional.pad(param.data.view(-1), [0, padding_size])
+        if ctx is not None:
+            ctx.comm_grp = group
+        if not inputs.is_contiguous():
+            inputs = inputs.contiguous()
+        if dist.get_world_size(group) == 1:
+            return inputs, None
+        output = torch.empty_like(inputs)
+        if not overlap:
+            dist.all_to_all_single(output, inputs, group=group)
+            return output, None
         else:
-            padding_param = param.data.view(-1)
-        splited_params = padding_param.split(padding_param.numel() // world_size)
-        splited_params = splited_params[global_rank]
-        param.data = splited_params
+            handle = dist.all_to_all_single(output, inputs, group=group, async_op=True)
+            return output, handle
 
-
-# ======================================================
-# AllGather & ReduceScatter
-# ======================================================
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs) -> Tuple[Tensor, None, None]:
+        return (
+            AllToAll.forward(None, grad_outputs[0], ctx.comm_grp, False)[0],
+            None,
+            None,
+        )
 
 
 class AsyncAllGatherForTwo(torch.autograd.Function):
@@ -166,13 +152,22 @@ class AllGather(torch.autograd.Function):
             ctx.comm_grp = group
 
         comm_size = dist.get_world_size(group)
+        # print(f"XW debug, All Gather Dist world size {comm_size}")
         if comm_size == 1:
             return inputs.unsqueeze(0), None
 
         buffer_shape = (comm_size,) + inputs.shape
         outputs = torch.empty(buffer_shape, dtype=inputs.dtype, device=inputs.device)
         buffer_list = list(torch.chunk(outputs, comm_size, dim=0))
+        # buffer_list = list([
+        #     t.squeeze(0) for t in torch.chunk(outputs, comm_size, dim=0)
+        # ])
+        
         if not overlap:
+            # print("buffer list", len(buffer_list), [t.shape for t in buffer_list])
+            # print("inputs", inputs.shape, inputs.is_contiguous())
+            # print(group)
+
             dist.all_gather(buffer_list, inputs, group=group)
             return outputs, None
         else:
@@ -233,32 +228,40 @@ class ReduceScatter(torch.autograd.Function):
         )
 
 
-# ======================================================
-# AlltoAll
-# ======================================================
+# using all_to_all_single api to perform all to all communication
+def _all_to_all_single(input_, seq_world_size, group, scatter_dim, gather_dim):
+    inp_shape = list(input_.shape)
+    inp_shape[scatter_dim] = inp_shape[scatter_dim] // seq_world_size
+    if scatter_dim < 2:
+        input_t = input_.reshape([seq_world_size, inp_shape[scatter_dim]] + inp_shape[scatter_dim + 1 :]).contiguous()
+    else:
+        input_t = (
+            input_.reshape([-1, seq_world_size, inp_shape[scatter_dim]] + inp_shape[scatter_dim + 1 :])
+            .transpose(0, 1)
+            .contiguous()
+        )
+
+    output = torch.empty_like(input_t)
+    dist.all_to_all_single(output, input_t, group=group)
+
+    if scatter_dim < 2:
+        output = output.transpose(0, 1).contiguous()
+
+    return output.reshape(
+        inp_shape[:gather_dim]
+        + [
+            inp_shape[gather_dim] * seq_world_size,
+        ]
+        + inp_shape[gather_dim + 1 :]
+    ).contiguous()
 
 
-@_torch_custom_op_wrapper("distributed::_all_to_all_func", mutates_args=(), device_types="cuda")
-def _all_to_all_func(input_: torch.Tensor, world_size: int = 1, scatter_dim: int = 0, gather_dim: int = 0) -> torch.Tensor:
+# using all_to_all api to perform all to all communication
+def _all_to_all(input_, world_size, group, scatter_dim, gather_dim):
     input_list = [t.contiguous() for t in torch.tensor_split(input_, world_size, scatter_dim)]
     output_list = [torch.empty_like(input_list[0]) for _ in range(world_size)]
-    group = get_sp_comm_group()
     dist.all_to_all(output_list, input_list, group=group)
     return torch.cat(output_list, dim=gather_dim).contiguous()
-
-
-@_torch_register_fake_wrapper("distributed::_all_to_all_func")
-def _all_to_all_func_fake(input_: torch.Tensor, world_size: int = 1, scatter_dim: int = 0, gather_dim: int = 0) -> torch.Tensor:
-    inp_shape = list(input_.shape)
-    group = get_sp_comm_group()
-    world_size = dist.get_world_size(group)
-    if world_size == 1:
-        return input_
-
-    inp_shape[gather_dim] = inp_shape[gather_dim] * world_size
-    inp_shape[scatter_dim] = inp_shape[scatter_dim] // world_size
-    outputs = torch.empty(torch.Size(inp_shape), dtype=input_.dtype, device=input_.device, layout=input_.layout)
-    return outputs
 
 
 class _AllToAll(torch.autograd.Function):
@@ -277,8 +280,13 @@ class _AllToAll(torch.autograd.Function):
         ctx.scatter_dim = scatter_dim
         ctx.gather_dim = gather_dim
         world_size = dist.get_world_size(process_group)
+        bsz, _, _ = input_.shape
 
-        return _wrapper_all_to_all_func(input_, world_size, scatter_dim, gather_dim)
+        # Todo: Try to make all_to_all_single compatible with a large batch size
+        if bsz == 1:
+            return _all_to_all_single(input_, world_size, process_group, scatter_dim, gather_dim)
+        else:
+            return _all_to_all(input_, world_size, process_group, scatter_dim, gather_dim)
 
     @staticmethod
     def backward(ctx, *grad_output):
@@ -289,134 +297,82 @@ class _AllToAll(torch.autograd.Function):
         return (return_grad, None, None, None)
 
 
+def model_sharding(model: torch.nn.Module):
+    global_rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    for _, param in model.named_parameters():
+        padding_size = (world_size - param.numel() % world_size) % world_size
+        if padding_size > 0:
+            padding_param = torch.nn.functional.pad(param.data.view(-1), [0, padding_size])
+        else:
+            padding_param = param.data.view(-1)
+        splited_params = padding_param.split(padding_param.numel() // world_size)
+        splited_params = splited_params[global_rank]
+        param.data = splited_params
+
+
 def all_to_all_comm(input_, process_group=None, scatter_dim=2, gather_dim=1):
     return _AllToAll.apply(input_, process_group, scatter_dim, gather_dim)
 
 
-# ======================================================
-# Sequence Gather & Split
-# ======================================================
-
-
-def _split_sequence_func(inputs, pg: dist.ProcessGroup, dim=-1):
-    world_size = dist.get_world_size(pg)
+def _gather(input_, dim=-1, process_group=None):
+    # skip if only one rank involved
+    world_size = dist.get_world_size(process_group)
     if world_size == 1:
-        return inputs
+        return input_
+
+    # all gather
+    input_ = input_.contiguous()
+    tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
+    torch.distributed.all_gather(tensor_list, input_, group=process_group)
+
+    # concat
+    output = torch.cat(tensor_list, dim=dim).contiguous()
+
+    return output
+
+
+def _split(input_, dim=-1, process_group=None):
+    # skip if only one rank involved
+    world_size = dist.get_world_size(process_group)
+    if world_size == 1:
+        return input_
 
     # Split along last dimension.
-    rank = dist.get_rank(pg)
-    dim_size = inputs.size(dim)
+    dim_size = input_.size(dim)
     assert dim_size % world_size == 0, (
         f"The dimension to split ({dim_size}) is not a multiple of world size ({world_size}), "
         f"cannot split tensor evenly"
     )
 
-    outputs = torch.split(inputs, dim_size // world_size, dim=dim)[rank]
-    return outputs
+    tensor_list = torch.split(input_, dim_size // world_size, dim=dim)
+    rank = dist.get_rank(process_group)
+    output = tensor_list[rank].clone().contiguous()
 
-
-@_torch_custom_op_wrapper("distributed::_gather_sequence_func", mutates_args=(), device_types="cuda")
-def _gather_sequence_func(inputs: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    pg = get_sp_comm_group()
-    world_size = dist.get_world_size(pg)
-    if world_size == 1:
-        return inputs
-
-    # all gather
-    inputs = inputs.contiguous()
-    outputs = [torch.empty_like(inputs) for _ in range(world_size)]
-    dist.all_gather(outputs, inputs, group=pg)
-
-    # concat
-    outputs = torch.cat(outputs, dim=dim)
-    return outputs
-
-
-@_torch_register_fake_wrapper("distributed::_gather_sequence_func")
-def _gather_sequence_func_fake(inputs: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    inp_shape = list(inputs.shape)
-    pg = get_sp_comm_group()
-    world_size = dist.get_world_size(pg)
-    if world_size == 1:
-        return inputs
-    
-    inp_shape[dim] = inp_shape[dim] * world_size
-    outputs = torch.empty(torch.Size(inp_shape), dtype=inputs.dtype, device=inputs.device, layout=inputs.layout)
-    return outputs
-
-
-if torch.__version__ >= "2.4.0":
-    _wrapper_all_to_all_func = torch.ops.distributed._all_to_all_func
-    _wrapper_gather_sequence_func = torch.ops.distributed._gather_sequence_func
-else:
-    _wrapper_all_to_all_func = _all_to_all_func
-    _wrapper_gather_sequence_func = _gather_sequence_func
+    return output
 
 
 class _GatherForwardSplitBackward(torch.autograd.Function):
-    """
-    Gather the input sequence.
+    """Gather the input from model parallel region and concatenate.
 
     Args:
         input_: input matrix.
-        process_group: process group.
+        parallel_mode: parallel mode.
         dim: dimension
     """
 
     @staticmethod
-    def symbolic(graph, input_):
-        return _wrapper_gather_sequence_func(input_)
-
-    @staticmethod
-    def forward(ctx, input_, process_group, dim, grad_scale):
+    def forward(ctx, input_, dim, process_group):
         ctx.process_group = process_group
         ctx.dim = dim
-        ctx.grad_scale = grad_scale
-        return _wrapper_gather_sequence_func(input_, dim)
+        return _gather(input_, dim, process_group)
 
     @staticmethod
     def backward(ctx, grad_output):
-        if ctx.grad_scale == "up":
-            grad_output = grad_output * dist.get_world_size(ctx.process_group)
-        elif ctx.grad_scale == "down":
-            grad_output = grad_output / dist.get_world_size(ctx.process_group)
-
-        return _split_sequence_func(grad_output, ctx.process_group, ctx.dim), None, None, None
+        return _split(grad_output, ctx.dim, ctx.process_group), None, None
 
 
-class _SplitForwardGatherBackward(torch.autograd.Function):
-    """
-    Split sequence.
-
-    Args:
-        input_: input matrix.
-        process_group: parallel mode.
-        dim: dimension
-    """
-
-    @staticmethod
-    def symbolic(graph, input_):
-        return _split_sequence_func(input_)
-
-    @staticmethod
-    def forward(ctx, input_, process_group, dim, grad_scale):
-        ctx.process_group = process_group
-        ctx.dim = dim
-        ctx.grad_scale = grad_scale
-        return _split_sequence_func(input_, process_group, dim)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        if ctx.grad_scale == "up":
-            grad_output = grad_output * dist.get_world_size(ctx.process_group)
-        elif ctx.grad_scale == "down":
-            grad_output = grad_output / dist.get_world_size(ctx.process_group)
-        return _wrapper_gather_sequence_func(grad_output, ctx.dim), None, None, None
+def gather_forward_split_backward(input_, dim, process_group):
+    return _GatherForwardSplitBackward.apply(input_, dim, process_group)
 
 
-def split_sequence(input_, process_group, dim, grad_scale=1.0):
-    return _SplitForwardGatherBackward.apply(input_, process_group, dim, grad_scale)
-
-
-def gather_sequence(input_, process_group, dim, grad_scale=None):
-    return _GatherForwardSplitBackward.apply(input_, process_group, dim, grad_scale)

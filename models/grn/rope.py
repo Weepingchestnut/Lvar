@@ -8,8 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 # from timm.models.layers import DropPath, drop_path
-# from torch.utils.checkpoint import checkpoint
-from models.schedules.dynamic_resolution import get_first_full_spatial_size_scale_index
+from timm.layers import DropPath, drop_path
+from torch.utils.checkpoint import checkpoint
 
 
 def precompute_rope2d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_by_hw, pad_to_multiplier=1, max_height=2048 // 16, max_width=2048 // 16, base=10000.0, device=None, scaling_factor=1.0, activated_h_div_w_templates=[]):
@@ -71,101 +71,51 @@ def precompute_rope2d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_
     return rope2d_freqs_grid
 
 
-def precompute_rope3d_freqs_grid(dim, dynamic_resolution_h_w, rope2d_normalized_by_hw, pad_to_multiplier=1, max_frames=128, max_height=2048 // 8, max_width=2048 // 8, base=10000.0, device=None, activated_h_div_w_templates=[], steps_per_frame=4, pn=None, args=None):
+def precompute_rope3d_freqs_grid(
+        dim, 
+        rope2d_normalized_by_hw, 
+        pad_to_multiplier=1, 
+        max_frames=128, 
+        max_height=2048 // 8, 
+        max_width=2048 // 8, 
+        base=10000.0, 
+        device=None, 
+        activated_h_div_w_templates=[], 
+        text_maxlen=0, 
+        pn=None, 
+        args=None,
+        **kwargs,
+):
     # split the dimension into three parts, one for x, one for y, and one for t
+    print(f'[precompute_rope4d_freqs_grid: 3d]: start')
     assert dim % 2 == 0, f'Only support dim % 2 == 0, but got dim={dim}'
     dim_div_2 = dim // 2
-    num_of_freqs = int(np.ceil(dim_div_2 / 3))
-    inv_freq = 1.0 / (base ** (torch.arange(num_of_freqs, dtype=torch.int64).float().to(device) / num_of_freqs)) # namely theta, 1 / (10000^(i/dim_div_3)), i=0,2,..., dim_div_3-2, totally dim_div_3 / 2 elems
-    t_height = torch.arange(max_height, device=device, dtype=torch.int64).type_as(inv_freq)
-    t_width = torch.arange(max_width, device=device, dtype=torch.int64).type_as(inv_freq)
-    t_frames = torch.arange(max_frames, device=device, dtype=torch.int64).type_as(inv_freq)
-    freqs_height = torch.outer(t_height, inv_freq)  # (max_height, ceil(dim_div_2 / 3)), namely y*theta
-    freqs_width = torch.outer(t_width, inv_freq)  # (max_width, ceil(dim_div_2 / 3)), namely x*theta
-    freqs_frames = torch.outer(t_frames, inv_freq)  # (max_width, ceil(dim_div_2 / 3)), namely x*theta
-    if (num_of_freqs*3) - dim_div_2 == 0:
-        offset_t, offset_h, offset_w = num_of_freqs, num_of_freqs, num_of_freqs
-    elif (num_of_freqs*3) - dim_div_2 == 2: # 2 elems that should be drop
-        offset_t, offset_h, offset_w = num_of_freqs, num_of_freqs-1, num_of_freqs-1
-    else: # 1 elems that should be drop
-        offset_t, offset_h, offset_w = num_of_freqs-1, num_of_freqs, num_of_freqs
-    freqs_grid_map = torch.concat([
-        freqs_frames[:, None, None, :offset_t].expand(-1, max_height, max_width, -1), # (max_frames, max_height, max_width, ceil(dim_div_2 / 3))
-        freqs_height[None, :, None, :offset_h].expand(max_frames, -1, max_width, -1), # (max_frames, max_height, max_width, ceil(dim_div_2 / 3))
-        freqs_width[None, None, :, :offset_w].expand(max_frames, max_height, -1, -1), # (max_frames, max_height, max_width, ceil(dim_div_2 / 3))
-    ], dim=-1)  # (max_frames, max_height, max_width, dim / 2)
-    freqs_grid_map = torch.stack([torch.cos(freqs_grid_map), torch.sin(freqs_grid_map)], dim=0)
-    # (2, max_frames, max_height, max_width, dim / 2)
-
+    num_of_freqs_former = dim_div_2 // 3
+    preserve_1d_length = 600
+    num_of_freqs_last = dim_div_2 - num_of_freqs_former * 2 # in some cases, dim_div_2 % 3 != 0. here tackle with these cases
+    inv_freq_former = 1.0 / (base ** (torch.arange(num_of_freqs_former, dtype=torch.int64).float().to(device) / num_of_freqs_former)) # namely theta, 1 / (10000^(i/dim_div_3)), i=0,2,..., dim_div_3-2, totally dim_div_3 / 2 elems
+    inv_freq_last = 1.0 / (base ** (torch.arange(num_of_freqs_last, dtype=torch.int64).float().to(device) / num_of_freqs_last))
+    t_frames = torch.arange(preserve_1d_length+max_frames, device=device, dtype=torch.int64).type_as(inv_freq_former)
+    t_height = torch.arange(max_height, device=device, dtype=torch.int64).type_as(inv_freq_former)
+    t_width = torch.arange(max_width, device=device, dtype=torch.int64).type_as(inv_freq_former)
+    freqs_frames = torch.outer(t_frames, inv_freq_former)  # (max_frames, (dim_div_2 / 3)), namely x*theta
+    freqs_height = torch.outer(t_height, inv_freq_former)  # (max_height, (dim_div_2 / 3), namely y*theta
+    freqs_width = torch.outer(t_width, inv_freq_last)  # (max_width, (dim_div_2 / 3)), namely x*theta
+    freqs_frames = torch.stack([torch.cos(freqs_frames), torch.sin(freqs_frames)], dim=0)
+    freqs_height = torch.stack([torch.cos(freqs_height), torch.sin(freqs_height)], dim=0)
+    freqs_width = torch.stack([torch.cos(freqs_width), torch.sin(freqs_width)], dim=0)
+    tm = preserve_1d_length
+    rope_text_embeds = torch.cat([
+        freqs_frames[   :,   :tm,  None,   None,   :].expand(-1, -1, -1, -1, -1),
+        freqs_height[   :,  None,    :1,   None,   :].expand(-1, tm, -1, -1, -1),
+        freqs_width[   :,  None,  None,     :1,   :].expand(-1, tm, -1, -1, -1),
+    ], dim=-1)  # (2, tm, 1, 1, dim_div_2)
+    rope_text_embeds = rope_text_embeds.reshape(2, 1, 1, 1, tm, dim_div_2)
     rope2d_freqs_grid = {}
-    for h_div_w in activated_h_div_w_templates:
-        assert h_div_w in dynamic_resolution_h_w, f'Unknown h_div_w: {h_div_w}'
-        image_scale_schedule = dynamic_resolution_h_w[h_div_w][pn]['image_scales']
-        video_scale_schedule = dynamic_resolution_h_w[h_div_w][pn]['video_scales']
-        first_full_spatial_size_scale_index = get_first_full_spatial_size_scale_index(video_scale_schedule)
-        pt, ph, pw = video_scale_schedule[-1]
-        rope_cache_list4image, rope_cache_list4video = [], []
-        
-        # image
-        for si, (pt, ph, pw) in enumerate(image_scale_schedule):
-            assert pt == 1
-            mul_pt_ph_pw = pt * ph * pw
-            mul_ph_pw = ph * pw
-            if rope2d_normalized_by_hw == 2: # star style
-                upt, uph, upw = image_scale_schedule[-1]
-                t_inds = 0 * torch.ones(pt, ph, pw)
-                indices = torch.stack([
-                    t_inds,
-                    (torch.arange(ph) * (uph / ph)).reshape(1, ph, 1).expand(pt, ph, pw),
-                    (torch.arange(pw) * (upw / pw)).reshape(1, 1, pw).expand(pt, ph, pw),
-                ], dim=-1).round().int() # (pt, ph, pw, 3)
-                indices = indices.reshape(-1, 3) # (pt*ph*pw, 3)
-                rope_cache = freqs_grid_map[:, indices[:,0], indices[:,1], indices[:,2], :] # (2, pt*ph*pw, dim / 2)
-                rope_cache = rope_cache.reshape(2, pt, ph, pw, -1)
-            elif rope2d_normalized_by_hw == 0:
-                rope_cache = freqs_grid_map[:, :pt, :ph, :pw, :] # (2, pt, ph, pw, dim / 2)
-            else:
-                raise ValueError(f'Unknown rope2d_normalized_by_hw: {rope2d_normalized_by_hw}')
-            rope_cache_list4image.append(rope_cache.reshape(2, mul_ph_pw, -1)) # (2, 1*ph*pw, dim / 2)
-        
-        # video
-        for si, (pt, ph, pw) in enumerate(video_scale_schedule):
-            mul_pt_ph_pw = pt * ph * pw
-            mul_ph_pw = ph * pw
-            if rope2d_normalized_by_hw == 2: # star style
-                upt, uph, upw = video_scale_schedule[-1]
-                if args.dynamic_scale_schedule == 'infinity_video_tower':
-                    t_ind = int(np.ceil((si - first_full_spatial_size_scale_index) / steps_per_frame))
-                    t_ind = max(t_ind, 0)
-                    t_inds = t_ind * torch.ones(pt, ph, pw)
-                    print(f't_ind: {t_ind}, si: {si}, (pt, ph, pw): {(pt, ph, pw)}')
-                else:
-                    t_inds = (torch.arange(pt)).reshape(pt, 1, 1).expand(pt, ph, pw)
-                indices = torch.stack([
-                    t_inds,
-                    (torch.arange(ph) * (uph / ph)).reshape(1, ph, 1).expand(pt, ph, pw),
-                    (torch.arange(pw) * (upw / pw)).reshape(1, 1, pw).expand(pt, ph, pw),
-                ], dim=-1).round().int() # (pt, ph, pw, 3)
-                indices = indices.reshape(-1, 3) # (pt*ph*pw, 3)
-                rope_cache = freqs_grid_map[:, indices[:,0], indices[:,1], indices[:,2], :] # (2, pt*ph*pw, dim / 2)
-                rope_cache = rope_cache.reshape(2, pt, ph, pw, -1)
-            elif rope2d_normalized_by_hw == 0:
-                rope_cache = freqs_grid_map[:, :pt, :ph, :pw, :] # (2, pt, ph, pw, dim / 2)
-            else:
-                raise ValueError(f'Unknown rope2d_normalized_by_hw: {rope2d_normalized_by_hw}')
-            rope_cache_list4video.append(rope_cache.reshape(2, mul_pt_ph_pw, -1)) # (2, pt*ph*pw, dim / 2)
-        cat_rope_cache4image = torch.cat(rope_cache_list4image, 1) # (2, seq_len, dim / 2)
-        cat_rope_cache4video = torch.cat(rope_cache_list4video, 1) # (2, seq_len, dim / 2)
-        if cat_rope_cache4image.shape[1] % pad_to_multiplier:
-            pad = torch.zeros(2, pad_to_multiplier - cat_rope_cache4image.shape[1] % pad_to_multiplier, dim//2)
-            cat_rope_cache4image = torch.cat([cat_rope_cache4image, pad], dim=1)
-        if cat_rope_cache4video.shape[1] % pad_to_multiplier:
-            pad = torch.zeros(2, pad_to_multiplier - cat_rope_cache4video.shape[1] % pad_to_multiplier, dim//2)
-            cat_rope_cache4video = torch.cat([cat_rope_cache4video, pad], dim=1)
-        cat_rope_cache4image = cat_rope_cache4image[:,None,None,None] # (2, 1, 1, 1, seq_len, dim / 2)
-        cat_rope_cache4video = cat_rope_cache4video[:,None,None,None] # (2, 1, 1, 1, seq_len, dim / 2)
-        rope2d_freqs_grid[str(tuple(image_scale_schedule))] = cat_rope_cache4image
-        rope2d_freqs_grid[str(tuple(video_scale_schedule))] = cat_rope_cache4video
+    rope2d_freqs_grid['freqs_text'] = rope_text_embeds # (2, 1, 1, 1, preserve_1d_length, dim / 2)
+    rope2d_freqs_grid['freqs_frames'] = freqs_frames[:, tm:] # (2, max_frames, ceil(dim_div_2 / 4))
+    rope2d_freqs_grid['freqs_height'] = freqs_height # (2, max_height, ceil(dim_div_2 / 4))
+    rope2d_freqs_grid['freqs_width'] = freqs_width # (2, max_width, ceil(dim_div_2 / 4))
     return rope2d_freqs_grid
 
 
@@ -180,7 +130,6 @@ def precompute_rope4d_freqs_grid(
         base=10000.0, 
         device=None, 
         activated_h_div_w_templates=[], 
-        steps_per_frame=4, 
         text_maxlen=0, 
         pn=None, 
         args=None,
@@ -220,7 +169,6 @@ def precompute_rope4d_freqs_grid(
     rope2d_freqs_grid['freqs_height'] = freqs_height # (2, max_height, ceil(dim_div_2 / 4))
     rope2d_freqs_grid['freqs_width'] = freqs_width # (2, max_width, ceil(dim_div_2 / 4))
     return rope2d_freqs_grid
-
 
 def apply_rotary_emb(q, k, rope_cache):
     device_type = q.device.type

@@ -9,7 +9,6 @@ import utils.dist as dist
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vae.vqvae import VQVAE, VectorQuantizer2
 from models.var.basic_var import AdaLNBeforeHead, AdaLNSelfAttn, SharedAdaLin
-from tools.visual_attn import VisualAttnMap
 
 
 class VAR(nn.Module):
@@ -110,10 +109,6 @@ class VAR(nn.Module):
         # ------ 6. classifier head ------
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)                                                                               # [1024 --> 4096]
-
-        # ------ visual attn map ------
-        # self.vis_attn_map = VisualAttnMap()
-        self.vis_attn_map = None
     
     def init_weights(self,
                      init_adaln=0.5,
@@ -240,16 +235,6 @@ class VAR(nn.Module):
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-            # --> for visual attn map ---
-            # for idx, b in enumerate(self.blocks):
-            #     # print(f"Cueerent: {idx+1} block")
-            #     if self.vis_attn_map is not None:
-            #         self.vis_attn_map.set_cur_scale(pn)
-            #         self.vis_attn_map.set_cur_block(idx+1)
-            #     x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None,
-            #           vis_attn_map=self.vis_attn_map)
-            #     # print("=" * 50)
-            # ---------------------------
             logits_BlV = self.get_logits(x, cond_BD)                    # [16, 1, 4096]
 
             t = cfg * ratio
