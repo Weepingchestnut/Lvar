@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lvar"
+authors = [
+    {name = "Zekun Li", email="lizekun2024@ia.ac.cn"}
+]
+
+version = "0.1.0"
+description = "Research and engineering code for visual autoregressive models."
+readme = "README.md"
+dynamic = ["dependencies"]
+
+[tool.setuptools]
+py-modules = ["train", "train_infinity", "trainer"]
+include-package-data = false
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["."]
+namespaces = true
+include = [
+    "models*",
+    "utils*",
+    "tools*",
+    "evaluation*",
+    "kernels*",
+    "losses*",
+]
+exclude = [
+    "assets*",
+    "data*",
+    "datasets*",
+    "mytest*",
+    "pretrained_models*",
+    "scripts*",
+    "simple_play_models*",
+    "work_dir*",
+    "models.TODO*",
+    "tools.TODO*",
+    "kernels.chipmunk*",
+    "kernels.flash_attn*",
+    "evaluation.imagenet.torch-fidelity*",
+]
