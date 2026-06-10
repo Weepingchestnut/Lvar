@@ -11,15 +11,12 @@ import numpy as np
 import torch
 from PIL import Image
 
-from models.infinitystar.self_correction import SelfCorrection
-from models.schedules import get_encode_decode_func
 from models.schedules.dynamic_resolution import (
     get_dynamic_resolution_meta, get_first_full_spatial_size_scale_index)
-from tools.run_infinity import (InferencePipe, gen_one_video, load_tokenizer,
-                                load_video_transformer, save_video, transform)
+from tools.run_infinity import (
+    InferencePipe, gen_one_video, save_video, transform)
 from utils.arg_util_video import Args
 from utils.misc import time_str
-from utils.load import load_video_visual_tokenizer
 
 
 def perform_inference(pipe, data, args):

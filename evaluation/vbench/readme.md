@@ -19,7 +19,7 @@ pip install -e . --no-build-isolation
 ```
 
 
-## Fix Seed
+### Why Fix Seed?
 
 为什么要固定seed？
 - 完整推理一遍 Vbench 耗时久，因此在快速迭代算法时通常先关注一到两个维度的 Vbench 分数来进行简单评估
@@ -66,24 +66,68 @@ work_dir/evaluation/vbench/infinitystar_720p/fps16_5s_enlarge2captain1/
 ### Low-level metrics
 
 `evaluation/vbench/eval_low_level_metrics.py` 针对已生成的 VBench 视频进行 low-level 指标的评估。
+- 支持从 videos/ 统计整个 VBench benchmark 的 overall PSNR / SSIM / LPIPS
 
 ```bash
 # mutil-GPUs
 torchrun --nproc_per_node=8 evaluation/vbench/eval_low_level_metrics.py \
   --baseline-root /path/to/baseline/fps16_5s_enlarge2captain1 \
   --candidate-root /path/to/accelerated/fps16_5s_enlarge2captain1
-  --preferred-source png
 
 # single GPU
 python3 evaluation/vbench/eval_low_level_metrics.py \
   --baseline-root /path/to/baseline/fps16_5s_enlarge2captain1 \
   --candidate-root /path/to/accelerated/fps16_5s_enlarge2captain1
-  --preferred-source png
 ```
 
-支持：
-- 从 videos/ 统计整个 VBench benchmark 的 overall PSNR / SSIM / LPIPS
-- `--preferred-source {auto,npy,png,video}`，默认`auto`，评估时会优先读取`videos/*.npy`，其次读`frames_by_dimension/<dim>/<name>`或`videos/<physical_stem>/`下的`.png`帧目录，最后才回退`.mp4`解码
+Other useful parameters:
+
+- `--input-layout {auto, vbench, flat}` (default: `auto`): `vbench` expects the VBench structure (videos/ + videos_by_dimension/). `flat` treats both roots as plain directories of videos matched by filename (a root/videos subdir is also accepted); --dimensions is ignored in flat mode. `auto` detects the layout from each root.
+<!-- auto 对两个 root 各自探测——能解析出 videos/ + videos_by_dimension/ 结构就走 VBench 模式，否则只要目录里（或其 videos/ 子目录里）有视频文件就走 flat 模式；两边探测结果不一致会直接报错提示需要显式指定. -->
+- `--decode-backend {auto, torchcodec, decord, opencv}` (default: `auto`): Video decoding backend. `auto` prefers **[torchcodec](https://github.com/meta-pytorch/torchcodec)**, then decord, then opencv.
+  - `--decode-device {auto, cuda, cpu}` (default: `auto`): torchcodec only. `cuda` decodes via NVDEC on the metric GPU; `auto` tries NVDEC and permanently falls back to `cpu` decoding on the first failure.
+  - `--decode-threads (int)` (default: `0`): FFmpeg thread count per torchcodec decoder. 0 keeps FFmpeg's default.
+
+- `--prefetch-depth (int)` (default: `2`): How many video pairs to decode ahead in background threads (overlaps decoding with GPU metric computation). `0` disables prefetching.
+
+- `--frame-batch-size (int)` (default: `16`): How many frames to evaluate per GPU batch. The adjustment can be made appropriately based on the GPU memory.
+
+- `--lpips-net-type {alex, vgg, squeeze}` (default: `vgg`): Backbone used by torchmetrics LPIPS.
+
+- `--preferred-source {auto,npy,png,video}` (default: `auto`): Metric input source. 'auto' prefers npy, then PNG frame directories, then encoded videos.
+<!-- 默认`auto`，评估时会优先读取`videos/*.npy`，其次读`frames_by_dimension/<dim>/<name>`或`videos/<physical_stem>/`下的`.png`帧目录，最后才回退`.mp4`解码 -->
+- `--include-first-frame {0, 1}` (default: `1`): Whether to include frame 0 in metric computation. Set to 0 to evaluate only later video frames.
+
+- `--collect-per-video (store_true)`: Gather per-video metric values to rank 0; adds a per_video_metrics section and std fields to the report json.
+
+#### Use TorchCodec
+
+TorchCodec is a Python library for decoding video and audio data into PyTorch tensors, on CPU and CUDA GPU.
+
+```bash
+# 1. Install FFmpeg
+conda install "ffmpeg"
+# or
+conda install "ffmpeg" -c conda-forge
+
+# Install PyTorch and TorchCodec:
+# torch >= 2.11
+pip install torchcodec
+```
+
+Check it after installation
+```bash
+# 1) 共享库在不在（Linux or conda env）
+python -c "import ctypes.util; print(ctypes.util.find_library('avcodec'))"
+# 2) TorchCodec 能否真正解码
+# libopenvino 找 libstdc++ 时先命中 env 里更新版本的 libstdc++
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+python -c "from torchcodec.decoders import VideoDecoder; d=VideoDecoder('xxx.mp4'); print(d[:].shape)"
+# 3) 确认 imageio 没受影响（仍指向它自己捆绑的二进制）
+python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+```
+
+---
 
 
 ### Bugs
