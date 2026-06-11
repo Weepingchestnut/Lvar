@@ -92,7 +92,10 @@ def _sparse_attn_fwd_inner(acc, l_i, m_i, q,  #
     return acc, l_i, m_i
 
 
-@triton.autotune(list(filter(keep, configs)), key=["N_CTX_Q", "N_CTX_KV", "HEAD_DIM"])
+# NOTE: N_CTX_KV dropped from the autotune key — it tracks per-video k_len and
+# re-autotuning every video leaks the sparse-scale activations via retained
+# OutOfResources tracebacks. Reuse the config tuned on fixed N_CTX_Q/HEAD_DIM.
+@triton.autotune(list(filter(keep, configs)), key=["N_CTX_Q", "HEAD_DIM"])
 @triton.jit
 def _sparse_attn_fwd(Q, K, V, sm_scale, M, L, Out, Out_accum, Out_scale: tl.constexpr, #
               sparsity_indices, sparsity_counts, #

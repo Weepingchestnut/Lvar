@@ -4,6 +4,8 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch.nn import functional as F
 
+try: import chipmunk     # chipmunk FA3 attn
+except ImportError: chipmunk = None
 import kernels.sparse_attn.triton as sattn_triton
 from .sparse_attn_config import GLOBAL_CONFIG, get_kernel_config_attn
 # from flag_attn import flash_attention
@@ -83,11 +85,13 @@ def dense_colsum_attn_q(q, k, v, scale=None):
         # CUDA implementation
         # --- 2 kernel 2 pass get colsum ---
         o, _ = torch.ops.chipmunk.dense_attn(q, k, v, scale=scale)
-        _, cs, _ = sattn_triton.dense_colsum_attn(q, k, v, scale=scale)     # Using Triton correctly cs
+        _, lse = sattn_triton.dense_attn(q, k, v, scale=scale)
+        _, cs, _ = sattn_triton.dense_colsum_attn(q, k, v, lse, scale=scale)     # Using Triton correctly cs
     else:
         # Triton implementation
         # --- 1 kernel 2 pass get colsum ---
-        o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, scale=scale)
+        o, lse = sattn_triton.dense_attn(q, k, v, scale=scale)
+        o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, lse, scale=scale)
 
         assert l[0].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[0].shape, q.shape)
         assert l[1].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[1].shape, q.shape)
@@ -214,10 +218,13 @@ def csp_attn(q, k, v, scale, indices, indices_counts, o, o_scale):
 # __all__ = ['csp_attn', 'dense_attn', 'dense_colsum_attn']
 
 
-# ==========
-# bitpack.py
-# ==========
-@torch.compile(dynamic=False)
+# ========
+# bitpack
+# ========
+# dynamic=True: `mask` width tracks k_len (varies per video), so dynamic=False
+# recompiles every video and the retained compile artifacts pin the activations.
+# A single symbolic-shape compilation reused across k_len avoids the per-video churn.
+@torch.compile(dynamic=True)
 def bitpack(mask: torch.Tensor):
     r"""
     Compresses a boolean tensor into a bit-packed uint8 tensor in parallel on the GPU.
@@ -255,7 +262,9 @@ def bitpack(mask: torch.Tensor):
     return packed, original_shape
 
 
-@torch.compile(dynamic=False)
+# dynamic=True for the same reason as bitpack: avoid per-video recompilation that
+# pins activations in retained compile artifacts.
+@torch.compile(dynamic=True)
 def bitunpack(packed: torch.Tensor, original_shape: Tuple[int, ...]):
     r"""
     Decompresses a bit-packed tensor (uint8) back to a boolean tensor in parallel on the GPU.
@@ -286,9 +295,9 @@ def bitunpack(packed: torch.Tensor, original_shape: Tuple[int, ...]):
     return bits.view(*original_shape)
 
 
-# =============
-# indexed_io.py
-# =============
+# ===========
+# indexed_io
+# ===========
 def copy_indices(
     bm_fc1: torch.Tensor, 
     bm_mid_cache: torch.Tensor, 

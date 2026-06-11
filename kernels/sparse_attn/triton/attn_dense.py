@@ -81,7 +81,12 @@ def keep(conf):
     return True
 
 
-@triton.autotune(list(filter(keep, configs)), key=["N_CTX_Q", "N_CTX_KV", "HEAD_DIM"])
+# NOTE: N_CTX_KV dropped from the autotune key. It tracks k_len, which varies per
+# video (prompt length); keeping it re-autotunes every video, and the
+# OutOfResources exceptions raised while benchmarking retain (via their tracebacks)
+# the decision-scale activations -> per-video GPU leak. Tuning on the fixed
+# N_CTX_Q/HEAD_DIM and reusing the config across k_len avoids the churn.
+@triton.autotune(list(filter(keep, configs)), key=["N_CTX_Q", "HEAD_DIM"])
 @triton.jit
 def _attn_fwd(Q, K, V, sm_scale, M, L, Out, seqlen,  #
               stride_qz, stride_qh, stride_qm, stride_qk,  #

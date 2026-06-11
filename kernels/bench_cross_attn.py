@@ -336,7 +336,7 @@ def print_header():
 
 
 def print_accuracy(cfg: BenchConfig, acc_results: Dict[str, dict], reference_impl: str):
-    print("\n" + "-" * 120)
+    print("\n" + "=" * 120)
     print(
         f"[Accuracy] "
         f"B={cfg.batch:>2} H={cfg.heads:>3} Q={cfg.q_len:>5} KV={cfg.kv_len:>5} D={cfg.head_dim:>4} "
@@ -369,7 +369,7 @@ def print_perf(cfg: BenchConfig, rows: List[Tuple[str, str, str, str]]):
     print(f"{'provider':<15} {'avg_ms':<12} {'TFLOPS':<12} {'note'}")
     for name, ms, tflops, note in rows:
         print(f"{name:<15} {ms:<12} {tflops:<12} {note}")
-    print("-" * 120)
+    print("=" * 120)
 
 
 def parse_args():

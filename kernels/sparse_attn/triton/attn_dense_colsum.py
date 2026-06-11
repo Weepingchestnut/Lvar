@@ -122,7 +122,10 @@ def _full_attn_fwd_inner(acc, l_i, m_i, q,  #
 # blocksums_ptrs is updated via atomic_add. Triton autotune benchmarks several
 # configs on the same output tensor, so it must reset this accumulator between
 # trials or the measured run will leave colsum multiplied by the tuning repeats.
-@triton.autotune(list(filter(keep, configs)), key=["N_CTX_Q", "N_CTX_KV", "HEAD_DIM"], reset_to_zero=["blocksums_ptrs"])
+# NOTE: N_CTX_KV dropped from the autotune key — it tracks per-video k_len and
+# re-autotuning every video leaks the decision-scale activations via retained
+# OutOfResources tracebacks. Reuse the config tuned on fixed N_CTX_Q/HEAD_DIM.
+@triton.autotune(list(filter(keep, configs)), key=["N_CTX_Q", "HEAD_DIM"], reset_to_zero=["blocksums_ptrs"])
 @triton.jit
 def _full_attn_fwd(Q, K, V, sm_scale, M, L, Out, seqlen,  #
               prev_maxes_ptr, #

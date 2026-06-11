@@ -30,16 +30,25 @@ BASE_CONFIG = {
     },
     'attn': {
         'is_enabled': True,
-        'decision_scale': 10,       # add for ablation
-        'speedup': 1,                # for cuda Kernel index problem
+        # ------ CS4A ------
+        'decision_scale': 10,                   # sparse decision scale `S`
+        'decision_on_first_repeat': False,      # True: full decision on decision scale's repeat 0, later repeats sparse; False: legacy decision on last repeat
+        'speedup': 0,                           # 1: use TK-CUDA dense_colsum_attn; 0: use Triton dense_colsum_attn
         'top_keys': 0.05,
-        'attn_sink': 5,
-        'win_size': [-1,-1,-1,-1,-1,-1,-1,-1,1,1,3,5,7],
         'random_keys': 0.01,
         'local_voxels': 0,
         'local_1d_window': 0,
-
+        'cs4a_index_expand_mode': '1d',
+        'cs4a_band_neighbor_frames': 1,         # frame_band: own frame +/- N neighbour frames
+        'use_o_cache': False,
+        'update_o_cache_on_sparse_scale': 'none',
         'first_n_dense_layers': 2,
+        # ------ CSLA ------
+        'attn_sink': 5,
+        'win_size': [-1,-1,-1,-1,-1,-1,-1,-1,1,1,3,5,7],
+        # ------ CS4A + CSLA ------
+        'bound_layer': 10,
+        # 
         'full_step_every': 10,
         'full_step_schedule': None,
 
