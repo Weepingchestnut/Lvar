@@ -41,13 +41,58 @@ vbench_score() {
             2>&1 | tee ${dim_path}/vbench_${dimension}_${timestamp}.log
     done
 
+    # calculate VBench final scores
+    python evaluation/vbench/cal_vbench_final_score.py \
+        --json_files_path ${out_dir}/evaluation_results/ \
+        2>&1 | tee ${out_dir}/evaluation_results/vbench_final_score_${timestamp}.log
+
     conda deactivate
+
+    # ------ low-level score ------
+    # # if you install `ffmpeg` in conda env or system `ffmpeg` version old, use 
+    export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
+    torchrun --nproc_per_node=${gpu_num} evaluation/vbench/eval_low_level_metrics.py \
+        --baseline-root ${vbench_gts} \
+        --candidate-root ${out_dir} \
+        --include-first-frame 1 \
+        2>&1 | tee ${out_dir}/evaluation_results/vbench_low-level_metrics_first-frame1_${timestamp}.log
+
+    timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
+    torchrun --nproc_per_node=${gpu_num} evaluation/vbench/eval_low_level_metrics.py \
+        --baseline-root ${vbench_gts} \
+        --candidate-root ${out_dir} \
+        --preferred-source video \
+        --include-first-frame 1 \
+        2>&1 | tee ${out_dir}/evaluation_results/vbench_low-level_metrics_video_first-frame1_${timestamp}.log
+
+    timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
+    torchrun --nproc_per_node=${gpu_num} evaluation/vbench/eval_low_level_metrics.py \
+        --baseline-root ${vbench_gts} \
+        --candidate-root ${out_dir} \
+        --include-first-frame 0 \
+        2>&1 | tee ${out_dir}/evaluation_results/vbench_low-level_metrics_first-frame0_${timestamp}.log
+
+    timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
+    torchrun --nproc_per_node=${gpu_num} evaluation/vbench/eval_low_level_metrics.py \
+        --baseline-root ${vbench_gts} \
+        --candidate-root ${out_dir} \
+        --preferred-source video \
+        --include-first-frame 0 \
+        2>&1 | tee ${out_dir}/evaluation_results/vbench_low-level_metrics_video_first-frame0_${timestamp}.log
+    
+    single GPU
+    python3 evaluation/vbench/eval_low_level_metrics.py \
+        --baseline-root ${vbench_gts} \
+        --candidate-root ${out_dir} \
+        2>&1 | tee ${out_dir}/evaluation_results/vbench_low-level_metrics_${timestamp}.log
+    
 }
 
 latency_profile() {
     # --- run inference ---
     # single GPU
-    python tools/latency_profile_infistar.py \
+    python -u tools/latency_profile_infistar.py \
         --pn ${pn} \
         --fps ${fps} \
         --generation_duration ${generation_duration} \
@@ -59,7 +104,18 @@ latency_profile() {
         --semantic_scales ${semantic_scales} \
         --profile_output_root ${out_dir} \
         --infer_batch_size ${batch_size} \
-        2>&1 | tee ${out_dir}/infer_profile_batch-${batch_size}.log
+        2>&1 | tee ${out_dir}/infer_profile_batch-${batch_size}_${timestamp}.log
+    
+    # ------ low-level metrics ------
+    # if you install `ffmpeg` in conda env, use 
+    export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+    mkdir -p ${out_dir}/evaluation_results
+
+    python -u evaluation/vbench/eval_low_level_metrics.py \
+        --baseline-root ${profile_gts} \
+        --candidate-root ${out_dir} \
+        --collect-per-video \
+        2>&1 | tee ${out_dir}/evaluation_results/profile_low-level_metrics_${timestamp}.log
 }
 
 
@@ -73,8 +129,10 @@ resolution=720p
 fps=16
 generation_duration=5
 append_enlarge2captain=1    # use f'{prompt}, Close-up on big objects, emphasize scale and detail'
+timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
 
-model_exp=${model_type}_${resolution}       # TODO: change to different exps
+# TODO: change to different exps
+model_exp=${model_type}_${resolution}
 sub_fix=fps${fps}_${generation_duration}s_enlarge2captain${append_enlarge2captain}
 
 # Define the dimension list
@@ -137,7 +195,6 @@ out_dir=${out_dir_root}/${model_exp}/${sub_fix}
 mkdir -p ${out_dir}
 dim_path=${out_dir}/videos_by_dimension
 
-timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
 start_sec=$(date +%s)
 
 test_vbench
