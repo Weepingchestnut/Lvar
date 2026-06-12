@@ -10,6 +10,8 @@ from torch.utils.checkpoint import checkpoint
 try: from timm.layers import DropPath, drop_path
 except: from timm.models.layers.drop import DropPath
 
+try: import chipmunk     # our chipmunk kernels
+except ImportError: chipmunk = None
 # Import flash_attn's attention
 from flash_attn import flash_attn_func  # q, k, or v: BLHc, ret: BLHc
 from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
@@ -157,6 +159,11 @@ class SelfAttention(nn.Module):
                 with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                     oup = torch_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, 
                                      dropout_p=0).transpose(1, 2).reshape(B, L, C)
+
+                # --- TK CUDA attn ---
+                # o, _ = torch.ops.chipmunk.dense_attn(q.to(v.dtype), k.to(v.dtype), v)
+                # # assert lse.shape == (q.shape[0], q.shape[1], q.shape[2], 1), "LSE shape mismatch"
+                # oup = o.transpose(1, 2).reshape(B, L, C)
             # oup: bf16
         
         return self.proj_drop(self.proj(oup))
@@ -217,6 +224,11 @@ class SelfAttention(nn.Module):
                 with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                     oup = torch_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, 
                                      dropout_p=0).transpose(1, 2).reshape(B, L, C)
+
+                # --- TK CUDA attn ---
+                # o, _ = torch.ops.chipmunk.dense_attn(q.to(v.dtype), k.to(v.dtype), v)
+                # # assert lse.shape == (q.shape[0], q.shape[1], q.shape[2], 1), "LSE shape mismatch"
+                # oup = o.transpose(1, 2).reshape(B, L, C)
             # oup: bf16
 
         return self.proj_drop(self.proj(oup))
