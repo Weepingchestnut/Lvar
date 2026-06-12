@@ -1,0 +1,1 @@
+"""FastVAR model package."""

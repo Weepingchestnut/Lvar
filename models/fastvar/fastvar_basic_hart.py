@@ -72,7 +72,7 @@ def fastvar_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_di
 
     if idx_fn is not None and idx_fn.__name__ != 'do_nothing':
         rope_idx = idx_fn()
-        print("rope_idx: ", rope_idx.shape)
+        # print("rope_idx: ", rope_idx.shape)
         cos = torch.gather(cos, index=rope_idx.repeat(1,1,cos.shape[-1]), dim=1)
         sin = torch.gather(sin, index=rope_idx.repeat(1,1,sin.shape[-1]), dim=1)
 
