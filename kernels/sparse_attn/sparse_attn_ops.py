@@ -37,6 +37,20 @@ def dense_attn(q, k, v, scale=None):
     return o, lse
 
 
+def _colsum_group_rows() -> int:
+    """Colsum query-group rows for the decision scale.
+
+    `dcsla_colsum_group_rows` (multiple of 64; {192, 128, 64}) only takes effect
+    when D-CSLA is enabled: the legacy CS4A chain (topk / mask_to_indices /
+    csp_attn / singleton masks) assumes the kernel-config bm=192 grouping, so
+    with dcsla_enabled=false the override is ignored and 192 is always used.
+    """
+    attn_cfg = GLOBAL_CONFIG['attn']
+    if not attn_cfg.get('dcsla_enabled', False):
+        return 192
+    return int(attn_cfg.get('dcsla_colsum_group_rows', 192))
+
+
 # --------------------------
 # for speedup
 #       cs in CUDA impl has bugs
@@ -48,10 +62,13 @@ def dense_colsum_attn_s(q, k, v, scale=None):
 
     provider = GLOBAL_CONFIG['attn']['provider']
     pad_to = get_kernel_config_attn()['bm']
+    group_rows = _colsum_group_rows()
 
     if provider == 'cuda':
         # CUDA implementation
         # --- 2 kernel 2 pass get colsum ---
+        assert group_rows == 192, \
+            f'CUDA dense_colsum_attn is fixed at 192-row groups (3 consumer warpgroups); got dcsla_colsum_group_rows={group_rows}'
         o, lse = torch.ops.chipmunk.dense_attn(q, k, v, scale)     # lse [bs, heads, q_len, 1]
         _, cs, l = torch.ops.chipmunk.dense_colsum_attn(q, k, v, lse, scale)    # cs: [bs, num_heads, ceil(Nq/bm), Nkv]
         assert l.shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[0].shape, q.shape)
@@ -59,7 +76,7 @@ def dense_colsum_attn_s(q, k, v, scale=None):
     else:
         # Triton implementation
         # --- 1 kernel 2 pass get colsum ---
-        o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, scale=scale)
+        o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, scale=scale, group_rows=group_rows)
 
         assert l[0].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[0].shape, q.shape)
         assert l[1].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[1].shape, q.shape)
@@ -80,25 +97,29 @@ def dense_colsum_attn_q(q, k, v, scale=None):
 
     provider = GLOBAL_CONFIG['attn']['provider']
     pad_to = get_kernel_config_attn()['bm']
+    group_rows = _colsum_group_rows()
 
     if provider == 'cuda':
         # CUDA implementation
         # --- 2 kernel 2 pass get colsum ---
         o, _ = torch.ops.chipmunk.dense_attn(q, k, v, scale=scale)
         _, lse = sattn_triton.dense_attn(q, k, v, scale=scale)
-        _, cs, _ = sattn_triton.dense_colsum_attn(q, k, v, lse, scale=scale)     # Using Triton correctly cs
+        _, cs, _ = sattn_triton.dense_colsum_attn(q, k, v, lse, scale=scale, group_rows=group_rows)     # Using Triton correctly cs
     else:
         # Triton implementation
-        # --- 1 kernel 2 pass get colsum ---
         o, lse = sattn_triton.dense_attn(q, k, v, scale=scale)
-        o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, lse, scale=scale)
+
+        assert type(lse) == tuple
+        assert lse[0].is_contiguous() and lse[1].is_contiguous(), "LSE must be contiguous"
+
+        o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, lse, scale=scale, group_rows=group_rows)
 
         assert l[0].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[0].shape, q.shape)
         assert l[1].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[1].shape, q.shape)
 
     assert o.shape == q.shape, "Output shape mismatch - o: {}, q: {}".format(o.shape, q.shape)
     # assert cs.shape == (q.shape[0], q.shape[1], (q.shape[-2] + pad_to - 1) // pad_to, k.shape[2]), "CS shape mismatch - cs: {}, q: {}".format(cs.shape, q.shape)
-    
+
     return o, cs
 
 
@@ -200,8 +221,8 @@ def csp_attn(q, k, v, scale, indices, indices_counts, o, o_scale):
     # Ignore the n_groups dimension in Python - the kernel will also double check for us!
     assert indices.shape == (q.shape[0], q.shape[1], indices.shape[2], k.shape[-2]), "Indices shape mismatch - indices: {}, q: {}, k: {}".format(indices.shape, q.shape, k.shape)
     assert indices_counts.shape == indices.shape[:-1], "Indices counts shape mismatch - indices_counts: {}, indices: {}".format(indices_counts.shape, indices.shape)
-    assert o.shape == q.shape, "Output shape mismatch - o: {}, q: {}".format(o.shape, q.shape)
-    
+    assert o is None or o.shape == q.shape, "Output shape mismatch - o: {}, q: {}".format(o.shape, q.shape)
+
     if GLOBAL_CONFIG['attn']['provider'] == 'triton':
         pad_to = get_kernel_config_attn()['bm']
         o_delta, _ = sattn_triton.csp_attn(
@@ -209,10 +230,17 @@ def csp_attn(q, k, v, scale, indices, indices_counts, o, o_scale):
             indices, indices_counts,
             scale=scale,
         )
+        # o=None means "no O_cache to accumulate into" (o would be all zeros):
+        # return ΔO directly instead of zeros-init + two full-size elementwise passes.
+        if o is None:
+            return o_delta if o_scale == 1 else o_delta * o_scale
         o = o + o_delta * o_scale
     else:
+        if o is None:
+            # The CUDA kernel accumulates into o in place, so it needs a real tensor.
+            o = torch.zeros_like(q)
         torch.ops.chipmunk.csp_attn(q, k, v, o, indices, indices_counts, o_scale, scale)
-    
+
     return o
 
 # __all__ = ['csp_attn', 'dense_attn', 'dense_colsum_attn']

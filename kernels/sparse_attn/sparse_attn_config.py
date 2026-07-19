@@ -30,22 +30,48 @@ BASE_CONFIG = {
     },
     'attn': {
         'is_enabled': True,
+        # which SparseDiffAttn path: 'image' (Infinity) or 'video' (InfinityStar)
+        'model_family': 'video',
         # ------ CS4A ------
         'decision_scale': 10,                   # sparse decision scale `S`
         'decision_on_first_repeat': False,      # True: full decision on decision scale's repeat 0, later repeats sparse; False: legacy decision on last repeat
         'speedup': 0,                           # 1: use TK-CUDA dense_colsum_attn; 0: use Triton dense_colsum_attn
         'top_keys': 0.05,
+        'use_current_scale_topklen': False,
         'random_keys': 0.01,
-        'local_voxels': 0,
+        'local_voxels': 0,                      # Number of local voxels to use for static local attention
         'local_1d_window': 0,
-        'cs4a_index_expand_mode': '1d',
+        'cs4a_qgroup_map_mode': 'nearest',
+        'cs4a_qgroup_interp_align': 'center',
+        'cs4a_index_expand_mode': 'footprint',
         'cs4a_band_neighbor_frames': 1,         # frame_band: own frame +/- N neighbour frames
+        # ------ CS4A (image / Infinity only) ------
+        'cs4a_image_kv_map': 'relative',        # 'relative': Decompose-Align-Project LUT; 'identity': keep decision coords (conference behavior)
+        'cs4a_sink_scales': 5,                  # union tokens of the first N scales as attention sink (>= k - decision_scale when 'relative')
+        'cs4a_image_expand_mode': 'center_union',  # 'center_union': mapped centers ∪ local ∪ sink; 'footprint': inverse parent-LUT mask expansion
+        'cs4a_footprint_union_local': False,    # footprint: also union the local window (cs4a_ws)
         'use_o_cache': False,
         'update_o_cache_on_sparse_scale': 'none',
         'first_n_dense_layers': 2,
         # ------ CSLA ------
         'attn_sink': 5,
         'win_size': [-1,-1,-1,-1,-1,-1,-1,-1,1,1,3,5,7],
+        # ------ D-CSLA (block-sparse FlexAttention path; alternative to csp_attn) ------
+        'dcsla_enabled': False,
+        'dcsla_block_size': 128,
+        'dcsla_select_mode': 'coverage',        # ['coverage', 'topk_ratio']
+        'dcsla_tau': 0.9,                       # coverage: cover tau of the row's TOTAL mass (sink-covered mass credited)
+        'dcsla_topk_ratio': 0.2,                # topk_ratio: fixed fraction of V (iso-budget vs cs4a top_keys)
+        'dcsla_min_blocks': 16,                 # min selected video blocks per q-block row
+        'dcsla_max_blocks_ratio': 0.5,          # cap on selected video blocks, fraction of V
+        'dcsla_local_diag_blocks': 1,           # force +/-N blocks around the diagonal-aligned video position; 0=off
+        'dcsla_keep_sink': True,                # True: force-keep all ctx(sink) blocks; False: sink selected per dcsla_sink_select_tau
+        'dcsla_sink_select_tau': 0.0,           # keep_sink=False: >0 = sink region runs its OWN coverage selection (sink mass is exact, identity transfer); 0 = sink competes jointly with video
+        'dcsla_mass_normalize': True,           # mass-conserving transfer (divide by footprint multiplicity); False = raw counts (v1 behavior)
+        'dcsla_colsum_group_rows': 192,         # decision colsum query-group rows, multiple of 64 ({192,128,64}); Triton colsum only (CUDA speedup colsum is fixed at 192); ignored unless dcsla_enabled
+
+        'dcsla_flex_mode': 'max-autotune-no-cudagraphs',   # torch.compile mode; ~ / 'none' for default
+        'dcsla_flex_dynamic': True,             # torch.compile(dynamic=...) for varying text/kv lengths
         # ------ CS4A + CSLA ------
         'bound_layer': 10,
         # 
