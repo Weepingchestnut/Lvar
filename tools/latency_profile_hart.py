@@ -1,4 +1,3 @@
-import argparse
 # import copy
 import os
 import random
@@ -15,7 +14,7 @@ from tqdm import tqdm
 # from transformers import AutoModel, AutoTokenizer
 
 from tools.run_hart import llm_system_prompt, load_hart, load_hart_tokenizer
-from tools.run_infinity import add_common_arguments
+from utils.arg_util import HARTInferArgs
 from utils.profile_utils import (default_prompts, format_memory,
                                  get_memory_usage, get_physical_device_index)
 
@@ -305,18 +304,8 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    add_common_arguments(parser)
-
-    parser.add_argument(
-        "--batch_size", type=int, help="Generation batch size", default=1)
-    parser.add_argument("--warmup_iter", type=int, default=50)
-    parser.add_argument("--profile_iter", type=int, default=100)
-    args = parser.parse_args()
-
-    # parse cfg
-    args.cfg = list(map(float, args.cfg.split(',')))
-    if len(args.cfg) == 1:
-        args.cfg = args.cfg[0]
+    # HART-only profiler: parse HARTInferArgs directly (batch_size / warmup_iter /
+    # profile_iter live there too); Tap parses cfg as a single float already
+    args = HARTInferArgs(explicit_bool=True).parse_args(known_only=True)
 
     main(args)

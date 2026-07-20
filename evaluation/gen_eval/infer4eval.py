@@ -6,6 +6,7 @@ from lightning_fabric import seed_everything
 from models.scalekv.scale_kv import enable_scale_kv
 from tools.conf import HF_HOME, HF_TOKEN
 from tools.run_infinity import *
+from utils.infer_arg_utils import merge_script_args, parse_infer_args
 
 
 # set environment variables
@@ -15,19 +16,21 @@ os.environ['XFORMERS_FORCE_DISABLE_TRITON'] = '1'
 
 
 if __name__ == '__main__':
+    # model-level args (model_path / cfg / ... incl. --outdir) are parsed by the
+    # Tap class matching --model_type; the parser below only holds benchmark args
+    args = parse_infer_args()
     parser = argparse.ArgumentParser()
-    add_common_arguments(parser)
-    parser.add_argument('--outdir', type=str, default='')
     parser.add_argument('--n_samples', type=int, default=4)
     parser.add_argument('--metadata_file', type=str, default='evaluation/gen_eval/prompts/evaluation_metadata.jsonl')
     parser.add_argument('--rewrite_prompt', type=int, default=0, choices=[0,1])
     parser.add_argument('--load_rewrite_prompt_cache', type=int, default=1, choices=[0,1])
-    args = parser.parse_args()
+    args = merge_script_args(args, parser)
 
-    # parse cfg
-    args.cfg = list(map(float, args.cfg.split(',')))
-    if len(args.cfg) == 1:
-        args.cfg = args.cfg[0]
+    # parse cfg (Tap parses cfg as a single float; keep supporting the legacy comma-separated string)
+    if isinstance(args.cfg, str):
+        args.cfg = list(map(float, args.cfg.split(',')))
+        if len(args.cfg) == 1:
+            args.cfg = args.cfg[0]
     
     with open(args.metadata_file) as fp:
         metadatas = [json.loads(line) for line in fp]
@@ -86,6 +89,8 @@ if __name__ == '__main__':
         images = []
         for sample_j in range(args.n_samples):
             print(f"Generating {sample_j+1} of {args.n_samples}, prompt={prompt}")
+            # per-sample seed, same protocol as the DDP pipelines
+            seed = args.seed + (index * args.n_samples) + sample_j
 
             torch.cuda.reset_peak_memory_stats(device='cuda')
             alloc_before_gen = torch.cuda.memory_allocated(device='cuda') / (1024**2)
@@ -119,11 +124,12 @@ if __name__ == '__main__':
                 tgt_h, tgt_w = dynamic_resolution_h_w[h_div_w_template][args.pn]['pixel']
 
                 image = gen_one_img(
-                    infinity, vae, text_tokenizer, text_encoder, 
-                    prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg, 
-                    scale_schedule=scale_schedule, 
-                    cfg_insertion_layer=[args.cfg_insertion_layer], 
-                    vae_type=args.vae_type
+                    infinity, vae, text_tokenizer, text_encoder,
+                    prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg,
+                    scale_schedule=scale_schedule,
+                    cfg_insertion_layer=[args.cfg_insertion_layer],
+                    vae_type=args.vae_type,
+                    g_seed=seed,
                 )
             else:
                 raise ValueError

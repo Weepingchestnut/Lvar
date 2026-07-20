@@ -5,10 +5,20 @@ import traceback
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
-import chipmunk
+try: import chipmunk
+except ImportError: chipmunk = None
+
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+# Optional TK 2.0 side-by-side build (kernels/chipmunk_tk2); benchmarked as the
+# extra provider "chipmunk_tk2" when installed.
+try:
+    import chipmunk_tk2  # noqa: F401  (registers torch.ops.chipmunk_tk2)
+    HAS_CHIPMUNK_TK2 = True
+except ImportError:
+    HAS_CHIPMUNK_TK2 = False
 
 # Import flash_attn's attention
 # from flash_attn_interface import flash_attn_func; print('#'*10 + ' use FA3 ' + '#'*10)
@@ -16,7 +26,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from flash_attn import flash_attn_func  # q, k, or v: BLHc, ret: BLHc
 
 from kernels.sparse_attn.sparse_attn_ops import dense_attn
-from kernels.flash_atten.triton.fused_attention import flash_attn_triton
+from kernels.sparse_attn.triton.fused_attention import attention
 
 
 # =========================
@@ -41,38 +51,46 @@ BENCH_CONFIGS: List[BenchConfig] = [
     # BenchConfig(batch=2, heads=16, q_len=512,  kv_len=512,  head_dim=64),
     # BenchConfig(batch=2, heads=16, q_len=512,  kv_len=2048, head_dim=64),
     
-    BenchConfig(batch=4, heads=16, q_len=1024, kv_len=1024, head_dim=128),
-    BenchConfig(batch=4, heads=16, q_len=1024, kv_len=4096, head_dim=128),
+    # BenchConfig(batch=4, heads=16, q_len=1024, kv_len=1024, head_dim=128),
+    # BenchConfig(batch=4, heads=16, q_len=1024, kv_len=4096, head_dim=128),
     
-    BenchConfig(batch=1, heads=24,  q_len=2048,  kv_len=6425, head_dim=128),
-    BenchConfig(batch=2, heads=24,  q_len=2048,  kv_len=6425, head_dim=128),
-    BenchConfig(batch=1, heads=24,  q_len=4096,  kv_len=10521, head_dim=128),
-    BenchConfig(batch=2, heads=24,  q_len=4096,  kv_len=10521, head_dim=128),
+    # BenchConfig(batch=1, heads=24,  q_len=2048,  kv_len=6425, head_dim=128),
+    # BenchConfig(batch=2, heads=24,  q_len=2048,  kv_len=6425, head_dim=128),
+    # BenchConfig(batch=1, heads=24,  q_len=4096,  kv_len=10521, head_dim=128),
+    # BenchConfig(batch=2, heads=24,  q_len=4096,  kv_len=10521, head_dim=128),
 
-    BenchConfig(batch=1, heads=32,  q_len=11520,  kv_len=15244, head_dim=128),
-    BenchConfig(batch=2, heads=32,  q_len=11520,  kv_len=15244, head_dim=128),
-    BenchConfig(batch=1, heads=32,  q_len=20640,  kv_len=24364, head_dim=128),
-    BenchConfig(batch=2, heads=32,  q_len=20640,  kv_len=24364, head_dim=128),
-    BenchConfig(batch=1, heads=32,  q_len=31800,  kv_len=35524, head_dim=128),
-    BenchConfig(batch=2, heads=32,  q_len=31800,  kv_len=35524, head_dim=128),
-    BenchConfig(batch=1, heads=32,  q_len=72000,  kv_len=75724, head_dim=128),
-    BenchConfig(batch=2, heads=32,  q_len=72000,  kv_len=75724, head_dim=128),
+    # BenchConfig(batch=1, heads=32,  q_len=11520,  kv_len=15244, head_dim=128),
+    # BenchConfig(batch=2, heads=32,  q_len=11520,  kv_len=15244, head_dim=128),
+    # BenchConfig(batch=1, heads=32,  q_len=20640,  kv_len=24364, head_dim=128),
+    # BenchConfig(batch=2, heads=32,  q_len=20640,  kv_len=24364, head_dim=128),
+    # BenchConfig(batch=1, heads=32,  q_len=31800,  kv_len=35524, head_dim=128),
+    # BenchConfig(batch=2, heads=32,  q_len=31800,  kv_len=35524, head_dim=128),
+    # BenchConfig(batch=1, heads=32,  q_len=72000,  kv_len=75724, head_dim=128),
+    # BenchConfig(batch=2, heads=32,  q_len=72000,  kv_len=75724, head_dim=128),
 
     # test Triton fused-attention
-    # BenchConfig(batch=1, heads=24,  q_len=2048,  kv_len=2048, head_dim=128),
-    # BenchConfig(batch=2, heads=24,  q_len=2048,  kv_len=2048, head_dim=128),
-    # BenchConfig(batch=1, heads=24,  q_len=4096,  kv_len=4096, head_dim=128),
-    # BenchConfig(batch=2, heads=24,  q_len=4096,  kv_len=4096, head_dim=128),
-    # BenchConfig(batch=1, heads=24,  q_len=8192,  kv_len=8192, head_dim=128),
-    # BenchConfig(batch=2, heads=24,  q_len=8192,  kv_len=8192, head_dim=128),
+    BenchConfig(batch=1, heads=24,  q_len=2048,  kv_len=2048, head_dim=128),
+    BenchConfig(batch=2, heads=24,  q_len=2048,  kv_len=2048, head_dim=128),
+    BenchConfig(batch=1, heads=24,  q_len=4096,  kv_len=4096, head_dim=128),
+    BenchConfig(batch=2, heads=24,  q_len=4096,  kv_len=4096, head_dim=128),
+    BenchConfig(batch=1, heads=24,  q_len=8192,  kv_len=8192, head_dim=128),
+    BenchConfig(batch=2, heads=24,  q_len=8192,  kv_len=8192, head_dim=128),
+    # 
+    BenchConfig(batch=1, heads=32,  q_len=15244,  kv_len=15244, head_dim=128),
+    BenchConfig(batch=2, heads=32,  q_len=15244,  kv_len=15244, head_dim=128),
+    BenchConfig(batch=1, heads=32,  q_len=24364,  kv_len=24364, head_dim=128),
+    BenchConfig(batch=2, heads=32,  q_len=24364,  kv_len=24364, head_dim=128),
+    BenchConfig(batch=1, heads=32,  q_len=35524,  kv_len=35524, head_dim=128),
+    BenchConfig(batch=2, heads=32,  q_len=35524,  kv_len=35524, head_dim=128),
+    BenchConfig(batch=1, heads=32,  q_len=75724,  kv_len=75724, head_dim=128),
+    BenchConfig(batch=2, heads=32,  q_len=75724,  kv_len=75724, head_dim=128),
 ]
 
 DEVICE = "cuda"
 WARMUP = 20
 ITERS = 100
 CHECK_ACCURACY = True
-# REFERENCE_IMPL = "fp32"
-REFERENCE_IMPL = "sdpa"
+REFERENCE_IMPL = "sdpa"     # {fp32, sdpa, flash_cuda}
 ACCURACY_ATOL_FP16 = 2e-2
 ACCURACY_RTOL_FP16 = 2e-2
 PRINT_TENSOR_STATS = False
@@ -89,12 +107,6 @@ def set_seed(seed: int = 0) -> None:
 def ensure_cuda():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available.")
-
-
-def supports_flash_triton_cfg(cfg: BenchConfig) -> bool:
-    # 官方 flash_attn_triton 注释里强调 headdim <= 128 更稳妥
-    # 这里保守一点
-    return cfg.head_dim <= 128
 
 
 def make_inputs(cfg: BenchConfig, requires_grad: bool = False):
@@ -228,17 +240,17 @@ def run_flash_cuda(q_bhqd: torch.Tensor, k_bhkd: torch.Tensor, v_bhkd: torch.Ten
     return out.transpose(1, 2).contiguous()
 
 
-def run_flash_triton(q_bhqd: torch.Tensor, k_bhkd: torch.Tensor, v_bhkd: torch.Tensor, sm_scale: Optional[float]) -> torch.Tensor:
-    out, _ = dense_attn(q_bhqd, k_bhkd, v_bhkd, scale=sm_scale)
+# def run_flash_triton(q_bhqd: torch.Tensor, k_bhkd: torch.Tensor, v_bhkd: torch.Tensor, sm_scale: Optional[float]) -> torch.Tensor:
+#     out, _ = dense_attn(q_bhqd, k_bhkd, v_bhkd, scale=sm_scale)
 
-    return out
+#     return out
 
 
 # --- Triton fused-attention ---
-# def run_flash_triton(q_bhqd: torch.Tensor, k_bhkd: torch.Tensor, v_bhkd: torch.Tensor, sm_scale: Optional[float]) -> torch.Tensor:
-#     out = flash_attn_triton(q_bhqd, k_bhkd, v_bhkd, scale=sm_scale)
+def run_flash_triton(q_bhqd: torch.Tensor, k_bhkd: torch.Tensor, v_bhkd: torch.Tensor, sm_scale: Optional[float]) -> torch.Tensor:
+    out = attention(q_bhqd, k_bhkd, v_bhkd, False, sm_scale, False)
 
-#     return out
+    return out
 
 
 def run_chipmunk(q_bhqd: torch.Tensor, k_bhkd: torch.Tensor, v_bhkd: torch.Tensor, sm_scale: Optional[float]) -> torch.Tensor:
@@ -251,12 +263,19 @@ def run_chipmunk(q_bhqd: torch.Tensor, k_bhkd: torch.Tensor, v_bhkd: torch.Tenso
     return out
 
 
+def run_chipmunk_tk2(q_bhqd: torch.Tensor, k_bhkd: torch.Tensor, v_bhkd: torch.Tensor, sm_scale: Optional[float]) -> torch.Tensor:
+    out, _ = torch.ops.chipmunk_tk2.dense_attn(q_bhqd, k_bhkd, v_bhkd, scale=sm_scale)
+    return out
+
+
 PROVIDERS: Dict[str, Callable[[torch.Tensor, torch.Tensor, torch.Tensor, Optional[float]], torch.Tensor]] = {
     "sdpa": run_sdpa,
     "flash_cuda": run_flash_cuda,
-    # "flash_triton": run_flash_triton,
-    "chipmunk": run_chipmunk,
+    "flash_triton": run_flash_triton,
+    # "chipmunk": run_chipmunk,
 }
+if HAS_CHIPMUNK_TK2:
+    PROVIDERS["chipmunk_tk2"] = run_chipmunk_tk2
 
 
 # =========================

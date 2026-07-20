@@ -110,8 +110,22 @@ def sampling_with_top_k_top_p_also_inplace_modifying_probs_(probs_BlV: torch.Ten
 TIMM_KEYS = {'img_size', 'pretrained', 'pretrained_cfg', 'pretrained_cfg_overlay', 'global_pool'}
 
 @register_model
-def infinity_2b(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, **kwargs):
-    return Infinity(depth=depth, embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=4, drop_path_rate=drop_path_rate, **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS})
+def infinity_2b(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8, **kwargs):
+    return Infinity(
+        depth=depth, embed_dim=embed_dim, num_heads=num_heads, 
+        mlp_ratio=mlp_ratio, drop_path_rate=drop_path_rate,
+        block_chunks=block_chunks,
+        **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS}
+    )
+
+@register_model
+def infinity_8b(depth=40, embed_dim=3584, num_heads=3584//128, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8, **kwargs):
+    return Infinity(
+        depth=depth, embed_dim=embed_dim, num_heads=num_heads, 
+        mlp_ratio=mlp_ratio, drop_path_rate=drop_path_rate,
+        block_chunks=block_chunks,
+        **{k: v for k, v in kwargs.items() if k not in TIMM_KEYS}
+    )
 
 @register_model
 def infinity_20b(depth=58, embed_dim=4608, num_heads=4608//128, drop_path_rate=0.25, **kwargs):
@@ -140,41 +154,52 @@ def infinity_layer48(depth=48, embed_dim=3360, num_heads=28, drop_path_rate=0.1,
 
 class Infinity(nn.Module):
     def __init__(
-        self, vae_local,
-        text_channels=0, text_maxlen=0,     # text-cond generation
-        selecting_idx=None,                 # class-cond generation
-        embed_dim=1024, depth=16, num_heads=16, mlp_ratio=4.,   # model's architecture
-        drop_rate=0., drop_path_rate=0.,    # drop out and drop path
-        norm_eps=1e-6, rms_norm=False,      # norm layer
-        shared_aln=False, head_aln=True,    # adaptive norm
-        cond_drop_rate=0.1,                 # for classifier-free guidance
-        rand_uncond=False,
-        cross_attn_layer_scale=-1., nm0=False, tau=1, cos_attn=True, swiglu=False,
-        raw_scale_schedule=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
+        self,
+        # Architecture
+        embed_dim=1024, depth=16, num_heads=16, mlp_ratio=4., block_chunks=1,  # model's architecture
         head_depth=1,
-        top_p=0.0, top_k=0.0,
-        customized_flash_attn=False, fused_mlp=False, fused_norm=False,
-        block_chunks=1,
-        checkpointing=None,
-        pad_to_multiplier=0,
-        use_flex_attn=False,
-        batch_size=2,
+            # norm
+        rms_norm=False, norm_eps=1e-6,      # norm layer
+        shared_aln=False, head_aln=True,    # adaptive norm
+        nm0=False,
+            # attention
+        cos_attn=True, tau=1,               # Internal temperature inside Self-Attention
+        cross_attn_layer_scale=-1.,         # for text cross-attn
+            # FFN
+        swiglu=False,
+            # attn backend
+        customized_flash_attn=False, use_flex_attn=False,
+        fused_mlp=False, fused_norm=False,
+        pad_to_multiplier=0,                # Flex compile batch/aspect settings
+        batch_size=2,                       # batch size of FlexAttention mask compile
+        video_frames=1,                     # Compile-time temporal scheduling constraints for FlexAttention
+            # PEs
+        rope2d_each_sa_layer=0,             # Is RoPE2d used in per-layer Self-Attention
+        rope2d_normalized_by_hw=0,          # RoPE coordinate mode
         add_lvl_embeding_only_first_block=1,
-        use_bit_label=1,
-        rope2d_each_sa_layer=0,
-        rope2d_normalized_by_hw=0,
-        pn=None,
-        train_h_div_w_list=None,
-        video_frames=1,
+        # Visual Tokenizer
+        vae_local=None, use_bit_label=1, 
+        apply_spatial_patchify=0,
+        # ConditioningConfig
+        text_channels=0, text_maxlen=0,     # text-cond generation
+        cond_drop_rate=0.1,                 # for classifier-free guidance training
+        rand_uncond=False,
+        selecting_idx=None,                 # class-cond generation
+        # Training
+        drop_rate=0., drop_path_rate=0.,    # drop out and drop path
+        checkpointing=None,
         always_training_scales=20,
-        apply_spatial_patchify = 0,
+        train_h_div_w_list=None,            # For which aspect ratios does FlexAttention precompile masks
+        # Inference
         inference_mode=False,
+        pn=None,                            # resolution
+        top_p=0.0, top_k=0.0,
+        raw_scale_schedule=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # no use
         cache_dir=None,          # debug, timm load_model has cache_dir default
+        # naive acceleration
         skip_last_scales: int = 0,
-        # --- exp params ---
-        attn_sink_scales: int = 5,
         drop_uncond_last_scales: int = 0,
-        spsd_scale: int = 10,               # sparse decision scale
+        other_args=None,
     ):
         # set hyperparameters
         self.C = embed_dim
@@ -200,6 +225,13 @@ class Infinity(nn.Module):
         self.train_h_div_w_list = train_h_div_w_list if train_h_div_w_list else h_div_w_templates
         self.video_frames = video_frames
         self.always_training_scales = always_training_scales
+        self.cross_attn_layer_scale = cross_attn_layer_scale
+        self.shared_aln = shared_aln
+        self.drop_rate = drop_rate
+        self.tau = tau
+        self.cos_attn = cos_attn
+        self.swiglu = swiglu
+        self.fused_mlp = fused_mlp
 
         assert add_lvl_embeding_only_first_block in [0,1]
         self.add_lvl_embeding_only_first_block = add_lvl_embeding_only_first_block
@@ -298,8 +330,8 @@ class Infinity(nn.Module):
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
         
         # [input layers] input norm && input embedding
-        norm_layer = partial(FastRMSNorm if rms_norm else nn.LayerNorm, eps=norm_eps)
-        self.norm0_ve = norm_layer(self.d_vae) if nm0 else nn.Identity()
+        self.norm_layer = partial(FastRMSNorm if rms_norm else nn.LayerNorm, eps=norm_eps)
+        self.norm0_ve = self.norm_layer(self.d_vae) if nm0 else nn.Identity()
         self.word_embed = nn.Linear(self.d_vae, self.C)
         
         # [shared adaptive layernorm mapping network]
@@ -307,8 +339,8 @@ class Infinity(nn.Module):
         
         # fused norm
         if fused_norm:
-            fused_norm_func = fused_ada_rms_norm if rms_norm else fused_ada_layer_norm
-            if fused_norm_func is not None: # pre-compile
+            self.fused_norm_func = fused_ada_rms_norm if rms_norm else fused_ada_layer_norm
+            if self.fused_norm_func is not None: # pre-compile
                 B = 2
                 x = torch.randn(B, 1, self.C).requires_grad_(True)
                 scale = torch.randn(B, 1, self.C).mul_(0.01).requires_grad_(True)
@@ -316,7 +348,7 @@ class Infinity(nn.Module):
                 # fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale, shift=shift).mean().backward()
                 del B, x, scale, shift
         else:
-            fused_norm_func = None
+            self.fused_norm_func = None
         
         # [backbone and head]
         self.use_flex_attn = use_flex_attn
@@ -326,13 +358,13 @@ class Infinity(nn.Module):
             self.attn_fn_compile_dict = self.compile_flex_attn()
 
         self.drop_path_rate = drop_path_rate
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # dpr means drop path rate (linearly increasing)
+        self.dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # dpr means drop path rate (linearly increasing)
         self.unregistered_blocks = []
         for block_idx in range(depth):
             block = (CrossAttnBlock if self.t2i else SelfAttnBlock)(
-                embed_dim=self.C, kv_dim=self.D, cross_attn_layer_scale=cross_attn_layer_scale, cond_dim=self.D, act=True, shared_aln=shared_aln, norm_layer=norm_layer,
-                num_heads=num_heads, mlp_ratio=mlp_ratio, drop=drop_rate, drop_path=dpr[block_idx], tau=tau, cos_attn=cos_attn,
-                swiglu=swiglu, customized_flash_attn=self.customized_flash_attn, fused_mlp=fused_mlp, fused_norm_func=fused_norm_func,
+                embed_dim=self.C, kv_dim=self.D, cross_attn_layer_scale=cross_attn_layer_scale, cond_dim=self.D, act=True, shared_aln=shared_aln, norm_layer=self.norm_layer,
+                num_heads=num_heads, mlp_ratio=mlp_ratio, drop=drop_rate, drop_path=self.dpr[block_idx], tau=tau, cos_attn=cos_attn,
+                swiglu=swiglu, customized_flash_attn=self.customized_flash_attn, fused_mlp=fused_mlp, fused_norm_func=self.fused_norm_func,
                 checkpointing_sa_only=self.checkpointing == 'self-attn',
                 use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
             )
@@ -341,11 +373,11 @@ class Infinity(nn.Module):
         # [head]
         V = self.V
         if head_aln:
-            self.head_nm = AdaLNBeforeHead(self.C, self.D, act=True, norm_layer=norm_layer, fused_norm_func=fused_norm_func)
+            self.head_nm = AdaLNBeforeHead(self.C, self.D, act=True, norm_layer=self.norm_layer, fused_norm_func=self.fused_norm_func)
             self.head = nn.Linear(self.C, V) if head_depth == 1 else nn.Sequential(nn.Linear(self.C, self.C, bias=True), nn.GELU(approximate='tanh'), nn.Linear(self.C, V))
         else:
             self.head_nm = MultiInpIdentity()
-            self.head = nn.Sequential(norm_layer(self.C), nn.Linear(self.C, V)) if head_depth == 1 else nn.Sequential(norm_layer(self.C), nn.Linear(self.C, self.C, bias=True), nn.GELU(approximate='tanh'), nn.Linear(self.C, V))
+            self.head = nn.Sequential(self.norm_layer(self.C), nn.Linear(self.C, V)) if head_depth == 1 else nn.Sequential(self.norm_layer(self.C), nn.Linear(self.C, self.C, bias=True), nn.GELU(approximate='tanh'), nn.Linear(self.C, V))
         
         self.num_block_chunks = block_chunks or 1
         self.num_blocks_in_a_chunk = depth // block_chunks
@@ -362,9 +394,11 @@ class Infinity(nn.Module):
             f'    [Infinity config ] embed_dim={embed_dim}, num_heads={num_heads}, depth={depth}, mlp_ratio={mlp_ratio}, swiglu={swiglu} num_blocks_in_a_chunk={self.num_blocks_in_a_chunk}\n'
             f'    [drop ratios] drop_rate={drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})\n',
             f'    [skip scales] skip last {skip_last_scales} scales',
+            f'    [drop uncond branch] drop last {drop_uncond_last_scales} scales\n',
             end='\n\n', flush=True
         )
         self.skip_last_scales = skip_last_scales
+        self.drop_uncond_last_scales = drop_uncond_last_scales
 
     def compile_flex_attn(self):
         attn_fn_compile_dict = {}
@@ -656,6 +690,7 @@ class Infinity(nn.Module):
                         x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, 
                         attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, 
                         scale_ind=si, 
+                        layer_idx=layer_idx
                     )
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
                         # print(f'add cfg={cfg} on {layer_idx}-th layer output')

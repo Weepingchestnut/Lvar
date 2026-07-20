@@ -27,7 +27,7 @@ Acceleration Methods
 - SparseVAR (ICCV'2025)
 - ScaleKV (NeurIPS'2025)
 - SkipVAR (arXiv'2025)
-<!-- - SparVAR (CVPR'2026) -->
+- SparVAR (CVPR'2026)
 
 ### Video Generation Models
 
@@ -46,20 +46,23 @@ Acceleration Methods
 - For PyTorch, the recommended version is `2.7.1` or later.
 
 ```bash
-conda create -n torch271 python=3.12
+conda create -n torch2110 python=3.14
 
 # for CUDA 12.8
-pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+# pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
 # flash-attention
 MAX_JOBS=16 pip install flash-attn --no-build-isolation
 
 cd Lvar
-pip install -r requirements.txt
+pip install -e .
+```
+
+<!-- pip install -r requirements.txt
 
 # Since dev, the Python path should be set manually
 vim ~/.bashrc
-export PYTHONPATH=$PYTHONPATH:{your-path}/Lvar
-```
+export PYTHONPATH=$PYTHONPATH:{your-path}/Lvar -->
 <!-- export PYTHONPATH=$PYTHONPATH:/share/project/wangning/158/zekun/wkspace/Lvar -->
 
 ### 2. Kernel Compile

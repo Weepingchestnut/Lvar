@@ -167,6 +167,7 @@ class Args(Tap):
     enable_checkpointing: str = None  # Checkpointing strategy: 'full-block', 'self-attn'
     pad_to_multiplier: int = 128  # Pad sequence length to a multiplier of this value
     sp_size: int = 0  # Sequence parallelism size
+    sp_bcast_sample: bool = False  # [SP inference] broadcast sampled tokens from rank0 (safety net vs RNG drift)
     fsdp_save_flatten_model: int = 1  # Whether to save the flattened model in FSDP
     inject_sync: int = 0  # Whether to inject synchronization
     model_init_device: str = 'cuda'  # Device for model initialization
@@ -423,6 +424,7 @@ class InferArgs(Args):
     # ------ 480p ------
     # image_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]'
     # video_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 1]'
+    # # video_scale_repetition: str = '[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 0]'      # for A100 40GB run
     # detail_scale_min_tokens=350
     # semantic_scales: int = 11
 
@@ -430,6 +432,13 @@ class InferArgs(Args):
     append_duration2caption: int = 1
     use_two_stage_lfq: int = 1
     max_repeat_times: int = 10000
+    drop_uncond_last_scales: int = 0
+    # Offload the T5 text encoder to CPU while the AR loop runs (T5 is only needed
+    # for prompt encoding), freeing ~6GB VRAM. Recommended on <=40GB GPUs: without
+    # this headroom the CUDA caching allocator can hit alloc-retries (implicit
+    # empty_cache + remap, seconds of jitter per video) or OOM at late video scales.
+    # Costs one CPU<->GPU T5 round-trip per prompt, outside the AR loop itself.
+    low_vram_mode: int = 0      # choices=[0,1]
     
     # For optimal performance, enabling the prompt rewriter is recommended.
     # To utilize the GPT model, ensure the following environment variables are set:
@@ -437,6 +446,16 @@ class InferArgs(Args):
     # export GLOBAL_AZURE_ENDPOINT="YOUR_ENDPOINT"
     # *--> use official rewrite VBench_rewrited_prompt.json
     enable_rewriter: int = 0
+
+    # ------------------------------------
+    # -------- Play model Setting --------
+    # ------------------------------------
+    # Optional quick quality check: baseline (vanilla InfinityStar 480p) demo
+    # video generated with the same prompt/seed, e.g.
+    # "work_dir/play_models/InfinityStar_480p/gen_videos/demo_xxx.mp4".
+    # When set, PSNR/SSIM/LPIPS against it are computed after generation
+    # (VBench low-level metric protocol, single-pair). Empty = skip.
+    baseline_video_path: str = "work_dir/play_models/InfinityStar_480p/gen_videos/demo_2026-07-18_16-25-41_baseline.mp4"
     
     # --------------------------------
     # -------- VBench Setting --------
@@ -445,6 +464,7 @@ class InferArgs(Args):
     output_root: str = 'work_dir/evaluation/vbench/infinitystar_480p_81frames'
     save_raw_png_frames: int = 1
     save_raw_npy_frames: int = 0
+    print_env_info: int = 1
     start_index: int = 0
     end_index: int = -1
     num_samples_per_prompt: int = 5
@@ -468,28 +488,38 @@ class InferArgs(Args):
     # ------------------------------------------
     # -------- Attention Map Experiment --------
     # ------------------------------------------
-    attn_map_prompt: str = "A sleek, modern airplane is captured from a side view as it soars through a clear blue sky. The sunlight reflects off its polished metal surface, emphasizing the plane's streamlined design. The airplane's wings are slightly tilted, indicating a gentle ascent. Contrails form behind its engines, adding to the sense of motion and speed. The camera pans slowly from left to right, following the airplane's graceful movement against the vast sky."
+    attn_map_prompt = "A handsome smiling gardener inspecting plants, realistic cinematic lighting, detailed textures, ultra-realistic"
+    # attn_map_prompt: str = "A sleek, modern airplane is captured from a side view as it soars through a clear blue sky. The sunlight reflects off its polished metal surface, emphasizing the plane's streamlined design. The airplane's wings are slightly tilted, indicating a gentle ascent. Contrails form behind its engines, adding to the sense of motion and speed. The camera pans slowly from left to right, following the airplane's graceful movement against the vast sky."
+    # attn_map_prompt: str = "A woman with shoulder-length brown hair is seen talking to someone off-screen to the right. She is wearing a dark-colored top and a necklace. The background is blurred, but it appears to be an indoor setting with some indistinct objects and a window. The woman slightly moves her head while speaking."
     attn_map_negative_prompt: str = ''
     attn_map_output_root: str = f'work_dir/analysis_results/infinitystar_{resolution}/attn_maps'
     attn_map_vmin: float = 0.0
-    attn_map_vmax: float = 0.001
-    attn_map_query_chunk_size: int = 4096           # 128
-    attn_map_head_chunk_size: int = 4
-    attn_map_full_attention_gb: float = 8.0         # default: 4.0
+    attn_map_vmax: float = 0.0001                       # default: 0.0001 for InfinityStar
+    attn_map_query_chunk_size: int = 1024               # recommend: 4096 (1024 is for 40GB A100)
+    attn_map_head_chunk_size: int = 4                   # recommend: 4 (2 or 1 is for 40GB A100)
+    attn_map_full_attention_gb: float = 8.0             # default: 8.0 (4.0 is for 40GB A100)
     attn_map_prompt_prefix_chars: int = 50
     attn_map_single_min_short_inches: float = 1.3
     attn_map_single_max_long_inches: float = 400.0
-    attn_map_incremental_stitched: int = 0          # update stitched attn map
+    attn_map_incremental_stitched: int = 0              # update stitched attn map, too slow, recommend 0 to get `attn_map.pt`, then draw stitched attn map
     attn_map_save_single_png: int = 1
     attn_map_fast_png: int = 1
     attn_map_resume: int = 1
     attn_map_resume_regenerate_png: int = 1
+    # --- 720p only video ---
     attn_map_selected_steps: str = 'scale_15_repeat2,scale_16_repeat2,scale_17_repeat2,scale_18_repeat2,scale_19_repeat2,scale_20_repeat2,scale_21_repeat2,scale_22_repeat2,scale_23_repeat2,scale_24_repeat2,scale_25_repeat2,scale_26_repeat2,scale_27_repeat1,scale_28_repeat0,scale_29_repeat0'
+    attn_map_quantize_from_step: str = 'scale_27_repeat1'
+    # --- 480p only video ---
+    # attn_map_selected_steps: str = 'scale_14_repeat2,scale_15_repeat2,scale_16_repeat2,scale_17_repeat2,scale_18_repeat2,scale_19_repeat2,scale_20_repeat2,scale_21_repeat2,scale_22_repeat2,scale_23_repeat2,scale_24_repeat2,scale_25_repeat2,scale_26_repeat1,scale_27_repeat0'
+    # attn_map_quantize_from_step: str = 'scale_26_repeat1'
+    # -----------------------
     attn_map_selected_layers: str = ''
-    attn_map_storage_mode: str = 'fp16_zlib'       # fp16, fp16_zlib, uint8, uint8_zlib, uint16, uint16_zlib
+    attn_map_stitched_layers: str = '3,4,8,10,30'         # Specify the **layers** to be plotted when drawing the stitched plot, e.g. `--attn_map_stitched_layers "0,1"`
+    attn_map_stitched_heads: str = '2,19,21,24,30,31'                       # Specify the **heads** to be plotted when drawing the stitched plot, e.g. `--attn_map_stitched_heads "0,3,7"`
+    attn_map_stitched_show_step_labels: int = 0             # add labels similar to `scale_27_repeat0`
+    attn_map_storage_mode: str = 'fp16_zlib'                # fp16, fp16_zlib, uint8, uint8_zlib, uint16, uint16_zlib
     attn_map_storage_compress_level: int = 6
-    attn_map_quantize_from_step: str = 'scale_28_repeat0'
-    attn_map_verbose: int = 1                       # print qkv shape
+    attn_map_verbose: int = 1                               # print qkv shape
     attn_map_save_video: int = 1
 
     # -------------------------------------------

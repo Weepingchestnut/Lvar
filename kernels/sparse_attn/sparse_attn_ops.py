@@ -51,6 +51,52 @@ def _colsum_group_rows() -> int:
     return int(attn_cfg.get('dcsla_colsum_group_rows', 192))
 
 
+# ---------------------------------------------------------------
+# FA2-based decision colsum (exact; replaces the legacy double full-attention)
+#   legacy triton path: dense_attn (o discarded, lse kept) + fused
+#     dense_colsum_attn (recomputes o while accumulating cs) => 2x full attention
+#   fa2 path: flash_attn_func returns o AND the per-row logsumexp as a free
+#     byproduct; colsum_only_attn then adds a single QK^T-only sweep. The o
+#     returned now comes from FA2 — the same kernel the non-decision dense
+#     repeats use — so decision-step numerics match the rest of the pipeline.
+# ---------------------------------------------------------------
+def _use_fa2_colsum() -> bool:
+    # set attn.colsum_fa2: false in the sparse-attn YAML to fall back to the
+    # legacy double-pass Triton path
+    return bool(GLOBAL_CONFIG['attn'].get('colsum_fa2', True))
+
+
+def _fa2_attn_and_lse2(q, k, v, sm_scale):
+    """FA2 dense attention on [B, H, N, D] tensors, GQA-native.
+
+    Returns (o [B, H_q, N, D], lse2 [B, H_q, N] fp32) where lse2 is FA2's
+    natural-log row logsumexp scaled by log2(e) — the exp2-domain combined
+    logsumexp expected by colsum_only_attn: exp2(q@k*scale*log2e - lse2)
+    equals the softmax probability exactly.
+    """
+    from flash_attn import flash_attn_func  # lazy: keep this module importable without fa2
+    ret = flash_attn_func(
+        q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3),
+        softmax_scale=sm_scale, return_attn_probs=True,
+    )
+    o_blhd, lse_e = ret[0], ret[1]
+    if lse_e.shape[-1] != q.shape[2]:
+        # some FA2 builds round seqlen_q up in the returned lse; drop the padding
+        lse_e = lse_e[..., :q.shape[2]]
+    assert lse_e.shape == (q.shape[0], q.shape[1], q.shape[2]), \
+        f'unexpected FA2 lse shape {tuple(lse_e.shape)} for q {tuple(q.shape)}'
+    o = o_blhd.permute(0, 2, 1, 3)
+    lse2 = (lse_e.float() * 1.4426950408889634).contiguous()
+    return o, lse2
+
+
+def _dense_colsum_attn_fa2(q, k, v, scale, group_rows):
+    sm_scale = 1 / math.sqrt(q.shape[-1]) if scale is None else scale
+    o, lse2 = _fa2_attn_and_lse2(q, k, v, sm_scale)
+    cs = sattn_triton.colsum_only_attn(q, k, lse2, scale=sm_scale, group_rows=group_rows)
+    return o, cs
+
+
 # --------------------------
 # for speedup
 #       cs in CUDA impl has bugs
@@ -73,9 +119,14 @@ def dense_colsum_attn_s(q, k, v, scale=None):
         _, cs, l = torch.ops.chipmunk.dense_colsum_attn(q, k, v, lse, scale)    # cs: [bs, num_heads, ceil(Nq/bm), Nkv]
         assert l.shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[0].shape, q.shape)
 
+    elif _use_fa2_colsum() and q.dtype in (torch.bfloat16, torch.float16):
+        # FA2 dense (o + lse byproduct) + QK^T-only Triton colsum.
+        # (fp32 inputs fall through to the legacy path: FA2 is half-precision only)
+        o, cs = _dense_colsum_attn_fa2(q, k, v, scale, group_rows)
+
     else:
-        # Triton implementation
-        # --- 1 kernel 2 pass get colsum ---
+        # Triton implementation (legacy)
+        # --- fused kernel; host derives lse via an extra internal dense_attn pass ---
         o, cs, l = sattn_triton.dense_colsum_attn(q, k, v, scale=scale, group_rows=group_rows)
 
         assert l[0].shape == (q.shape[0], q.shape[1], q.shape[2], 1), "L shape mismatch - l: {}, q: {}".format(l[0].shape, q.shape)
@@ -83,7 +134,7 @@ def dense_colsum_attn_s(q, k, v, scale=None):
 
     assert o.shape == q.shape, "Output shape mismatch - o: {}, q: {}".format(o.shape, q.shape)
     # assert cs.shape == (q.shape[0], q.shape[1], (q.shape[-2] + pad_to - 1) // pad_to, k.shape[2]), "CS shape mismatch - cs: {}, q: {}".format(cs.shape, q.shape)
-    
+
     return o, cs
 
 
@@ -105,8 +156,13 @@ def dense_colsum_attn_q(q, k, v, scale=None):
         o, _ = torch.ops.chipmunk.dense_attn(q, k, v, scale=scale)
         _, lse = sattn_triton.dense_attn(q, k, v, scale=scale)
         _, cs, _ = sattn_triton.dense_colsum_attn(q, k, v, lse, scale=scale, group_rows=group_rows)     # Using Triton correctly cs
+    elif _use_fa2_colsum() and q.dtype in (torch.bfloat16, torch.float16):
+        # FA2 dense (o + lse byproduct) + QK^T-only Triton colsum.
+        # (fp32 inputs fall through to the legacy path: FA2 is half-precision only)
+        o, cs = _dense_colsum_attn_fa2(q, k, v, scale, group_rows)
+
     else:
-        # Triton implementation
+        # Triton implementation (legacy explicit 2-pass)
         o, lse = sattn_triton.dense_attn(q, k, v, scale=scale)
 
         assert type(lse) == tuple
@@ -225,10 +281,14 @@ def csp_attn(q, k, v, scale, indices, indices_counts, o, o_scale):
 
     if GLOBAL_CONFIG['attn']['provider'] == 'triton':
         pad_to = get_kernel_config_attn()['bm']
+        # lean=True: skip the discarded M/L byproduct and return ΔO in transpose-friendly
+        # [B,N,H,D] storage. Safe because every SparseDiffAttn consumer finishes with
+        # `.transpose(1, 2).reshape(B, L, C)` — layout-agnostic, and free on this layout.
         o_delta, _ = sattn_triton.csp_attn(
             q, k, v,
             indices, indices_counts,
             scale=scale,
+            lean=True,
         )
         # o=None means "no O_cache to accumulate into" (o would be all zeros):
         # return ΔO directly instead of zeros-init + two full-size elementwise passes.

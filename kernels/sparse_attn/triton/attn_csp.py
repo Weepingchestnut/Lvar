@@ -90,7 +90,7 @@ def _sparse_attn_fwd_inner(acc, l_i, m_i, q,  #
 # OutOfResources tracebacks. Reuse the config tuned on fixed N_CTX_Q/HEAD_DIM.
 @triton.autotune(list(filter(keep, configs)), key=["N_CTX_Q", "HEAD_DIM"])
 @triton.jit
-def _sparse_attn_fwd(Q, K, V, sm_scale, M, L, Out, Out_accum, Out_scale: tl.constexpr,  #
+def _sparse_attn_fwd(Q, K, V, sm_scale, M, L, Out, Out_scale: tl.constexpr,  #
               sparsity_indices, sparsity_counts,  #
               stride_qz, stride_qh, stride_qm, stride_qk,  #
               stride_kz, stride_kh, stride_kn, stride_kk,  #
@@ -104,6 +104,7 @@ def _sparse_attn_fwd(Q, K, V, sm_scale, M, L, Out, Out_accum, Out_scale: tl.cons
               BLOCK_N: tl.constexpr,  #
               num_qg_per_indices_group: tl.constexpr,  #
               fp8_v: tl.constexpr,  #
+              WRITE_ML: tl.constexpr,  #
               ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
@@ -163,22 +164,27 @@ def _sparse_attn_fwd(Q, K, V, sm_scale, M, L, Out, Out_accum, Out_scale: tl.cons
 
     # epilogue
     acc = acc / l_i[:, None]
-    m_ptrs = M + off_hz * N_CTX_Q + offs_m
-    l_ptrs = L + off_hz * N_CTX_Q + offs_m
-    tl.store(m_ptrs, m_i, mask=offs_m < N_CTX_Q)
-    tl.store(l_ptrs, l_i, mask=offs_m < N_CTX_Q)
+    # M / L (per-row max & softmax denominator) are a debug/analysis byproduct with a
+    # single live consumer (test_csp_attn_triton). The active SparVAR path discards
+    # them, so WRITE_ML=False skips the fp32 stores (and their host-side alloc).
+    if WRITE_ML:
+        m_ptrs = M + off_hz * N_CTX_Q + offs_m
+        l_ptrs = L + off_hz * N_CTX_Q + offs_m
+        tl.store(m_ptrs, m_i, mask=offs_m < N_CTX_Q)
+        tl.store(l_ptrs, l_i, mask=offs_m < N_CTX_Q)
     # will get optimized out when Out_scale is 1.0 since it's tl.constexpr
     acc *= Out_scale
-    o_accum_ptrs = Out_accum + o_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
-    acc += tl.load(o_accum_ptrs, mask=qo_mask)
+    # NOTE: the previous external o_accum load has been removed. On the Triton path it
+    # was ALWAYS an all-zeros tensor (O_cache accumulation is done host-side in
+    # sparse_attn_ops.csp_attn), so it only cost a full zeros_like(q) memset + a
+    # same-size read every call for a guaranteed no-op add.
     o_ptrs = Out + o_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_on
     tl.store(o_ptrs, acc.to(Out.type.element_ty), mask=qo_mask)
 
 
 class _sparse_attention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, sparsity_indices, sparsity_counts, O_scale=1.0, scale=None):
-        o_accum = torch.zeros_like(q)
+    def forward(ctx, q, k, v, sparsity_indices, sparsity_counts, O_scale=1.0, scale=None, lean=False):
         sm_scale = 1 / math.sqrt(q.shape[-1]) if scale is None else scale
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
@@ -190,17 +196,31 @@ class _sparse_attention(torch.autograd.Function):
         assert k.shape[1] == v.shape[1]
         assert k.shape[2] == v.shape[2]
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
-        o = torch.empty_like(q)
+        # lean (active SparVAR path): allocate the output in [B, N, H, D] storage exposed
+        # as a [B, H, N, D] view, so the caller's `.transpose(1, 2).reshape(B, L, C)` is a
+        # free view instead of a full [B,H,N,D] copy. The kernel still stores the head_dim
+        # axis contiguously (stride_on == 1); only the seq/head strides differ.
+        if lean:
+            B, H, N, D = q.shape
+            o = torch.empty((B, N, H, D), device=q.device, dtype=q.dtype).permute(0, 2, 1, 3)
+        else:
+            o = torch.empty_like(q)
 
         bm = get_kernel_config_attn()['bm']
         assert bm % 64 == 0, "BM must be a multiple of 64"
         num_qg_per_indices_group = bm // 64
 
         grid = lambda args: (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        L = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        # M / L: debug byproduct (see kernel WRITE_ML). On the lean path skip the two
+        # [B,H,N] fp32 allocs + stores entirely; pass a 1-elem stand-in the kernel never
+        # dereferences (WRITE_ML=False). Avoids relying on Triton null-pointer support.
+        if lean:
+            M = L = q.new_empty(1, dtype=torch.float32)
+        else:
+            M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+            L = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         _sparse_attn_fwd[grid](
-            q, k, v, sm_scale, M, L, o, o_accum, O_scale,  #
+            q, k, v, sm_scale, M, L, o, O_scale,  #
             sparsity_indices, sparsity_counts,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
@@ -214,14 +234,20 @@ class _sparse_attention(torch.autograd.Function):
             HEAD_DIM=HEAD_DIM_K,  #
             num_qg_per_indices_group=num_qg_per_indices_group,
             fp8_v=(v.dtype == torch.float8_e5m2),
+            WRITE_ML=not lean,
         )
 
+        if lean:
+            return o, None
         return o, (M.unsqueeze(-1), L.unsqueeze(-1))
 
 
 # csp_attn = _sparse_attention.apply
-def csp_attn(q, k, v, sparsity_indices, sparsity_counts, O_scale=1.0, scale=None):
-    return _sparse_attention.apply(q, k, v, sparsity_indices, sparsity_counts, O_scale, scale)
+def csp_attn(q, k, v, sparsity_indices, sparsity_counts, O_scale=1.0, scale=None, lean=False):
+    # lean=True (active SparVAR path): skip the debug M/L byproduct and return the
+    # output in transpose-friendly [B,N,H,D] storage. Default False keeps the exact
+    # legacy return contract `(o, (M, L))` for existing callers / tests.
+    return _sparse_attention.apply(q, k, v, sparsity_indices, sparsity_counts, O_scale, scale, lean)
 
 
 def main():

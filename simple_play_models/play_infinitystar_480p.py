@@ -21,6 +21,8 @@ from models.infinitystar.self_correction import SelfCorrection
 from models.schedules import get_encode_decode_func
 from models.schedules.dynamic_resolution import (
     get_dynamic_resolution_meta, get_first_full_spatial_size_scale_index)
+from simple_play_models.low_level_metrics_utils import \
+    evaluate_low_level_metrics_vs_baseline
 from tools.run_infinity import (InferencePipe, gen_one_video, load_tokenizer,
                                 load_video_transformer, save_video, transform)
 from utils.arg_util_video import Args
@@ -153,13 +155,15 @@ if __name__ == '__main__':
     args.apg_norm_threshold=0.05
     args.image_scale_repetition='[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]'
     args.video_scale_repetition='[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 1]'
-    # args.video_scale_repetition='[3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 0]'      # for A100 40GB run
     args.append_duration2caption=1
     args.use_two_stage_lfq=1
     args.detail_scale_min_tokens=350
     args.semantic_scales=11
     args.max_repeat_times=10000
     args.enable_rewriter=enable_rewriter
+    # ------ for A100 40GB run ------
+    # args.drop_uncond_last_scales=1
+    args.baseline_video_path="work_dir/play_models/InfinityStar_480p/gen_videos/demo_2026-07-18_17-21-37.mp4"
 
     # load models
     pipe = InferencePipe(args)
@@ -184,10 +188,17 @@ if __name__ == '__main__':
         print(f"Rewritten prompt: {rewritten_prompt}")
         prompt = rewritten_prompt
     data['prompt'] = prompt
-    
+
     output_dict = perform_inference(pipe, data, args)
     save_dir = 'work_dir/play_models/InfinityStar_480p'
     gen_video_path = osp.join(os.path.join(save_dir, 'gen_videos'), f'demo_{time_str()}.mp4')
     save_video(output_dict['output'], fps=args.fps, save_filepath=gen_video_path)
             
     print(f"Video genernation done: {gen_video_path=}")
+
+    if args.baseline_video_path:
+        evaluate_low_level_metrics_vs_baseline(
+            candidate_video_path=gen_video_path,
+            baseline_video_path=args.baseline_video_path,
+            save_json_path=osp.splitext(gen_video_path)[0] + "_low_level_metrics.json",
+        )

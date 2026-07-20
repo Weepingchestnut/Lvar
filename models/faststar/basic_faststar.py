@@ -78,12 +78,14 @@ def compute_st_score(
 def topk_pruning_mask(
     st_score: torch.Tensor,
     prune_ratio: float,
-    per_frame_topk: bool = True,
+    per_frame_topk: bool = False,
 ) -> torch.Tensor:
     """Return a bool keep mask shaped [B, T, H, W] using top-k ST scores."""
     if st_score.dim() != 4:
         raise ValueError("FastSTAR ST score must be shaped [B, T, H, W].")
-    prune_ratio = min(max(float(prune_ratio), 0.0), 1.0)
+    prune_ratio = float(prune_ratio)
+    if not 0.0 <= prune_ratio < 1.0:
+        raise ValueError(f"FastSTAR prune ratio must be in [0, 1), got {prune_ratio}.")
     keep_ratio = 1.0 - prune_ratio
     if keep_ratio >= 1.0:
         return torch.ones_like(st_score, dtype=torch.bool)
@@ -114,6 +116,43 @@ def resize_pruning_mask(pruning_mask: torch.Tensor, size: Tuple[int, int, int]) 
     mask = pruning_mask[:, None].float()
     mask = F.interpolate(mask, size=size, mode="nearest")
     return mask[:, 0] >= 0.5
+
+
+def pruning_mask_to_token_indices(
+    pruning_mask: torch.Tensor,
+    token_size: Tuple[int, int, int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Resize a feature-space keep mask and return shared flattened token indices."""
+    token_mask = resize_pruning_mask(pruning_mask, tuple(int(v) for v in token_size))
+    shared_mask = token_mask[:1]
+    if token_mask.shape[0] > 1 and not torch.equal(token_mask, shared_mask.expand_as(token_mask)):
+        raise ValueError("FastSTAR requires one shared token mask across the inference batch.")
+
+    keep_indices = shared_mask[0].reshape(-1).nonzero(as_tuple=True)[0]
+    if keep_indices.numel() == 0:
+        raise ValueError("FastSTAR pruning removed every token after mask interpolation.")
+    return token_mask, keep_indices
+
+
+def scatter_pruned_tokens(
+    selected_tokens: torch.Tensor,
+    keep_indices: torch.Tensor,
+    full_seq_len: int,
+) -> torch.Tensor:
+    """Scatter selected [B, K, C] tokens into a zero-filled [B, L, C] tensor."""
+    if selected_tokens.dim() != 3:
+        raise ValueError("FastSTAR selected tokens must be shaped [B, K, C].")
+    if keep_indices.dim() != 1 or selected_tokens.shape[1] != keep_indices.numel():
+        raise ValueError("FastSTAR keep indices must match the selected token sequence length.")
+    full_seq_len = int(full_seq_len)
+    if full_seq_len <= 0 or keep_indices.numel() > full_seq_len:
+        raise ValueError(f"Invalid FastSTAR full sequence length: {full_seq_len}.")
+
+    full_tokens = selected_tokens.new_zeros(
+        (selected_tokens.shape[0], full_seq_len, selected_tokens.shape[-1])
+    )
+    full_tokens.index_copy_(1, keep_indices, selected_tokens)
+    return full_tokens
 
 
 def partial_update(

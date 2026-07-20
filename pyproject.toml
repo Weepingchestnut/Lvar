@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=77", "wheel"]  # >=77: PEP 639 SPDX license / license-files support
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -11,7 +11,27 @@ authors = [
 version = "0.1.0"
 description = "Research and engineering code for visual autoregressive models."
 readme = "README.md"
+requires-python = ">=3.10"   # Adjust according to the actual conda environment; the minimum Python version required for torch 2.6 / transformers 4.57 is approximately 3.9
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = [
+    "visual autoregressive",
+    "image generation",
+    "video generation",
+    "InfinityStar",
+    "next-scale prediction",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dynamic = ["dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/Weepingchestnut/Lvar"
+Repository = "https://github.com/Weepingchestnut/Lvar"
 
 [tool.setuptools]
 py-modules = ["train", "train_infinity", "trainer"]
@@ -42,6 +62,8 @@ exclude = [
     "work_dir*",
     "models.TODO*",
     "tools.TODO*",
+    # chipmunk / chipmunk_tk2 为独立编译的 CUDA 扩展（需 H 系列 GPU + 严格匹配 CUDA / ThunderKittens），
+    # 由用户在各自子目录手动安装、作为顶层包 import，不随 lvar 一起打包或自动编译；此处仅排除其包发现。
     "kernels.chipmunk*",
     "kernels.flash_attn*",
     "evaluation.imagenet.torch-fidelity*",

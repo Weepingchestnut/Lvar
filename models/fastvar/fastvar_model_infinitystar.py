@@ -2,29 +2,22 @@ import json
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 from timm.models import register_model
 
+from models.fastvar.basic_fastvar_infinitystar import FastVARSelfAttnBlock
 from models.infinitystar.apg import normalized_guidance
-from models.infinitystar.infinitystar_model import TIMM_KEYS, InfinityStar
+from models.infinitystar.infinitystar_model import TIMM_KEYS, InfinityStar, MultipleLayers
 from models.schedules.dynamic_resolution import \
     get_first_full_spatial_size_scale_index
 
-from .basic_faststar import (
-    compute_st_score,
-    partial_update,
-    pruning_mask_to_token_indices,
-    save_pruning_mask,
-    scatter_pruned_tokens,
-    topk_pruning_mask,
-)
-
 
 @register_model
-def faststar_infinitystar(depth=36, block_chunks=6, embed_dim=4096, num_heads=4096 // 128,
-                          num_key_value_heads=4096 // 128 // 4, mlp_ratio=4, drop_path_rate=0, **kwargs):
-    return FastStar(
+def fastvar_infinitystar(depth=36, block_chunks=6, embed_dim=4096, num_heads=4096 // 128,
+                   num_key_value_heads=4096 // 128 // 4, mlp_ratio=4, drop_path_rate=0, **kwargs):
+    return FastVAR_InfinityStar(
         arch='qwen',
         depth=depth,
         block_chunks=block_chunks,
@@ -37,25 +30,93 @@ def faststar_infinitystar(depth=36, block_chunks=6, embed_dim=4096, num_heads=40
     )
 
 
-class FastStar(InfinityStar):
-    """Compatibility wrapper for FastSTAR-enabled InfinityStar inference."""
+class FastVAR_InfinityStar(InfinityStar):
+    """InfinityStar accelerated by FastVAR (ICCV'2025), the comparison baseline of the FastSTAR paper."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # FastSTAR-specific init
-        faststar_args = self.other_args
+        # FastVAR-specific init
+        fastvar_args = self.other_args
+        self.fastvar_prune_ratio_by_scale = fastvar_args.fastvar_prune_ratio_by_scale(self.scale_schedule)
+        target_scales = sorted(self.fastvar_prune_ratio_by_scale.keys())
+        self.fastvar_cache_scale = fastvar_args.fastvar_cache_scale_index(target_scales)
+        self.fastvar_prune_layers = set(fastvar_args.fastvar_prune_layer_list(self.depth))
+        # ratio == 1 scales are skipped entirely (original FastVAR's 100% pruning / skip last scales)
+        self.fastvar_skip_scales = {
+            si for si, ratio in self.fastvar_prune_ratio_by_scale.items() if ratio >= 1.0}
+        restore_interp_mode = fastvar_args.fastvar_restore_interp_mode
+        per_frame_pts = bool(int(fastvar_args.fastvar_per_frame_pts))
 
-        self.faststar_prune_ratio_by_scale = faststar_args.faststar_prune_ratio_by_scale(self.scale_schedule)
-        self.faststar_p_norm = faststar_args.faststar_p_norm_value()
+        # Rebuild the transformer blocks with FastVAR-enabled blocks. Parameter names and
+        # structure match SelfAttnBlock, so the pretrained checkpoint loads unchanged.
+        self.unregistered_blocks = []
+        for layer_idx in range(self.depth):
+            block = FastVARSelfAttnBlock(
+                embed_dim=self.C,
+                cond_dim=self.D,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_key_value_heads,
+                mlp_ratio=self.mlp_ratio,
+                use_flex_attn=self.use_flex_attn,
+                pad_to_multiplier=self.pad_to_multiplier,
+                rope2d_normalized_by_hw=self.rope2d_normalized_by_hw,
+                mask_type=self.other_args.mask_type,
+                context_frames=self.other_args.context_frames,
+                steps_per_frame=self.other_args.steps_per_frame,
+                arch=self.arch,
+                qwen_qkvo_bias=self.qwen_qkvo_bias,
+                inject_sync=self.other_args.inject_sync,
+                prune_layer=layer_idx in self.fastvar_prune_layers,
+                restore_interp_mode=restore_interp_mode,
+                per_frame_pts=per_frame_pts,
+            )
+            block.layer_idx = layer_idx
+            block.attn.layer_idx = layer_idx
+            self.unregistered_blocks.append(block)
+
+        if self.num_block_chunks == 1:
+            self.blocks = nn.ModuleList(self.unregistered_blocks)
+            assert self.blocks[0] is self.unregistered_blocks[0]
+        else:
+            self.block_chunks = nn.ModuleList()
+            for i in range(self.num_block_chunks):
+                self.block_chunks.append(MultipleLayers(
+                    self.unregistered_blocks,
+                    self.num_blocks_in_a_chunk,
+                    i * self.num_blocks_in_a_chunk,
+                ))
+            assert self.block_chunks[0].module[0] is self.unregistered_blocks[0]
+
         print(
-            f'[FastSTAR]\n'
-            f'    target_scales={list(self.faststar_prune_ratio_by_scale.keys())}\n'
-            f'    prune_ratios={list(self.faststar_prune_ratio_by_scale.values())}\n'
-            f'    p_norm={self.faststar_p_norm}\n'
-            f'    per_frame_topk={bool(int(faststar_args.faststar_per_frame_topk))}\n'
-            f'    final_iteration_full={bool(int(faststar_args.faststar_final_iteration_full))}\n'
+            f"\n[FastVAR (ICCV'2025) x InfinityStar]\n"
+            f'    target_scales={target_scales}\n'
+            f'    prune_ratios={[self.fastvar_prune_ratio_by_scale[s] for s in target_scales]}\n'
+            f'    cache_scale={self.fastvar_cache_scale}\n'
+            f'    skip_scales={sorted(self.fastvar_skip_scales)}\n'
+            f'    prune_layers={sorted(self.fastvar_prune_layers)}\n'
+            f'    final_iteration_full={bool(int(fastvar_args.fastvar_final_iteration_full))}\n'
+            f'    per_frame_pts={per_frame_pts}\n'
+            f'    restore_interp_mode={restore_interp_mode}\n'
         )
+
+    def set_fastvar_step_state(self, scale_ind, x_shape, pruning_this_step):
+        """Inject the per-(scale, repeat) FastVAR state into every block.
+
+        MultipleLayers.forward has no kwargs pass-through, so the pruning decision is
+        injected as block state instead of extending the block forward signature.
+        """
+        prune_ratio = self.fastvar_prune_ratio_by_scale.get(scale_ind, 0.0) if pruning_this_step else 0.0
+        cache_this_step = scale_ind == self.fastvar_cache_scale
+        for block in self.unregistered_blocks:
+            block.fastvar_prune_this_step = pruning_this_step
+            block.fastvar_prune_ratio = prune_ratio
+            block.fastvar_x_shape = tuple(x_shape) if x_shape is not None else None
+            block.fastvar_cache_this_step = cache_this_step
+
+    def reset_fastvar_caches(self):
+        for block in self.unregistered_blocks:
+            block.reset_fastvar_cache()
 
     @torch.no_grad()
     def ar_infer_infinity_elegant(
@@ -106,6 +167,7 @@ class FastStar(InfinityStar):
         ca_kv, cond_BD_or_gss, attn_mask = None, None, None
         ret, idx_Bl_list = [], []  # current length, list of reconstructed images
         for b in self.unregistered_blocks: b.attn.kv_caching(True)
+        self.reset_fastvar_caches()
 
         # TODO: ------ for attn map vis ------
         self.set_attention_map_recorder(attn_map_recorder)
@@ -124,24 +186,14 @@ class FastStar(InfinityStar):
         assert len(
             image_scale_repetition) == scales_in_one_clip, f'{len(image_scale_repetition)} != {scales_in_one_clip}'
 
-        # faststar_prune_ratio_by_scale = args.faststar_prune_ratio_by_scale(scale_schedule)
-        # faststar_p_norm = args.faststar_p_norm_value()
-        # print(
-        #     f'\n[FastSTAR]\n'
-        #     f'    target_scales={list(faststar_prune_ratio_by_scale.keys())}\n'
-        #     f'    prune_ratios={list(faststar_prune_ratio_by_scale.values())}\n'
-        #     f'    p_norm={faststar_p_norm}\n'
-        #     f'    final_iteration_full={bool(int(args.faststar_final_iteration_full))}\n'
-        # )
-
-        total_steps = image_scale_repetition.sum() + video_scale_repetition.sum() * (
-                    len(scale_schedule) // len(video_scale_repetition) - 1) + 1  # +1 is prefix text token forward step
-        pbar = tqdm.tqdm(total=total_steps)
         block_chunks = self.block_chunks if self.num_block_chunks > 1 else self.blocks
 
         #* Count the suffix over actual visual forward steps, e.g. scale_27_repeat1, scale_28_repeat0.
+        #* 100%-pruned (skipped) scales contribute no steps, so drop-uncond lands on executed steps.
         visual_repeat_steps = []
         for step_si in range(len(scale_schedule)):
+            if step_si in self.fastvar_skip_scales:
+                continue
             rel_step_si = step_si % scales_in_one_clip
             if step_si < scales_in_one_clip:
                 step_repeat_times = image_scale_repetition[rel_step_si]
@@ -150,8 +202,10 @@ class FastStar(InfinityStar):
             step_infer_repeat_times = min(int(step_repeat_times), args.max_repeat_times)
             for step_repeat_idx in range(step_infer_repeat_times):
                 visual_repeat_steps.append((step_si, step_repeat_idx))
-        # drop_uncond_last_scales = max(int(getattr(args, "drop_uncond_last_scales", 0)), 0)
         drop_uncond_steps = set(visual_repeat_steps[-self.drop_uncond_last_scales:]) if self.drop_uncond_last_scales > 0 else set()
+
+        total_steps = len(visual_repeat_steps) + 1  # +1 is prefix text token forward step
+        pbar = tqdm.tqdm(total=total_steps)
         active_branch_repeat = bs // B
 
         noise_shape = vae_scale_schedule[0]
@@ -172,6 +226,7 @@ class FastStar(InfinityStar):
         pbar.update(1)
         if attn_map_recorder is not None:
             attn_map_recorder.set_step(step_key='t0', file_label='scale_t0')
+        self.set_fastvar_step_state(scale_ind='t0', x_shape=None, pruning_this_step=False)
         # get text KV cache
         for block_idx, b in enumerate(block_chunks):
             last_stage = b(
@@ -185,7 +240,6 @@ class FastStar(InfinityStar):
         ref_text_scale_inds = ['t0']
         last_stage = sos_token  # torch.Size([2, 1, 4096])
         cum_scales = 0  # real repetition-aware scale
-        faststar_pruning_masks = {}
         for si, pn in enumerate(scale_schedule):  # si: i-th segment
 
             rel_si_in_one_clip = si % scales_in_one_clip
@@ -198,15 +252,19 @@ class FastStar(InfinityStar):
 
             cfg = cfg_list[si]
             infer_repeat_times = min(repeat_times, args.max_repeat_times)
+            if si in self.fastvar_skip_scales:
+                # FastVAR 100% pruning: skip this scale's forward passes entirely; the
+                # accumulated feature map (already at target_pn) is interpolated as the
+                # final output for these tokens, cf. the FastVAR paper's skip-last-scales.
+                infer_repeat_times = 0
+                if bool(int(args.fastvar_log_pruning)):
+                    print(f'[FastVAR] scale={si} skipped (prune_ratio=1.00, 100% pruning)')
             for repeat_idx in range(infer_repeat_times):
                 drop_uncond_this_step = (si, repeat_idx) in drop_uncond_steps and active_branch_repeat > 1
-                # print(f'{(si, repeat_idx)=}')
                 if drop_uncond_this_step:
-                    # print(f'    {drop_uncond_this_step=}')
                     last_stage = last_stage[:B]
                     active_branch_repeat = 1
                     self.keep_cond_branch_in_kv_cache(B)
-                # print(f'real scale ind is : {cum_scales+repeat_idx}')
 
                 # --- visual RoPE ---
                 #       Recalculate visual RoPE for each repetition
@@ -222,62 +280,27 @@ class FastStar(InfinityStar):
                     )
 
                 last_repetition_step = (repeat_idx == (infer_repeat_times - 1))
-                pruning_mask = faststar_pruning_masks.get(si)
-                if si in self.faststar_prune_ratio_by_scale and pruning_mask is None:
-                    raise RuntimeError(
-                        f"FastSTAR pruning mask for target scale {si} was not prepared by scale {si - 1}."
-                    )
-                pruning_this_step = (
-                    pruning_mask is not None
-                    and args.faststar_should_prune(
-                        si,
-                        repeat_idx,
-                        infer_repeat_times,
-                        self.faststar_prune_ratio_by_scale,
-                    )
-                )
-                full_seq_len = last_stage.shape[1]
-                keep_indices = None
-                if pruning_this_step:
-                    expected_seq_len = int(np.prod(pn))
-                    if full_seq_len != expected_seq_len:
-                        raise ValueError(
-                            f"FastSTAR expected {expected_seq_len} tokens at scale {si}, got {full_seq_len}."
-                        )
-                    if rope_cache.shape[4] != full_seq_len:
-                        raise ValueError(
-                            f"FastSTAR token/RoPE length mismatch: {full_seq_len} != {rope_cache.shape[4]}."
-                        )
-                    _, keep_indices = pruning_mask_to_token_indices(pruning_mask, tuple(pn))
-                    last_stage = last_stage.index_select(1, keep_indices)
-                    rope_cache = rope_cache.index_select(4, keep_indices)
 
-                    if bool(int(args.faststar_log_masks)):
-                        feature_kept = int(pruning_mask.sum().item())
-                        feature_total = pruning_mask.numel()
-                        token_kept = keep_indices.numel()
+                # -------- FastVAR: inject the per-step pruning state into all blocks --------
+                pruning_this_step = args.fastvar_should_prune(
+                    si, repeat_idx, infer_repeat_times, self.fastvar_prune_ratio_by_scale)
+                self.set_fastvar_step_state(scale_ind=si, x_shape=pn, pruning_this_step=pruning_this_step)
+                if bool(int(args.fastvar_log_pruning)) and si in self.fastvar_prune_ratio_by_scale:
+                    full_seq_len = last_stage.shape[1]
+                    if pruning_this_step:
+                        prune_ratio = self.fastvar_prune_ratio_by_scale[si]
+                        token_kept = full_seq_len - int(full_seq_len * prune_ratio)
                         print(
-                            f'[FastSTAR] scale={si} repeat={repeat_idx} '
-                            f'prune_ratio={self.faststar_prune_ratio_by_scale[si]:.2f} '
-                            f'feature_kept={feature_kept}/{feature_total} '
-                            f'feature_keep_ratio={feature_kept / feature_total:.4f} '
-                            f'transformer_tokens={token_kept}/{full_seq_len} '
+                            f'[FastVAR] scale={si} repeat={repeat_idx} '
+                            f'prune_ratio={prune_ratio:.2f} '
+                            f'tokens={token_kept}/{full_seq_len} per prune layer '
                             f'token_keep_ratio={token_kept / full_seq_len:.4f}'
                         )
-                    if bool(int(args.faststar_save_masks)):
-                        save_path = save_pruning_mask(
-                            pruning_mask,
-                            args.faststar_mask_save_dir,
-                            scale_index=si,
-                            repeat_index=repeat_idx,
+                    else:
+                        print(
+                            f'[FastVAR] scale={si} repeat={repeat_idx} '
+                            f'full-token refinement tokens={full_seq_len}'
                         )
-                        if bool(int(args.faststar_log_masks)):
-                            print(f'[FastSTAR] saved pruning mask: {save_path} (+ .png visualization)')
-                elif pruning_mask is not None and bool(int(args.faststar_log_masks)):
-                    print(
-                        f'[FastSTAR] scale={si} repeat={repeat_idx} '
-                        f'full-token refinement tokens={full_seq_len}'
-                    )
 
                 for block_idx, b in enumerate(block_chunks):
                     last_stage = b(
@@ -286,9 +309,6 @@ class FastStar(InfinityStar):
                         scale_ind=si, context_info=context_info, last_repetition_step=last_repetition_step,
                         ref_text_scale_inds=ref_text_scale_inds
                     )
-
-                if pruning_this_step:
-                    last_stage = scatter_pruned_tokens(last_stage, keep_indices, full_seq_len)
 
                 if cfg_similarity_recorder is not None and last_repetition_step:
                     cfg_similarity_recorder.capture_last_stage(
@@ -303,7 +323,6 @@ class FastStar(InfinityStar):
                                                           is_semantic_scale=rel_si_in_one_clip < args.semantic_scales).mul(
                     1 / tau_list[si])
                 if cfg != 1:
-                    # print(f'add cfg on add_cfg_on_logits')
                     if active_branch_repeat == 1:
                         logits_BlV = logits_BlV[:B]
                     elif args.use_cfg:
@@ -314,7 +333,6 @@ class FastStar(InfinityStar):
                         pred_guided = normalized_guidance(pred_cond, pred_uncond, guidance_scale=cfg,
                                                           momentum_buffer=None, eta=0,
                                                           norm_threshold=args.apg_norm_threshold)
-                        # pred_guided = cfg * pred_cond + (1-cfg) * pred_uncond
                         logits_BlV = pred_guided
                 else:
                     logits_BlV = logits_BlV[:B]
@@ -340,7 +358,6 @@ class FastStar(InfinityStar):
 
                 idx_Bld = Bld2Bthwd(idx_Bld)
                 probs_Bld = Bld2Bthwd(probs_Bld)
-                # print(f'{si=} {repeat_idx=} idx_Bld.shape={idx_Bld.shape}')
 
                 # for I2V / reference-conditioned inference
                 if si < gt_leak:
@@ -363,51 +380,9 @@ class FastStar(InfinityStar):
                     codes = vae.quantizer.lfq_detail.indices_to_codes(idx_Bld, 'bit_label')
                     codes = F.interpolate(codes, size=target_pn, mode=vae.quantizer.z_interplote_up)
 
-                # -------- residual accumulation --------
+                # -------- residual accumulation (baseline behavior, no partial update) --------
                 summed_codes[-1] = F.interpolate(summed_codes[-1], size=target_pn, mode=vae.quantizer.z_interplote_up)
-                previous_feature = summed_codes[-1]
-                if pruning_this_step:
-                    current_feature = partial_update(previous_feature, codes, pruning_mask)
-                else:
-                    current_feature = previous_feature + codes
-                summed_codes[-1] = current_feature
-
-                next_scale_index = si + 1
-                should_build_next_mask = (
-                    next_scale_index < len(scale_schedule)
-                    and next_scale_index in self.faststar_prune_ratio_by_scale
-                    and last_repetition_step
-                )
-                if should_build_next_mask:
-                    previous_temporal_feature = None
-                    if len(summed_codes) > 1:
-                        previous_temporal_feature = F.interpolate(
-                            summed_codes[-2],
-                            size=target_pn,
-                            mode=vae.quantizer.z_interplote_up,
-                        )
-                    st_score = compute_st_score(
-                        previous_feature=previous_feature,
-                        current_feature=current_feature,
-                        previous_temporal_feature=previous_temporal_feature,
-                        p_norm=self.faststar_p_norm,
-                        temporal_fallback=args.faststar_first_clip_temporal_fallback,
-                    )
-                    next_pruning_mask = topk_pruning_mask(
-                        st_score,
-                        prune_ratio=self.faststar_prune_ratio_by_scale[next_scale_index],
-                        per_frame_topk=bool(int(args.faststar_per_frame_topk)),
-                    )
-                    faststar_pruning_masks[next_scale_index] = next_pruning_mask
-                    if bool(int(args.faststar_log_masks)):
-                        kept_features = int(next_pruning_mask.sum().item())
-                        total_features = next_pruning_mask.numel()
-                        print(
-                            f'[FastSTAR] prepared mask scale={si}->{next_scale_index} '
-                            f'prune_ratio={self.faststar_prune_ratio_by_scale[next_scale_index]:.2f} '
-                            f'feature_kept={kept_features}/{total_features} '
-                            f'feature_keep_ratio={kept_features / total_features:.4f}'
-                        )
+                summed_codes[-1] += codes
 
                 if repeat_idx < repeat_times - 1:
                     last_stage = F.interpolate(summed_codes[-1], size=vae_scale_schedule[si],
@@ -434,6 +409,7 @@ class FastStar(InfinityStar):
 
         summed_codes = torch.cat(summed_codes, dim=-3)
         for b in self.unregistered_blocks: b.attn.kv_caching(False)
+        self.reset_fastvar_caches()  # free the CTR caches between inferences
 
         # TODO: ------ for attn map vis ------
         self.set_attention_map_recorder(None)

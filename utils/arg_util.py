@@ -133,7 +133,7 @@ class Args(Tap):
     workers: int = 0        # num workers; 0: auto, -1: don't use multiprocessing in DataLoader
     
     # progressive training
-    pg: float = 0.0         # >0 for use progressive training during [0%, this] of training
+    pg: float = 0.0         # >0 for use progressive training during [0, this] of training
     pg0: int = 4            # progressive initial stage, 0: from the 1st token map, 1: from the 2nd token map, etc
     pgwp: float = 0         # num of warmup epochs at each progressive stage
     
@@ -605,16 +605,17 @@ class InfinityArgs(Tap):
 class InfinityInferArgs(InfinityArgs):
 
     model_type: str = 'infinity_2b'
-    pn: str = '1M'  # Pixel numbers
+    pn: str = '1M'  # Pixel numbers: choices=['0.06M', '0.25M', '1M']
 
     text_channels: int = 2048
-    text_encoder_ckpt: str = 'pretrained_models/infinity/flan-t5-xl'
+    text_maxlen: int = 512
+    text_encoder_ckpt: str = 'pretrained_models/infinity/flan-t5-xl'                    # The path to text model, Infinity --> Flan-t5-xl, HART --> Qwen2-VL-1.5B-Instruct by default.
     # ------ Infinity 2b ------
     vae_type: int = 32
     vae_path: str = 'pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth'
     apply_spatial_patchify: int = 0
     checkpoint_type: str = 'torch'
-    model_path: str = 'pretrained_models/infinity/Infinity/infinity_2b_reg.pth'
+    model_path: str = 'pretrained_models/infinity/Infinity/infinity_2b_reg.pth'         # The path to Infinity / HART model.
     # tau: float = 0.5          # different for Infinity 2b and 8b
 
     # ------ Infinity 8b ------
@@ -625,33 +626,103 @@ class InfinityInferArgs(InfinityArgs):
     # model_path: str = 'pretrained_models/infinity/Infinity/infinity_8b_weights'
     # tau: float = 1
 
-    bf16: int = 1   # choices=[0,1]
+    bf16: int = 1                                           # choices=[0,1]
     cfg_insertion_layer: int = 0
-    cfg: float = 3
+    cfg: float = 3                                          # Classifier-free guidance scale.
     tau: float = 1
 
-    use_flex_attn: int = 0
-    use_scale_schedule_embedding: int = 0
-    use_bit_label: int = 1
-    sampling_per_bits: int = 1
+    use_flex_attn: int = 0                                  # choices=[0,1]
+    use_scale_schedule_embedding: int = 0                   # choices=[0,1]
+    use_bit_label: int = 1                                  # choices=[0,1]
+    sampling_per_bits: int = 1                              # choices=[1,2,4,8,16]
     # PEs
-    add_lvl_embeding_only_first_block: int = 1
-    rope2d_each_sa_layer: int = 1
-    rope2d_normalized_by_hw: int = 2
+    add_lvl_embeding_only_first_block: int = 1              # choices=[0,1]
+    rope2d_each_sa_layer: int = 1                           # choices=[0,1]
+    rope2d_normalized_by_hw: int = 2                        # choices=[0,1,2]
     # 
     h_div_w_template: float = 1.000     # aspect ratio, height:width
+    
+    #* General next-scale acceleration technology
+    skip_last_scales: int = 0
+    drop_uncond_last_scales: int = 0
 
     # simple play model
-    enable_positive_prompt: int = 0
+    enable_positive_prompt: int = 0                         # choices=[0,1]
     cache_dir: str = '/dev/shm'
-    enable_model_cache: int = 0
+    enable_model_cache: int = 0                             # choices=[0,1]
     seed: int = 42
     save_file: str = 'tmp.png'
 
     # -----------------------------------------
     # -------- Latency Profile Setting --------
     # -----------------------------------------
-    throughput_batch: int = 1
+    batch_size: int = 1
+    warmup_iter: int = 50
+    profile_iter: int = 100
+    outdir: str = ''
+
+    # -----------------------------------------
+    # ------------ FastVAR Setting ------------
+    # -----------------------------------------
+    cached_scale: int = 8
+    prune_ratio: str = "0.4,0.5"
+
+
+    # -------------------------------------------
+    # ------------ SparseVAR Setting ------------
+    # -------------------------------------------
+    sparsevar_compress_method: str = 'sparsevar'
+    sparsevar_compress_ratio: float = 0.6              # {0.5, 0.6, 0.7}
+    sparsevar_local_window_size: int = 4
+    sparsevar_start_prune_stage: int = 10
+    sparsevar_specific_mse_layer: int = 3
+    sparsevar_beta: float = 0.8
+    # dynamic_anchor
+    # use_metric
+
+
+class HARTInferArgs(Tap):
+    """Inference args for HART-family T2I models.
+
+    Selected instead of InfinityInferArgs when --model_type contains 'hart'
+    (see utils/infer_arg_utils.py). HART needs none of the Infinity training
+    args, so this inherits Tap directly; the few shared fields are duplicated
+    here on purpose to keep the Infinity arg hierarchy untouched.
+    """
+
+    model_type: str = 'hart'
+    model_path: str = 'pretrained_models/hart/hart-0.7b-1024px/llm'          # The path to HART model.
+    text_encoder_ckpt: str = 'pretrained_models/hart/Qwen2-VL-1.5B-Instruct'
+    cfg: float = 4.5                                        # Classifier-free guidance scale.
+    tau: float = 1      # unused by HART; kept because shared eval scripts read args.tau unconditionally
+    pn: str = '1M'      # unused by HART; kept because shared eval scripts build the Infinity scale_schedule unconditionally
+    seed: int = 42
+    outdir: str = ''
+
+    # ------ HART sampling ------
+    use_ema: bool = True
+    max_token_length: int = 300
+    use_llm_system_prompt: bool = True
+    more_smooth: bool = True                                # Turn on for more visually smooth samples.
+
+    # ------ SparseVAR-HART ------
+    compress_method: str = 'sparsevar'
+    compress_ratio: float = 0.6
+    start_prune_stage: int = 10
+    specific_mse_layer: int = 3
+    local_window_size: int = 4
+
+    #* General next-scale acceleration technology
+    attn_sink_scales: int = 5                               # Sink the attention maps of the last few scales
+    skip_last_scales: int = 0                               # Skip the last few scales
+    drop_uncond_last_scales: int = 3                        # Drop the unconditional branch of last few scales
+
+    # -----------------------------------------
+    # -------- Latency Profile Setting --------
+    # -----------------------------------------
+    batch_size: int = 1
+    warmup_iter: int = 50
+    profile_iter: int = 100
 
 
 # --------

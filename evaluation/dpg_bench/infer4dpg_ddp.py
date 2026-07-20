@@ -10,6 +10,7 @@ from tqdm import trange
 
 from tools.run_hart import gen_one_img_hart, load_hart, load_hart_tokenizer
 from tools.run_infinity import *
+from utils.infer_arg_utils import merge_script_args, parse_infer_args
 
 
 def create_image_grid(images):
@@ -46,12 +47,13 @@ def create_image_grid(images):
 
 
 def main():
+    # model-level args (model_path / cfg / ... incl. --outdir) are parsed by the
+    # Tap class matching --model_type; the parser below only holds benchmark args
+    args = parse_infer_args()
     parser = argparse.ArgumentParser()
-    add_common_arguments(parser)
-    parser.add_argument('--outdir', type=str, default='')
     parser.add_argument('--n_samples', type=int, default=4)
     parser.add_argument('--test_speed', type=bool, default=True, help="Enable latency measurement")
-    args = parser.parse_args()
+    args = merge_script_args(args, parser)
 
     # ensure n_samples = 4
     if args.n_samples != 4:
@@ -59,10 +61,11 @@ def main():
               but n_samples is set to {args.n_samples}. Forcing n_samples to 4.")
         args.n_samples = 4
 
-    # parse cfg
-    args.cfg = list(map(float, args.cfg.split(',')))
-    if len(args.cfg) == 1:
-        args.cfg = args.cfg[0]
+    # parse cfg (Tap parses cfg as a single float; keep supporting the legacy comma-separated string)
+    if isinstance(args.cfg, str):
+        args.cfg = list(map(float, args.cfg.split(',')))
+        if len(args.cfg) == 1:
+            args.cfg = args.cfg[0]
     
     # *Initialize distributed environment
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -204,6 +207,7 @@ def main():
                     hart, args.use_ema, ema_hart, text_tokenizer, text_encoder,
                     prompt, cfg, args.max_token_length, args.use_llm_system_prompt,
                     args.more_smooth,
+                    g_seed=seed,    # keep the per-sample seed protocol identical to Infinity
                     test_speed=True
                 )
                 local_num_images += 1

@@ -27,8 +27,9 @@ from models.schedules.dynamic_resolution import (
     get_dynamic_resolution_meta, get_first_full_spatial_size_scale_index)
 from tools.run_infinity import (InferencePipe, gen_one_video, save_video,
                                 transform)
-from utils.arg_util_video import InferArgs
+from utils.infer_arg_utils import parse_video_infer_args
 from utils.env_report_utils import print_lvar_env_report
+from utils.sequence_parallel import SequenceParallelManager as sp_manager
 
 
 def perform_inference(pipe, data, args):
@@ -86,7 +87,7 @@ def perform_inference(pipe, data, args):
             vae_type=args.vae_type,
             sampling_per_bits=1,
             enable_positive_prompt=0,
-            low_vram_mode=True,
+            low_vram_mode=bool(args.low_vram_mode),
             args=args,
             get_visual_rope_embeds=pipe.get_visual_rope_embeds,
             context_info=context_info,
@@ -99,7 +100,7 @@ def perform_inference(pipe, data, args):
             
     generated_image = torch.cat(generated_image_list, 2)
     end_time = time.time()
-    elapsed_time = end_time - start_time    
+    elapsed_time = end_time - start_time
     
     return {
         "output": generated_image.cpu().numpy(),
@@ -187,7 +188,7 @@ def remove_stale_raw_links_from_video_dim_dir(dim_video_path):
 
 
 def main():
-    args = InferArgs().parse_args()
+    args = parse_video_infer_args()
     
     # *Initialize distributed process group
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -201,6 +202,22 @@ def main():
     )
     rank = tdist.get_rank()
     world_size = tdist.get_world_size()
+
+    # *Sequence parallelism: form SP groups of size args.sp_size inside the world.
+    # Each SP group is ONE model instance that co-generates a prompt across its GPUs
+    # (e.g. sp_size=2, 4 GPUs -> instances {0,1} and {2,3}). Prompts are data-parallel
+    # ACROSS instances and sequence-parallel WITHIN an instance. sp_size<=1 -> plain DDP.
+    # NOTE: derive sp_rank/group_id directly (NOT sp_manager.get_sp_rank(), which returns
+    # 0 whenever SP is toggled inactive between phases).
+    if args.sp_size > 1:
+        sp_manager.init_sp(args.sp_size)
+        sp_size = args.sp_size
+        num_groups = world_size // sp_size      # number of model instances (DP replicas)
+        group_id = rank // sp_size              # which instance this rank serves
+        sp_rank = rank % sp_size                # position within the instance
+    else:
+        sp_size, num_groups, group_id, sp_rank = 1, world_size, rank, 0
+    is_group_leader = (sp_rank == 0)            # only the leader writes files / counts latency
 
     if rank == 0 and args.print_env_info:
         print("\n=== Lvar Experiment Environment ===")
@@ -262,8 +279,10 @@ def main():
     # local_warmup_videos_count = warmup_steps * args.num_samples_per_prompt
     local_warmup_videos = 2
     
-    local_indices = list(range(rank, total_items, world_size))
-    print(f"[Rank {rank}] will process {len(local_indices)} prompts (Total tasks: {total_items})")
+    # Distribute prompts ACROSS model instances; both ranks of an instance share local_indices.
+    local_indices = list(range(group_id, total_items, num_groups))
+    print(f"[Rank {rank}] (instance {group_id}/{num_groups}, sp_rank {sp_rank}) "
+          f"will process {len(local_indices)} prompts (Total tasks: {total_items})")
     print(f"[Rank {rank}] {local_indices=}")
 
     # for global_idx in trange(start_idx, end_idx, disable=(rank != 0), desc=f"Rank {rank} generating videos"):
@@ -310,19 +329,24 @@ def main():
             save_path = osp.join(videos_root, physical_base_name)
             artifact_paths = get_video_artifact_paths(save_path)
             
+            # NOTE: the skip decision is filesystem-based, so both ranks of an instance
+            # agree on it and stay in lockstep for the SP collectives inside perform_inference.
             if has_complete_saved_outputs(save_path, args):
-                print(f"[Rank {rank}] Skipping existing complete outputs: {physical_base_name}")
-                local_num_skip_videos += 1
-                pass
+                if is_group_leader:
+                    print(f"[Rank {rank}] Skipping existing complete outputs: {physical_base_name}")
+                    local_num_skip_videos += 1
             else:
                 try:
+                    # Both ranks of the instance run this together (SP collectives); identical output.
                     output_dict = perform_inference(pipe, data, args)
+                except Exception as e:
+                    print(f"[Rank {rank}] Error generating {physical_base_name}: {e}")
+                    continue
+                if is_group_leader:   # only the leader writes the file / counts latency
                     video_np = output_dict["output"]  # [bs, t, h, w, 3] in uint8
-                    
                     local_num_videos += 1
                     if local_num_videos > local_warmup_videos:
                         local_total_latency += output_dict['elapsed_time']
-                    
                     save_video(
                         video_np,
                         fps=args.fps,
@@ -330,14 +354,12 @@ def main():
                         save_raw_png_frames=bool(args.save_raw_png_frames),
                         save_raw_npy_frames=bool(args.save_raw_npy_frames),
                     )
-                    # print(f"[Rank {rank}] Video genernation done: {save_path=}\n")
-                
-                except Exception as e:
-                    print(f"[Rank {rank}] Error generating {physical_base_name}: {e}")
-                    continue
 
             # a video prompt may belong multiple Vbench dims
             # create soft links under the dimension directory
+            # (only the SP group leader wrote save_path; non-leaders skip to the next sample)
+            if not is_group_leader:
+                continue
             for d in dims:
                 dim_dir = osp.join(videos_by_dim_root, d)
                 os.makedirs(dim_dir, exist_ok=True)
@@ -373,8 +395,8 @@ def main():
     tdist.all_reduce(latency_tensor, op=tdist.ReduceOp.SUM)
     global_total_latency = latency_tensor[0].item()
     global_num_videos = int(latency_tensor[1].item())
-    # Compute global warmup videos
-    global_warmup_videos_count = local_warmup_videos * world_size
+    # Compute global warmup videos (one leader per instance counts videos)
+    global_warmup_videos_count = local_warmup_videos * num_groups
     # Profile global videos
     global_num_videos_profile = global_num_videos - global_warmup_videos_count
     global_num_skip_videos = int(latency_tensor[2].item())

@@ -8,6 +8,7 @@ from tqdm import trange
 from tools.conf import HF_HOME, HF_TOKEN
 from tools.run_hart import gen_one_img_hart, load_hart, load_hart_tokenizer
 from tools.run_infinity import *
+from utils.infer_arg_utils import merge_script_args, parse_infer_args
 
 # set environment variables
 os.environ['HF_TOKEN'] = HF_TOKEN
@@ -16,20 +17,22 @@ os.environ['XFORMERS_FORCE_DISABLE_TRITON'] = '1'
 
 
 if __name__ == '__main__':
+    # model-level args (model_path / cfg / ... incl. --outdir) are parsed by the
+    # Tap class matching --model_type; the parser below only holds benchmark args
+    args = parse_infer_args()
     parser = argparse.ArgumentParser()
-    add_common_arguments(parser)
-    parser.add_argument('--outdir', type=str, default='')
     parser.add_argument('--n_samples', type=int, default=4)
     parser.add_argument('--metadata_file', type=str, default='evaluation/gen_eval/prompts/evaluation_metadata.jsonl')
     parser.add_argument('--rewrite_prompt', type=int, default=0, choices=[0,1])
     parser.add_argument('--load_rewrite_prompt_cache', type=int, default=1, choices=[0,1])
     parser.add_argument('--test_speed', type=bool, default=True, help="Enable latency measurement")
-    args = parser.parse_args()
+    args = merge_script_args(args, parser)
 
-    # parse cfg
-    args.cfg = list(map(float, args.cfg.split(',')))
-    if len(args.cfg) == 1:
-        args.cfg = args.cfg[0]
+    # parse cfg (Tap parses cfg as a single float; keep supporting the legacy comma-separated string)
+    if isinstance(args.cfg, str):
+        args.cfg = list(map(float, args.cfg.split(',')))
+        if len(args.cfg) == 1:
+            args.cfg = args.cfg[0]
     
     # *Initialize distributed process group
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -184,6 +187,7 @@ if __name__ == '__main__':
                     hart, args.use_ema, ema_hart, text_tokenizer, text_encoder,
                     prompt, cfg, args.max_token_length, args.use_llm_system_prompt,
                     args.more_smooth,
+                    g_seed=seed,    # keep the per-sample seed protocol identical to Infinity
                     test_speed=True
                 )
                 local_num_images += 1

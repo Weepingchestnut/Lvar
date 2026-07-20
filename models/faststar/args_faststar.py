@@ -38,25 +38,34 @@ def _parse_p_norm(value) -> float:
 class FastStarArgs(InferArgs):
     """Inference args for FastSTAR-enabled InfinityStar generation."""
 
-    model_type: str = 'faststar_qwen8b'
+    model_type: str = 'faststar_infinitystar'
 
     faststar_target_scales: str = ''                                            # default: last 4 scales
     faststar_prune_ratios: str = '[0.20, 0.30, 0.40, 0.70]'
     faststar_p_norm: str = '2'
-    faststar_per_frame_topk: int = 1                                            # choices=[0, 1]
+    faststar_per_frame_topk: int = 0                                            # choices=[0, 1]
     faststar_first_clip_temporal_fallback: str = "spatial_only"
-    faststar_final_iteration_full: int = 0                                      # choices=[0, 1]
+    faststar_final_iteration_full: int = 1                                      # choices=[0, 1]
 
-    faststar_log_masks: int = 1
-    faststar_save_masks: int = 1
+    faststar_log_masks: int = 0
+    faststar_save_masks: int = 0
     faststar_mask_save_dir: str = "work_dir/play_models/FastSTAR_720p/faststar_masks"
 
     def faststar_target_scale_list(self, scale_schedule: Iterable) -> List[int]:
         """Return target scale indices, defaulting to the final 4 scales."""
         scale_schedule = list(scale_schedule)
+        if len(scale_schedule) < 2:
+            raise ValueError("FastSTAR requires at least two scales to build a cross-scale pruning mask.")
         target_scales = _parse_int_list(self.faststar_target_scales)
         if not target_scales:
-            target_scales = list(range(max(len(scale_schedule) - 4, 0), len(scale_schedule)))   # 720p: [26, 27, 28, 29]
+            target_scales = list(range(max(len(scale_schedule) - 4, 1), len(scale_schedule)))   # 720p: [26, 27, 28, 29]
+        if len(set(target_scales)) != len(target_scales):
+            raise ValueError(f"FastSTAR target scales must be unique, got {target_scales}.")
+        invalid_scales = [scale for scale in target_scales if scale < 1 or scale >= len(scale_schedule)]
+        if invalid_scales:
+            raise ValueError(
+                f"FastSTAR target scales must be in [1, {len(scale_schedule) - 1}], got {invalid_scales}."
+            )
         return target_scales
 
     def faststar_prune_ratio_list(self, target_scales: Iterable[int]) -> List[float]:
@@ -72,6 +81,9 @@ class FastStarArgs(InferArgs):
                 "FastSTAR expects one prune ratio per target scale "
                 f"({len(prune_ratios)} ratios for {len(target_scales)} scales)."
             )
+        invalid_ratios = [ratio for ratio in prune_ratios if not math.isfinite(ratio) or not 0.0 <= ratio < 1.0]
+        if invalid_ratios:
+            raise ValueError(f"FastSTAR prune ratios must be finite values in [0, 1), got {invalid_ratios}.")
         return prune_ratios
 
     def faststar_prune_ratio_by_scale(self, scale_schedule: Iterable) -> Dict[int, float]:

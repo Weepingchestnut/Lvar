@@ -10,10 +10,18 @@ from .comm.operation import gather_forward_split_backward
 class SequenceParallelManager:
     _SP_GROUP = None
     _SP_SIZE = 0
+    _SP_ACTIVE = True  # runtime gate; lets inference keep the SP group but toggle it per phase
 
     @staticmethod
     def sp_on():
-        return SequenceParallelManager._SP_GROUP is not None
+        return SequenceParallelManager._SP_GROUP is not None and SequenceParallelManager._SP_ACTIVE
+
+    @staticmethod
+    def set_active(flag: bool):
+        # Toggle SP without tearing down the process group. Training leaves this at
+        # the default True; phase-switched inference flips it off for the image
+        # pyramid and on for the video tower (see models/infinitystar/sp_infer_utils.py).
+        SequenceParallelManager._SP_ACTIVE = bool(flag)
 
     @staticmethod
     def init_sp(sp_size):

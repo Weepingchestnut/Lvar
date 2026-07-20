@@ -33,6 +33,9 @@ evaluation/imagenet/torch-fidelity
 
 # ====== kernels ======
 *.so
+# --- TK ---
+kernels/chipmunk/submodules/
+kernels/chipmunk_tk2/
 # --- HART ---
 models/hart/kernels/build/
 models/hart/kernels/hart_backend.egg-info/

@@ -138,6 +138,7 @@ if __name__ == '__main__':
 
     
     prompt = "A handsome smiling gardener inspecting plants, realistic cinematic lighting, detailed textures, ultra-realistic"
+    # prompt = "A woman with shoulder-length brown hair is seen talking to someone off-screen to the right. She is wearing a dark-colored top and a necklace. The background is blurred, butit appears to be an indoor setting with some indistinct objects and a window. The woman slightly moves her head while speaking."
     # image_path = 'assets/reference_image.webp'  # Remove this for Text-to-Video (T2V) generation
     image_path = None
     data = {

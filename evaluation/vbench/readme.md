@@ -111,20 +111,35 @@ conda install "ffmpeg"
 conda install "ffmpeg" -c conda-forge
 
 # Install PyTorch and TorchCodec:
-# torch >= 2.11
+# new version may need torch >= 2.11 (our test on torch 2.11.0)
 pip install torchcodec
+# or
+pip install torchcodec --index-url=https://download.pytorch.org/whl/cu128
 ```
 
 Check it after installation
 ```bash
 # 1) 共享库在不在（Linux or conda env）
 python -c "import ctypes.util; print(ctypes.util.find_library('avcodec'))"
+# --------------- Expected output ---------------
+# in conda env:
+# ~/anaconda3/envs/torch2110/lib/libavcodec.so.62
+# -----------------------------------------------
+
 # 2) TorchCodec 能否真正解码
 # libopenvino 找 libstdc++ 时先命中 env 里更新版本的 libstdc++
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 python -c "from torchcodec.decoders import VideoDecoder; d=VideoDecoder('xxx.mp4'); print(d[:].shape)"
+# --------------- Expected output ---------------
+# Output video tensor shape:
+# torch.Size([81, 3, 480, 848])
+# -----------------------------------------------
+
 # 3) 确认 imageio 没受影响（仍指向它自己捆绑的二进制）
 python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+# --------------- Expected output ---------------
+# ~/anaconda3/envs/torch2110/lib/python3.14/site-packages/imageio_ffmpeg/binaries/ffmpeg-linux-x86_64-v7.0.2
+# -----------------------------------------------
 ```
 
 ---

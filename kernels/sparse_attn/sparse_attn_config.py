@@ -21,7 +21,7 @@ BASE_CONFIG = {
 
         'provider': 'triton', # either 'cuda' or 'triton'
     },
-     "patchify": {
+    "patchify": {
         'is_enabled': True,
 
         # To disable patching at any level, set that level's patch size to 1. To disable patching entirely, set all patch sizes to 1.
@@ -36,6 +36,7 @@ BASE_CONFIG = {
         'decision_scale': 10,                   # sparse decision scale `S`
         'decision_on_first_repeat': False,      # True: full decision on decision scale's repeat 0, later repeats sparse; False: legacy decision on last repeat
         'speedup': 0,                           # 1: use TK-CUDA dense_colsum_attn; 0: use Triton dense_colsum_attn
+        'colsum_fa2': False,                    # true: decision colsum = FA2 dense (o + row-lse byproduct) + QK^T-only Triton colsum kernel (exact, drops the redundant o recompute); false: legacy double full-attention Triton path
         'top_keys': 0.05,
         'use_current_scale_topklen': False,
         'random_keys': 0.01,

@@ -148,7 +148,7 @@ class FastVAR_Infinity(Infinity):
                     i*self.num_blocks_in_a_chunk
                 ))
         
-        print(f"\nFastVAR")
+        print(f"\nFastVAR (ICCV'2025)")
         if self.skip_last_scales != 2:
             print(f'Official FastVAR skip last 2 scales (prune 100% tokens), but currently {self.skip_last_scales=}!')
         print(

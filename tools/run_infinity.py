@@ -29,10 +29,9 @@ from torchvision.transforms.functional import to_tensor
 from transformers import (AutoTokenizer, T5Config, T5EncoderModel,
                           T5TokenizerFast)
 
-from models.fastvar.fastvar_model import FastVAR_Infinity
+from models.registry import ensure_model_registered
 from models.infinity.infinity_model import Infinity
 from models.scalekv.scale_kv import enable_scale_kv
-from models.skipvar.skipvar_model import SkipVAR_Infinity
 from models.sparsevar.sparsevar_model import SparseVAR_Infinity
 from models.sparvar.sparvar_model import SparVAR_Infinity
 from utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
@@ -79,7 +78,11 @@ def encode_prompt(text_tokenizer, text_encoder, prompt: Union[str, List[str]], e
 def encode_video_prompt(t5_path, text_tokenizer, text_encoder, prompt, enable_positive_prompt=False, low_vram_mode=False):
     if enable_positive_prompt:
         pass
-    
+
+    if low_vram_mode:
+        text_encoder.to('cuda')  # bring back if a previous call offloaded it (re-entrant)
+        print('[low_vram_mode] text_encoder -> cuda (for prompt encoding)')
+
     if isinstance(prompt, str):
         print(f'\nprompt={prompt}')
         captions = [prompt]
@@ -110,6 +113,13 @@ def encode_video_prompt(t5_path, text_tokenizer, text_encoder, prompt, enable_po
         Ltext = max(lens)
         kv_compact = torch.cat(text_features, dim=0).float()
         text_cond_tuple = (kv_compact, lens, cu_seqlens_k, Ltext)
+
+    if low_vram_mode:
+        # Text encoder is unused during the AR loop; free its ~6GB right after encoding
+        # so the loop fits in 40GB (single-GPU headroom; also needed under SP).
+        text_encoder.to('cpu')
+        torch.cuda.empty_cache()
+        print('[low_vram_mode] text_encoder -> cpu (offloaded after prompt encoding)')
     return text_cond_tuple
 
 
@@ -184,7 +194,7 @@ def gen_one_img(
         )
     cost, infinity_cost = time.time() - sstt, time.time() - stt
     # print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
-    print(f"cost: {cost}, infinity cost={infinity_cost}, text_encoder cost={cost - infinity_cost}")
+    print(f"cost: {cost:.6f} s, infinity cost={infinity_cost:.6f} s, text_encoder cost={cost - infinity_cost} s")
     
     if batch == 1: img = img_list[0]
     else: pass      # TODO: batch test
@@ -237,6 +247,7 @@ def gen_one_video(
         cfg_list = [cfg_list] * len(scale_schedule)
     if not isinstance(tau_list, list):
         tau_list = [tau_list] * len(scale_schedule)
+    # [low_vram_mode] T5 offload now lives inside encode_video_prompt (shared by all callers)
     text_cond_tuple = encode_video_prompt(args.text_encoder_ckpt, text_tokenizer, text_encoder, prompt, enable_positive_prompt, low_vram_mode=low_vram_mode)
     if negative_prompt:
         negative_label_B_or_BLT = encode_video_prompt(args.text_encoder_ckpt, text_tokenizer, text_encoder, negative_prompt, low_vram_mode=low_vram_mode)
@@ -377,192 +388,6 @@ def transform(pil_img, tgt_h, tgt_w):
     return im.add(im).add_(-1)
 
 
-def load_infinity(
-    rope2d_each_sa_layer, 
-    rope2d_normalized_by_hw, 
-    use_scale_schedule_embedding, 
-    pn, 
-    use_bit_label, 
-    add_lvl_embeding_only_first_block, 
-    model_path='', 
-    scale_schedule=None, 
-    vae=None, 
-    device='cuda', 
-    model_kwargs=None,
-    text_channels=2048,
-    apply_spatial_patchify=0,
-    use_flex_attn=False,
-    bf16=False,
-    checkpoint_type='torch',
-    args=None,
-    # todo: --- exp params ---
-    # freeze_kv_cache_last_n_scales: int = 4
-    skip_last_scales: int = 0,
-    drop_uncond_last_scales: int = 3,
-):
-    text_maxlen = 512
-    print(f'[Loading Infinity]')
-    with autocast("cuda", dtype=torch.bfloat16, enabled=True, cache_enabled=True), torch.no_grad():
-        if model_kwargs.pop('fastvar', None) is not None:
-            # print(f'{args.prune_ratio.split(',')=}')
-            prune_ratio = tuple([float(item) for item in args.prune_ratio.split(',')])
-            infinity_test: Infinity = FastVAR_Infinity(
-                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
-                shared_aln=True, raw_scale_schedule=scale_schedule,
-                checkpointing='full-block',
-                customized_flash_attn=False,
-                fused_norm=True,
-                pad_to_multiplier=128,
-                use_flex_attn=use_flex_attn,
-                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
-                use_bit_label=use_bit_label,
-                rope2d_each_sa_layer=rope2d_each_sa_layer,
-                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
-                pn=pn,
-                apply_spatial_patchify=apply_spatial_patchify,
-                inference_mode=True,
-                train_h_div_w_list=[1.0],
-                skip_last_scales=skip_last_scales,
-                # pruning setting
-                cached_scale=args.cached_scale,
-                prune_ratio=prune_ratio,
-                **model_kwargs,
-            ).to(device=device)
-            print(f'\n[you selected FastVAR with {model_kwargs=}] \
-                  model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
-        
-        elif model_kwargs.pop('skipvar', None) is not None:
-            infinity_test: Infinity = SkipVAR_Infinity(
-                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
-                shared_aln=True, raw_scale_schedule=scale_schedule,
-                checkpointing='full-block',
-                customized_flash_attn=False,
-                fused_norm=True,
-                pad_to_multiplier=128,
-                use_flex_attn=use_flex_attn,
-                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
-                use_bit_label=use_bit_label,
-                rope2d_each_sa_layer=rope2d_each_sa_layer,
-                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
-                pn=pn,
-                apply_spatial_patchify=apply_spatial_patchify,
-                inference_mode=True,
-                train_h_div_w_list=[1.0],
-                **model_kwargs,
-            ).to(device=device)
-            print(f'\n[you selected SkipVAR with {model_kwargs=}] \
-                  model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
-        
-        elif model_kwargs.pop('sparsevar', None) is not None:
-            infinity_test: Infinity = SparseVAR_Infinity(
-                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
-                shared_aln=True, raw_scale_schedule=scale_schedule,
-                checkpointing='full-block',
-                customized_flash_attn=False,
-                fused_norm=True,
-                pad_to_multiplier=128,
-                use_flex_attn=use_flex_attn,
-                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
-                use_bit_label=use_bit_label,
-                rope2d_each_sa_layer=rope2d_each_sa_layer,
-                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
-                pn=pn,
-                apply_spatial_patchify=apply_spatial_patchify,
-                inference_mode=True,
-                train_h_div_w_list=[1.0],
-                **model_kwargs,
-            ).to(device=device)
-            print(f'\n[you selected SparseVAR with {model_kwargs=}] \
-                  model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
-        
-        elif model_kwargs.pop('sparvar', None) is not None:
-            infinity_test: SparVAR_Infinity = SparVAR_Infinity(
-                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
-                shared_aln=True, raw_scale_schedule=scale_schedule,
-                checkpointing='full-block',
-                # customized_flash_attn=False,
-                fused_norm=True,
-                pad_to_multiplier=128,
-                use_flex_attn=use_flex_attn,
-                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
-                use_bit_label=use_bit_label,
-                rope2d_each_sa_layer=rope2d_each_sa_layer,
-                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
-                pn=pn,
-                apply_spatial_patchify=apply_spatial_patchify,
-                inference_mode=True,
-                train_h_div_w_list=[1.0],
-                skip_last_scales=skip_last_scales,
-                drop_uncond_last_scales=drop_uncond_last_scales,
-                **model_kwargs,
-            ).to(device=device)
-            print(f'\n[you selected SparVAR with {model_kwargs=}] \
-                  model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
-        
-        else:
-            infinity_test: Infinity = Infinity(
-                vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
-                shared_aln=True, raw_scale_schedule=scale_schedule,
-                checkpointing='full-block',
-                # customized_flash_attn=False,
-                fused_norm=True,
-                pad_to_multiplier=128,
-                use_flex_attn=use_flex_attn,
-                add_lvl_embeding_only_first_block=add_lvl_embeding_only_first_block,
-                use_bit_label=use_bit_label,
-                rope2d_each_sa_layer=rope2d_each_sa_layer,
-                rope2d_normalized_by_hw=rope2d_normalized_by_hw,
-                pn=pn,
-                apply_spatial_patchify=apply_spatial_patchify,
-                inference_mode=True,
-                train_h_div_w_list=[1.0],
-                # 
-                skip_last_scales=skip_last_scales,
-                drop_uncond_last_scales=drop_uncond_last_scales,
-                **model_kwargs,
-            ).to(device=device)
-            print(f'\n[you selected Infinity with {model_kwargs=}] \
-                  model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
-
-        if bf16:
-            for block in infinity_test.unregistered_blocks:
-                block.bfloat16()
-
-        infinity_test.eval()
-        infinity_test.requires_grad_(False)
-
-        infinity_test.cuda()
-        torch.cuda.empty_cache()
-
-        print(f'[Load Infinity weights]')
-        if checkpoint_type == 'torch' and model_path is not None:
-            state_dict = torch.load(model_path, map_location=device, weights_only=True)
-            print(infinity_test.load_state_dict(state_dict))
-        elif checkpoint_type == 'torch_shard' and model_path is not None:
-            from transformers.modeling_utils import load_sharded_checkpoint
-            load_sharded_checkpoint(infinity_test, model_path, strict=False)
-        infinity_test.rng = torch.Generator(device=device)
-        
-        return infinity_test
-
-
-def transform(pil_img, tgt_h, tgt_w):
-    width, height = pil_img.size
-    if width / height <= tgt_w / tgt_h:
-        resized_width = tgt_w
-        resized_height = int(tgt_w / (width / height))
-    else:
-        resized_height = tgt_h
-        resized_width = int((width / height) * tgt_h)
-    pil_img = pil_img.resize((resized_width, resized_height), resample=PImage.LANCZOS)
-    # crop the center out
-    arr = np.array(pil_img)
-    crop_y = (arr.shape[0] - tgt_h) // 2
-    crop_x = (arr.shape[1] - tgt_w) // 2
-    im = to_tensor(arr[crop_y: crop_y + tgt_h, crop_x: crop_x + tgt_w])
-    return im.add(im).add_(-1)
-
-
 def joint_vi_vae_encode_decode(vae, image_path, scale_schedule, device, tgt_h, tgt_w):
     # 1. Image load and pre-process
     pil_image = Image.open(image_path).convert('RGB')
@@ -655,34 +480,9 @@ def load_transformer(vae, args, load_weights=True):
         print(f'load checkpoint from {slim_model_path}')
     elif args.checkpoint_type == 'torch_shard':
         slim_model_path = model_path
-    
-    if args.model_type == 'infinity_2b':
-        kwargs_model = dict(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8) # 2b model
-    elif args.model_type == 'infinity_8b':
-        kwargs_model = dict(depth=40, embed_dim=3584, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8)
-    elif args.model_type == 'infinity_layer12':
-        kwargs_model = dict(depth=12, embed_dim=768, num_heads=8, drop_path_rate=0.1, mlp_ratio=4, block_chunks=4)
-    elif args.model_type == 'infinity_layer16':
-        kwargs_model = dict(depth=16, embed_dim=1152, num_heads=12, drop_path_rate=0.1, mlp_ratio=4, block_chunks=4)
-    elif args.model_type == 'infinity_layer24':
-        kwargs_model = dict(depth=24, embed_dim=1536, num_heads=16, drop_path_rate=0.1, mlp_ratio=4, block_chunks=4)
-    elif args.model_type == 'infinity_layer32':
-        kwargs_model = dict(depth=32, embed_dim=2080, num_heads=20, drop_path_rate=0.1, mlp_ratio=4, block_chunks=4)
-    elif args.model_type == 'infinity_layer40':
-        kwargs_model = dict(depth=40, embed_dim=2688, num_heads=24, drop_path_rate=0.1, mlp_ratio=4, block_chunks=4)
-    elif args.model_type == 'infinity_layer48':
-        kwargs_model = dict(depth=48, embed_dim=3360, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=4)
-    # elif 'infinity_2b' in args.model_type:
-    #     kwargs_model = dict(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8)
-    # --- add FastVAR (ICCV'2025) ---
-    elif args.model_type == 'fastvar_infinity_2b':
-        kwargs_model = dict(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8,
-                            fastvar=True)
-    elif args.model_type == 'fastvar_infinity_8b':
-        kwargs_model = dict(depth=40, embed_dim=3584, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8, 
-                            fastvar=True)
+
     # --- add ScaleKV (NeurIPS'2025) ---
-    elif args.model_type == 'scalekv_infinity_2b':
+    if args.model_type == 'scalekv_infinity_2b':
         kwargs_model = dict(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8)
     elif args.model_type == 'scalekv_infinity_8b':
         kwargs_model = dict(depth=40, embed_dim=3584, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8)
@@ -700,49 +500,68 @@ def load_transformer(vae, args, load_weights=True):
     elif args.model_type == 'sparsevar_infinity_8b':
         kwargs_model = dict(depth=40, embed_dim=3584, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8,
                             sparsevar=True)
-    # --- add SparVAR ---
-    elif args.model_type == 'sparvar_infinity_2b':
-        kwargs_model = dict(depth=32, embed_dim=2048, num_heads=2048//128, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8,
-                            sparvar=True)
-    elif args.model_type == 'sparvar_infinity_8b':
-        kwargs_model = dict(depth=40, embed_dim=3584, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=8,
-                            sparvar=True)
     
-    infinity = load_infinity(
-        rope2d_each_sa_layer=args.rope2d_each_sa_layer, 
-        rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
-        use_scale_schedule_embedding=args.use_scale_schedule_embedding,
-        pn=args.pn,
-        use_bit_label=args.use_bit_label, 
-        add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block, 
-        model_path=slim_model_path, 
-        scale_schedule=None, 
-        vae=vae, 
-        device=device, 
-        model_kwargs=kwargs_model,
-        text_channels=args.text_channels,
-        apply_spatial_patchify=args.apply_spatial_patchify,
-        use_flex_attn=args.use_flex_attn,
-        bf16=args.bf16,
-        checkpoint_type=args.checkpoint_type,
-        args=args,
-        # todo: --- exp params ---
-        # freeze_kv_cache_last_n_scales=args.freeze_kv_cache_last_n_scales
-        skip_last_scales=args.skip_last_scales,
-        drop_uncond_last_scales=args.drop_uncond_last_scales
-    )
+    ensure_model_registered(args.model_type)
+
+    print(f'[Loading Infinity]')
+    with autocast("cuda", dtype=torch.bfloat16, enabled=True, cache_enabled=True), torch.no_grad():
+        infinity_test: Infinity = create_model(
+            args.model_type,
+            vae_local=vae, use_bit_label=args.use_bit_label,
+            apply_spatial_patchify=args.apply_spatial_patchify,
+            text_channels=args.text_channels, text_maxlen=args.text_maxlen,
+            shared_aln=True,
+            use_flex_attn=args.use_flex_attn,
+            fused_norm=True,
+            pad_to_multiplier=128,
+            rope2d_each_sa_layer=args.rope2d_each_sa_layer,
+            rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
+            add_lvl_embeding_only_first_block=args.add_lvl_embeding_only_first_block,
+            checkpointing='full-block',
+            train_h_div_w_list=[1.0],
+            inference_mode=True,
+            pn=args.pn,
+            raw_scale_schedule=None,
+            # 
+            skip_last_scales=args.skip_last_scales,
+            drop_uncond_last_scales=args.drop_uncond_last_scales,
+            other_args=args,
+        ).to(device=device)
+        print(f'\n[you selected Infinity with {args.model_type}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={args.bf16}')
+
+        if args.bf16:
+            for block in infinity_test.unregistered_blocks:
+                block.bfloat16()
+        
+        infinity_test.eval()
+        infinity_test.requires_grad_(False)
+
+        infinity_test.cuda()
+        torch.cuda.empty_cache()
+
+        print(f'[Load Infinity weights]')
+        if args.checkpoint_type == 'torch' and slim_model_path is not None:
+            state_dict = torch.load(slim_model_path, map_location=device, weights_only=True)
+            print(infinity_test.load_state_dict(state_dict))
+        elif args.checkpoint_type == 'torch_shard' and slim_model_path is not None:
+            from transformers.modeling_utils import load_sharded_checkpoint
+            load_sharded_checkpoint(infinity_test, slim_model_path, strict=False)
+        infinity_test.rng = torch.Generator(device=device)
 
     if 'scalekv' in args.model_type:
-        infinity = enable_scale_kv(infinity, window_size=16, max_capacity=650,
-                                   kernel_size=5, pooling='maxpool',
-                                   model_size=args.model_type.split('_')[-1])
+        infinity_test = enable_scale_kv(
+            infinity_test, window_size=16, max_capacity=650,
+            kernel_size=5, pooling='maxpool',
+            model_size=args.model_type.split('_')[-1]
+        )
 
-    return infinity
+    return infinity_test
 
 
 def load_video_transformer(vae, args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model_path = args.model_path
+    ensure_model_registered(args.model_type)
     
     print(f'[Loading InfinityStar]')
     with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
@@ -822,46 +641,46 @@ class InferencePipe:
 
 
 def add_common_arguments(parser):
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument(
-        '--cfg',
-        type=str,
-        help="Classifier-free guidance scale.",
-        default='3')
-    parser.add_argument('--tau', type=float, default=1)
+    # parser.add_argument('--seed', type=int, default=0)
+    # parser.add_argument(
+    #     '--cfg',
+    #     type=str,
+    #     help="Classifier-free guidance scale.",
+    #     default='3')
+    # parser.add_argument('--tau', type=float, default=1)
 
-    parser.add_argument('--model_type', type=str, default='infinity_2b')
-    parser.add_argument(
-        '--model_path',
-        type=str,
-        help="The path to Infinity / HART model.",
-        default='pretrained_models/infinity/Infinity/infinity_2b_reg.pth')
-    parser.add_argument(
-        '--text_encoder_ckpt',
-        type=str,
-        help="The path to text model, Infinity --> Flan-t5-xl, HART --> Qwen2-VL-1.5B-Instruct by default.",
-        default='pretrained_models/infinity/flan-t5-xl')
+    # parser.add_argument('--model_type', type=str, default='infinity_2b')
+    # parser.add_argument(
+    #     '--model_path',
+    #     type=str,
+    #     help="The path to Infinity / HART model.",
+    #     default='pretrained_models/infinity/Infinity/infinity_2b_reg.pth')
+    # parser.add_argument(
+    #     '--text_encoder_ckpt',
+    #     type=str,
+    #     help="The path to text model, Infinity --> Flan-t5-xl, HART --> Qwen2-VL-1.5B-Instruct by default.",
+    #     default='pretrained_models/infinity/flan-t5-xl')
 
-    # ------ Infinity ------
-    parser.add_argument('--pn', type=str, default='1M', choices=['0.06M', '0.25M', '1M'])
-    parser.add_argument('--cfg_insertion_layer', type=int, default=0)
-    parser.add_argument('--vae_type', type=int, default=32)
-    parser.add_argument('--vae_path', type=str, default='pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth')
-    parser.add_argument('--add_lvl_embeding_only_first_block', type=int, default=1, choices=[0,1])
-    parser.add_argument('--use_bit_label', type=int, default=1, choices=[0,1])
-    parser.add_argument('--rope2d_each_sa_layer', type=int, default=1, choices=[0,1])
-    parser.add_argument('--rope2d_normalized_by_hw', type=int, default=2, choices=[0,1,2])
-    parser.add_argument('--use_scale_schedule_embedding', type=int, default=0, choices=[0,1])
-    parser.add_argument('--sampling_per_bits', type=int, default=1, choices=[1,2,4,8,16])
-    parser.add_argument('--text_channels', type=int, default=2048)
-    parser.add_argument('--apply_spatial_patchify', type=int, default=0, choices=[0,1])
-    parser.add_argument('--h_div_w_template', type=float, default=1.000)
-    parser.add_argument('--use_flex_attn', type=int, default=0, choices=[0,1])
-    parser.add_argument('--enable_positive_prompt', type=int, default=0, choices=[0,1])
-    parser.add_argument('--cache_dir', type=str, default='/dev/shm')
-    parser.add_argument('--enable_model_cache', type=int, default=0, choices=[0,1])
-    parser.add_argument('--checkpoint_type', type=str, default='torch')
-    parser.add_argument('--bf16', type=int, default=1, choices=[0,1])
+    # # ------ Infinity ------
+    # parser.add_argument('--pn', type=str, default='1M', choices=['0.06M', '0.25M', '1M'])
+    # parser.add_argument('--cfg_insertion_layer', type=int, default=0)
+    # parser.add_argument('--vae_type', type=int, default=32)
+    # parser.add_argument('--vae_path', type=str, default='pretrained_models/infinity/Infinity/infinity_vae_d32reg.pth')
+    # parser.add_argument('--add_lvl_embeding_only_first_block', type=int, default=1, choices=[0,1])
+    # parser.add_argument('--use_bit_label', type=int, default=1, choices=[0,1])
+    # parser.add_argument('--rope2d_each_sa_layer', type=int, default=1, choices=[0,1])
+    # parser.add_argument('--rope2d_normalized_by_hw', type=int, default=2, choices=[0,1,2])
+    # parser.add_argument('--use_scale_schedule_embedding', type=int, default=0, choices=[0,1])
+    # parser.add_argument('--sampling_per_bits', type=int, default=1, choices=[1,2,4,8,16])
+    # parser.add_argument('--text_channels', type=int, default=2048)
+    # parser.add_argument('--apply_spatial_patchify', type=int, default=0, choices=[0,1])
+    # parser.add_argument('--h_div_w_template', type=float, default=1.000)
+    # parser.add_argument('--use_flex_attn', type=int, default=0, choices=[0,1])
+    # parser.add_argument('--enable_positive_prompt', type=int, default=0, choices=[0,1])
+    # parser.add_argument('--cache_dir', type=str, default='/dev/shm')
+    # parser.add_argument('--enable_model_cache', type=int, default=0, choices=[0,1])
+    # parser.add_argument('--checkpoint_type', type=str, default='torch')
+    # parser.add_argument('--bf16', type=int, default=1, choices=[0,1])
 
     # ------ HART ------
     parser.add_argument("--use_ema", type=bool, default=True)
@@ -874,9 +693,9 @@ def add_common_arguments(parser):
         default=True)
     
     # ------ FastVAR ------
-    parser.add_argument('--cached_scale', type=int, default=8)
-    # parser.add_argument("--prune_ratio", nargs='+', type=float, default=[0.4, 0.5], help="Pruning ratio for last 2 scales in FastVAR")
-    parser.add_argument("--prune_ratio", type=str, default="0.4,0.5", help="Pruning ratio for last 2 scales in FastVAR")
+    # parser.add_argument('--cached_scale', type=int, default=8)
+    # # parser.add_argument("--prune_ratio", nargs='+', type=float, default=[0.4, 0.5], help="Pruning ratio for last 2 scales in FastVAR")
+    # parser.add_argument("--prune_ratio", type=str, default="0.4,0.5", help="Pruning ratio for last 2 scales in FastVAR")
     
     # ------ SparseVAR ------
     parser.add_argument("--compress_method", type=str, help="compress method", default="sparsevar")

@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from models.scalekv.scale_kv import enable_scale_kv
 from tools.run_infinity import *
+from utils.infer_arg_utils import merge_script_args, parse_infer_args
 
 
 def create_image_grid(images):
@@ -44,11 +45,12 @@ def create_image_grid(images):
 
 
 if __name__ == '__main__':
+    # model-level args (model_path / cfg / ... incl. --outdir) are parsed by the
+    # Tap class matching --model_type; the parser below only holds benchmark args
+    args = parse_infer_args()
     parser = argparse.ArgumentParser()
-    add_common_arguments(parser)
-    parser.add_argument('--outdir', type=str, default='')
     parser.add_argument('--n_samples', type=int, default=4)
-    args = parser.parse_args()
+    args = merge_script_args(args, parser)
 
     # ensure n_samples = 4
     if args.n_samples != 4:
@@ -56,10 +58,11 @@ if __name__ == '__main__':
               but n_samples is set to {args.n_samples}. Forcing n_samples to 4.")
         args.n_samples = 4
 
-    # parse cfg
-    args.cfg = list(map(float, args.cfg.split(',')))
-    if len(args.cfg) == 1:
-        args.cfg = args.cfg[0]
+    # parse cfg (Tap parses cfg as a single float; keep supporting the legacy comma-separated string)
+    if isinstance(args.cfg, str):
+        args.cfg = list(map(float, args.cfg.split(',')))
+        if len(args.cfg) == 1:
+            args.cfg = args.cfg[0]
     
     # load DPG-Bench prompts
     dpg_bench_file = 'evaluation/dpg_bench/dpg_bench.csv'
@@ -114,13 +117,16 @@ if __name__ == '__main__':
         images = []
         for sample_j in range(args.n_samples):
             print(f"  Generating sample {sample_j+1}/{args.n_samples}...")
+            # per-sample seed, same protocol as the DDP pipelines
+            seed = args.seed + (index * args.n_samples) + sample_j
             t1 = time.time()
 
             image = gen_one_img(infinity, vae, text_tokenizer, text_encoder,
                                 prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg,
                                 scale_schedule=scale_schedule,
                                 cfg_insertion_layer=[args.cfg_insertion_layer],
-                                vae_type=args.vae_type)
+                                vae_type=args.vae_type,
+                                g_seed=seed)
             
             t2 = time.time()
             print(f'{args.model_type} infer one image takes {t2-t1:.2f}s')

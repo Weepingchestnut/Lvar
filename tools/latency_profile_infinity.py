@@ -3,9 +3,11 @@ from typing import Union
 
 import pynvml
 import torch
+from torch.utils.collect_env import get_pretty_env_info
 from tqdm import tqdm
 
 from run_infinity import *
+from utils.arg_util import InfinityInferArgs
 from utils.profile_utils import (default_prompts, format_memory,
                                  get_memory_usage, get_physical_device_index)
 
@@ -40,6 +42,9 @@ def encode_prompts(text_tokenizer, text_encoder, prompt: Union[str, List[str]], 
 
 
 def main(args):
+    # Environment Information
+    print(get_pretty_env_info())
+
     # --- NVML init ---
     nvml_handle = None
     try:
@@ -57,9 +62,9 @@ def main(args):
     lib = torch.cuda.cudart()
 
     # parse cfg
-    args.cfg = list(map(float, args.cfg.split(',')))
-    if len(args.cfg) == 1:
-        args.cfg = args.cfg[0]
+    # args.cfg = list(map(float, args.cfg.split(',')))
+    # if len(args.cfg) == 1:
+    #     args.cfg = args.cfg[0]
 
     try:
         device = torch.device("cuda")
@@ -247,14 +252,6 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    add_common_arguments(parser)
-    
-    parser.add_argument(
-        "--batch_size", type=int, help="Generation batch size", default=1)
-    parser.add_argument("--warmup_iter", type=int, default=50)
-    parser.add_argument("--profile_iter", type=int, default=100)
-    parser.add_argument('--outdir', type=str, default='')
-    args = parser.parse_args()
+    args = InfinityInferArgs().parse_args()
 
     main(args)

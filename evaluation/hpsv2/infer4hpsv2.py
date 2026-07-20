@@ -13,6 +13,7 @@ from diffusers import FluxPipeline
 from models.scalekv.scale_kv import enable_scale_kv
 from tools.run_infinity import *
 from tools.conf import HF_TOKEN, HF_HOME
+from utils.infer_arg_utils import merge_script_args, parse_infer_args
 
 # set environment variables
 os.environ['HF_TOKEN'] = HF_TOKEN
@@ -30,17 +31,19 @@ def extract_key_val(text):
 
 
 if __name__ == '__main__':
+    # model-level args (model_path / cfg / ... incl. --outdir) are parsed by the
+    # Tap class matching --model_type; the parser below only holds benchmark args
+    args = parse_infer_args()
     parser = argparse.ArgumentParser()
-    add_common_arguments(parser)
-    parser.add_argument('--outdir', type=str, default='')
     parser.add_argument('--n_samples', type=int, default=1)
     parser.add_argument('--rewrite_prompt', type=int, default=0, choices=[0,1])
-    args = parser.parse_args()
+    args = merge_script_args(args, parser)
 
-    # parse cfg
-    args.cfg = list(map(float, args.cfg.split(',')))
-    if len(args.cfg) == 1:
-        args.cfg = args.cfg[0]
+    # parse cfg (Tap parses cfg as a single float; keep supporting the legacy comma-separated string)
+    if isinstance(args.cfg, str):
+        args.cfg = list(map(float, args.cfg.split(',')))
+        if len(args.cfg) == 1:
+            args.cfg = args.cfg[0]
 
     all_prompts = hpsv2.benchmark_prompts('all')
     seed_everything(args.seed)
@@ -92,6 +95,7 @@ if __name__ == '__main__':
     for style, prompts in all_prompts.items():
         for idx, prompt in enumerate(prompts):
             ptr += 1
+            seed_everything(args.seed)  # per-prompt reset, same protocol as the DDP pipelines
             if ptr % 10 == 0:
                 print(f'Generate {ptr}/{total} images...')
             
@@ -107,7 +111,9 @@ if __name__ == '__main__':
                 print(f'prompt: {prompt}, refined_prompt: {refined_prompt}')
             
             images = []
-            for _ in range(args.n_samples):
+            for sample_j in range(args.n_samples):
+                # per-sample seed over the flat prompt index (ptr is 1-based), same as the DDP pipelines
+                seed = args.seed + ((ptr - 1) * args.n_samples) + sample_j
                 t1 = time.time()
                 if args.model_type == 'sdxl':
                     image = base(
@@ -157,7 +163,7 @@ if __name__ == '__main__':
                     scale_schedule = dynamic_resolution_h_w[h_div_w_template][args.pn]['scales']
                     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
                     tgt_h, tgt_w = dynamic_resolution_h_w[h_div_w_template][args.pn]['pixel']
-                    image = gen_one_img(infinity, vae, text_tokenizer, text_encoder, prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg, scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer], vae_type=args.vae_type)
+                    image = gen_one_img(infinity, vae, text_tokenizer, text_encoder, prompt, tau_list=tau, cfg_sc=3, cfg_list=cfg, scale_schedule=scale_schedule, cfg_insertion_layer=[args.cfg_insertion_layer], vae_type=args.vae_type, g_seed=seed)
                 else:
                     raise ValueError
                 t2 = time.time()
